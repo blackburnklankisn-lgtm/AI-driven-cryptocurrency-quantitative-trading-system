@@ -1,0 +1,203 @@
+"""
+core/config.py — 配置加载模块
+
+设计原则：
+- 使用 pydantic-settings 进行类型验证与环境变量注入
+- 支持 YAML 文件 + 环境变量两层覆盖（env > yaml）
+- 禁止任何私钥、API Key 在代码或 YAML 中出现
+- 配置失败时立即抛出 ConfigError，禁止带错误默认值继续
+
+接口：
+    load_config(config_path) → SystemConfig
+    get_config()             → 返回已初始化的全局配置单例
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from core.exceptions import ConfigError
+
+
+# ══════════════════════════════════════════════════════════════
+# 子配置块
+# ══════════════════════════════════════════════════════════════
+
+class ExchangeConfig(BaseSettings):
+    """交易所连接配置（密钥仅从环境变量读取）。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    exchange_id: str = "binance"
+
+    # ── 密钥：强制来自环境变量，不在 YAML 中配置 ───────────
+    binance_api_key: str = Field(default="", alias="BINANCE_API_KEY")
+    binance_secret: str = Field(default="", alias="BINANCE_SECRET")
+    okx_api_key: str = Field(default="", alias="OKX_API_KEY")
+    okx_secret: str = Field(default="", alias="OKX_SECRET")
+    okx_passphrase: str = Field(default="", alias="OKX_PASSPHRASE")
+
+    rate_limit: bool = True          # 是否启用 CCXT 内置限速
+    request_timeout_ms: int = 10_000 # 单次请求超时，毫秒
+
+
+class RiskConfig(BaseSettings):
+    """风控硬约束参数。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    # 单币种最大仓位占总资产的比例
+    max_position_pct: Decimal = Field(
+        default=Decimal("0.20"),
+        alias="MAX_POSITION_PCT",
+        description="[0.0, 1.0] 单币种最大仓位占净值比例",
+    )
+    # 组合最大回撤限制（超过则触发熔断）
+    max_portfolio_drawdown: Decimal = Field(
+        default=Decimal("0.10"),
+        alias="MAX_PORTFOLIO_DRAWDOWN",
+        description="[0.0, 1.0] 触发熔断的最大回撤阈值",
+    )
+    # 单日最大亏损限制
+    max_daily_loss: Decimal = Field(
+        default=Decimal("0.03"),
+        alias="MAX_DAILY_LOSS",
+        description="[0.0, 1.0] 单日亏损超过此比例则暂停交易",
+    )
+    # 连续亏损熔断次数
+    max_consecutive_losses: int = 5
+
+    @field_validator("max_position_pct", "max_portfolio_drawdown", "max_daily_loss", mode="before")
+    @classmethod
+    def must_be_fraction(cls, v: object) -> object:
+        val = Decimal(str(v))
+        if not (Decimal("0") < val <= Decimal("1")):
+            raise ValueError(f"风控比例参数必须在 (0, 1] 范围内，实际值={v}")
+        return val
+
+
+class DataConfig(BaseSettings):
+    """数据层配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    default_timeframe: str = "1h"
+    supported_timeframes: list[str] = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    default_symbols: list[str] = ["BTC/USDT", "ETH/USDT"]
+    # 历史数据存储根目录（相对路径）
+    storage_dir: str = "./storage"
+
+
+class LoggingConfig(BaseSettings):
+    """日志配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_dir: str = Field(default="./logs", alias="LOG_DIR")
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_level(cls, v: str) -> str:
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if v.upper() not in allowed:
+            raise ValueError(f"log_level 必须是 {allowed} 之一，实际={v}")
+        return v.upper()
+
+
+# ══════════════════════════════════════════════════════════════
+# 主配置
+# ══════════════════════════════════════════════════════════════
+
+class SystemConfig(BaseSettings):
+    """
+    系统顶层配置，由 YAML 文件 + 环境变量共同组成。
+    优先级：环境变量 > YAML > 代码默认值。
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # 运行模式：live（实盘）/ paper（模拟盘）/ backtest（回测）
+    trading_mode: Literal["live", "paper", "backtest"] = Field(
+        default="paper",
+        alias="TRADING_MODE",
+    )
+
+    database_url: str = Field(
+        default="sqlite:///./storage/crypto_quant.db",
+        alias="DATABASE_URL",
+    )
+
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        alias="REDIS_URL",
+    )
+
+    exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+
+# ══════════════════════════════════════════════════════════════
+# 加载函数与全局单例
+# ══════════════════════════════════════════════════════════════
+
+_config: SystemConfig | None = None
+
+
+def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
+    """
+    从 YAML 文件 + 环境变量加载系统配置。
+
+    Args:
+        yaml_path: YAML 配置文件路径
+
+    Returns:
+        已验证的 SystemConfig 实例
+
+    Raises:
+        ConfigError: 配置文件缺失、格式错误或验证失败时
+    """
+    global _config  # noqa: PLW0603
+
+    yaml_file = Path(yaml_path)
+    yaml_data: dict = {}
+
+    if yaml_file.exists():
+        try:
+            with yaml_file.open(encoding="utf-8") as f:
+                yaml_data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            raise ConfigError(f"YAML 配置文件解析失败: {yaml_path}") from exc
+
+    try:
+        _config = SystemConfig.model_validate(yaml_data)
+    except Exception as exc:
+        raise ConfigError(f"系统配置验证失败: {exc}") from exc
+
+    return _config
+
+
+def get_config() -> SystemConfig:
+    """
+    返回全局配置单例。
+
+    必须先调用 load_config() 完成初始化。
+
+    Raises:
+        ConfigError: 未初始化时访问
+    """
+    if _config is None:
+        raise ConfigError("配置未初始化，请先调用 load_config()")
+    return _config

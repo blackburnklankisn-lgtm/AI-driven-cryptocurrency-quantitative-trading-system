@@ -1,0 +1,176 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "title": "Crypto Quant Trader",
+  "uid": "crypto_quant_trader",
+  "version": 1,
+  "schemaVersion": 36,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "账户净值 (USDT)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "trader_equity_usdt",
+          "legendFormat": "净值"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "当日盈亏 (USDT)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 0 }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "trader_daily_pnl_usdt",
+          "legendFormat": "日盈亏"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "熔断状态",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]
+        },
+        "mappings": [
+          { "type": "value", "options": { "0": { "text": "正常" }, "1": { "text": "熔断中" } } }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "trader_circuit_breaker_active",
+          "legendFormat": "熔断"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "连续亏损次数",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 3 },
+            { "color": "red", "value": 5 }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "trader_consecutive_losses",
+          "legendFormat": "连亏"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "净值历史曲线",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "trader_equity_usdt",
+          "legendFormat": "账户净值 (USDT)"
+        },
+        {
+          "expr": "trader_daily_pnl_usdt + trader_equity_usdt",
+          "legendFormat": "日初净值参考"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "订单统计（近 1 小时）",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "rate(trader_orders_submitted_total[5m]) * 300",
+          "legendFormat": "提交 {{side}}"
+        },
+        {
+          "expr": "rate(trader_orders_filled_total[5m]) * 300",
+          "legendFormat": "成交 {{side}}"
+        },
+        {
+          "expr": "rate(trader_orders_rejected_total[5m]) * 300",
+          "legendFormat": "拒绝 {{reason_category}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "数据接收延迟 (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(trader_data_latency_ms_bucket[5m]))",
+          "legendFormat": "P99延迟"
+        },
+        {
+          "expr": "histogram_quantile(0.50, rate(trader_data_latency_ms_bucket[5m]))",
+          "legendFormat": "P50延迟"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "累计手续费 (USDT)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "expr": "trader_fee_usdt_total",
+          "legendFormat": "手续费"
+        }
+      ]
+    }
+  ]
+}

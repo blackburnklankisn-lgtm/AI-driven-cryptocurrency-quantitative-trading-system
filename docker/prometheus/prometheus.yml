@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    system: 'crypto-quant-trader'
+
+scrape_configs:
+  # Trader 应用指标（Prometheus 客户端 HTTP 暴露）
+  - job_name: 'trader'
+    static_configs:
+      - targets: ['trader:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Prometheus 自身的指标
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

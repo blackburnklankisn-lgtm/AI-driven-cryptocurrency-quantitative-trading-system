@@ -1,0 +1,141 @@
+# ============================================================
+# docker-compose.yml — 完整基础设施一键启动
+#
+# 包含以下服务：
+#   - timescaledb:  时序数据库（PostgreSQL + TimescaleDB 扩展）
+#   - redis:        缓存与消息协调
+#   - prometheus:   指标采集与存储
+#   - grafana:      监控面板可视化
+#   - trader:       量化交易主进程（paper 模式）
+#
+# 启动方式：
+#   docker-compose -f docker/docker-compose.yml up -d
+#
+# 访问地址：
+#   Grafana:    http://localhost:3000  (admin/admin)
+#   Prometheus: http://localhost:9090
+#   Trader 指标: http://localhost:8000/metrics
+# ============================================================
+
+version: "3.9"
+
+services:
+  # ──────────────────────────────────────────────────────────
+  # TimescaleDB（PostgreSQL + 时序扩展）
+  # ──────────────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: crypto_timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_in_production}
+      POSTGRES_DB: crypto_quant
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./init_sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d crypto_quant"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────
+  # Redis（缓存 / 消息队列 / 状态协调）
+  # ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: crypto_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────
+  # Prometheus（指标采集）
+  # ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: crypto_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.console.libraries=/etc/prometheus/console_libraries
+      - --web.console.templates=/etc/prometheus/consoles
+      - --web.enable-lifecycle
+    restart: unless-stopped
+    depends_on:
+      - trader
+
+  # ──────────────────────────────────────────────────────────
+  # Grafana（监控面板）
+  # ──────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: crypto_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────
+  # Trader（量化主进程）
+  # ──────────────────────────────────────────────────────────
+  trader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: crypto_trader
+    ports:
+      - "8000:8000"  # Prometheus 指标端口
+    environment:
+      TRADING_MODE: paper           # 默认模拟盘，改为 live 才实盘
+      DATABASE_URL: postgresql://trader:${DB_PASSWORD:-change_me_in_production}@timescaledb:5432/crypto_quant
+      REDIS_URL: redis://redis:6379/0
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_SECRET: ${BINANCE_SECRET:-}
+      LOG_LEVEL: INFO
+    volumes:
+      - ../storage:/app/storage
+      - ../logs:/app/logs
+      - ../configs:/app/configs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  timescale_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: crypto_quant_net
