@@ -56,9 +56,10 @@ from apps.api.server import app as fast_app, set_trader_instance, WebsocketLogSi
 
 log = get_logger(__name__)
 
-# 将 WebsocketLogSink 挂载到 loguru
+# 将 WebsocketLogSink 挂载到 loguru（跨线程安全版本）
 from loguru import logger
-logger.add(WebsocketLogSink(), format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
+_ws_sink = WebsocketLogSink()
+logger.add(_ws_sink, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
 
 class LiveTrader:
     """

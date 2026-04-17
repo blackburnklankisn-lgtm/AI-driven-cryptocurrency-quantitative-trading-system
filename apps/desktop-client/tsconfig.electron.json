@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "ESNext",
+    "target": "ES2020",
     "module": "CommonJS",
     "moduleResolution": "node",
     "rootDir": "electron",
@@ -11,5 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "ignoreDeprecations": "6.0"
   },
-  "include": ["electron/**/*.ts"]
+  "include": [
+    "electron/**/*.ts"
+  ]
 }

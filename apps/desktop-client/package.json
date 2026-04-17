@@ -2,7 +2,6 @@
   "name": "desktop-client",
   "private": true,
   "version": "0.0.0",
-  "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"npm run electron:dev\"",

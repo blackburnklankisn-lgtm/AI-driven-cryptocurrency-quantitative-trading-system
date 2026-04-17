@@ -25,6 +25,8 @@ from pydantic import BaseModel
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """应用生命周期管理（替代已废弃的 on_event）。"""
+    # 注册主线程 event loop 到 WebsocketLogSink，使子线程日志能跨线程推送
+    WebsocketLogSink.set_main_loop(asyncio.get_running_loop())
     asyncio.create_task(_status_push_worker())
     yield
 
@@ -99,65 +101,75 @@ status_manager = ConnectionManager()
 class WebsocketLogSink:
     """
     Loguru Sink，接收日志并通过 WebSocket 推送到前端。
-    
-    改进：
-    - 使用 asyncio.Queue 作为缓冲层，防止高频日志拥塞事件循环
-    - 队列满时丢弃最旧的消息（背压控制）
-    - 消息经过脱敏处理后再推送
-    """
 
-    # 类级别的日志队列（maxsize 防止内存溢出）
-    _log_queue: asyncio.Queue = None
-    _worker_task = None
+    修复：使用 run_coroutine_threadsafe 跨线程提交到主线程 event loop。
+    交易逻辑运行在子线程，loguru 的 write() 在子线程中被调用，
+    必须通过 run_coroutine_threadsafe 将广播任务提交到主线程的 asyncio loop。
+
+    背压控制：内部使用线程安全的 queue.Queue（非 asyncio.Queue），
+    避免跨线程访问 asyncio 原语。
+    """
+    import queue as _queue_module
+
+    # 线程安全队列（maxsize 防止内存溢出）
+    _sync_queue: "queue.Queue" = None
+    _main_loop: asyncio.AbstractEventLoop = None
+    _worker_future = None
+
+    @classmethod
+    def set_main_loop(cls, loop: asyncio.AbstractEventLoop):
+        """由主线程在 uvicorn 启动后调用，注册主线程 event loop。"""
+        cls._main_loop = loop
+        import queue
+        cls._sync_queue = queue.Queue(maxsize=500)
 
     def write(self, message: str):
-        """同步写入接口（由 loguru 调用）。"""
-        try:
-            loop = asyncio.get_running_loop()
-            # 尝试非阻塞放入队列
-            queue = self._get_queue(loop)
-            if queue.full():
-                # 背压控制：队列满时丢弃最旧的消息
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+        """同步写入接口（由 loguru 在任意线程调用）。"""
+        loop = WebsocketLogSink._main_loop
+        q = WebsocketLogSink._sync_queue
+        if loop is None or q is None:
+            return  # 主线程 loop 尚未注册，忽略
+        # 背压控制：队列满时丢弃最旧的消息
+        if q.full():
             try:
-                queue.put_nowait(message)
-            except asyncio.QueueFull:
-                pass  # 极端情况下忽略
-            # 确保 worker 任务在运行
-            self._ensure_worker(loop)
-        except RuntimeError:
-            pass  # 不在 asyncio loop 中，忽略
-
-    def _get_queue(self, loop) -> asyncio.Queue:
-        """获取或创建队列（线程安全）。"""
-        if WebsocketLogSink._log_queue is None:
-            WebsocketLogSink._log_queue = asyncio.Queue(maxsize=500)
-        return WebsocketLogSink._log_queue
-
-    def _ensure_worker(self, loop):
-        """确保消费者协程在运行。"""
-        if (WebsocketLogSink._worker_task is None or
-                WebsocketLogSink._worker_task.done()):
-            WebsocketLogSink._worker_task = loop.create_task(
-                self._broadcast_worker()
+                q.get_nowait()
+            except Exception:
+                pass
+        try:
+            q.put_nowait(message)
+        except Exception:
+            pass
+        # 提交广播任务到主线程 event loop（线程安全）
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                _drain_and_broadcast(q), loop
             )
 
     @staticmethod
-    async def _broadcast_worker():
-        """消费队列中的日志消息并广播。"""
-        queue = WebsocketLogSink._log_queue
-        while True:
-            try:
-                message = await asyncio.wait_for(queue.get(), timeout=1.0)
-                await log_manager.broadcast(message)
-                queue.task_done()
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                pass
+    async def _drain_queue(q):
+        """保留兼容性，实际由模块级 _drain_and_broadcast 处理。"""
+        await _drain_and_broadcast(q)
+
+
+async def _drain_and_broadcast(q):
+    """从同步队列中取出所有待发送消息并广播到 WebSocket。"""
+    import queue as _q
+    msgs = []
+    # 一次性取出所有待发消息
+    while True:
+        try:
+            msg = q.get_nowait()
+            msgs.append(msg)
+        except _q.Empty:
+            break
+        except Exception:
+            break
+    # 批量广播
+    for msg in msgs:
+        try:
+            await log_manager.broadcast(msg)
+        except Exception:
+            pass
 
 
 # ── 状态推送后台任务 ─────────────────────────────────────────
