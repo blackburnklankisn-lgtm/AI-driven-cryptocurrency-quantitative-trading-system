@@ -20,12 +20,49 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "public/favicon.svg"
     },
     "files": [
       "dist/**/*",
       "dist-electron/**/*"
-    ]
+    ],
+    "extraResources": [
+      {
+        "from": "../../configs",
+        "to": "configs",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../apps",
+        "to": "backend/apps",
+        "filter": [
+          "**/*.py"
+        ]
+      },
+      {
+        "from": "../../modules",
+        "to": "backend/modules",
+        "filter": [
+          "**/*.py"
+        ]
+      },
+      {
+        "from": "../../core",
+        "to": "backend/core",
+        "filter": [
+          "**/*.py"
+        ]
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "runAfterFinish": true
+    }
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.2",
