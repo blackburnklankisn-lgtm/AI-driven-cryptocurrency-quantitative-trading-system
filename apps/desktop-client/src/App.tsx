@@ -1,6 +1,10 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { Activity, AlertTriangle, Square, RefreshCcw, Terminal, Wifi, WifiOff } from 'lucide-react';
 
+const API_HOST = window.location.protocol === 'file:'
+  ? '127.0.0.1:8000' 
+  : window.location.host;
+
 interface SystemStatus {
   status: string;
   mode: string;
@@ -20,7 +24,9 @@ function App() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
+  const [logsWsConnected, setLogsWsConnected] = useState(false);
   const [controlFeedback, setControlFeedback] = useState<{ msg: string; ok: boolean } | null>(null);
+
   const logEndRef = useRef<HTMLDivElement>(null);
   const logWsRef = useRef<WebSocket | null>(null);
   const statusWsRef = useRef<WebSocket | null>(null);
@@ -54,7 +60,7 @@ function App() {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connectStatus = () => {
-      const ws = new WebSocket('ws://127.0.0.1:8000/api/v1/ws/status');
+      const ws = new WebSocket(`ws://${API_HOST}/api/v1/ws/status`);
       statusWsRef.current = ws;
 
       ws.onopen = () => setWsConnected(true);
@@ -94,19 +100,23 @@ function App() {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connectLogs = () => {
-      const ws = new WebSocket('ws://127.0.0.1:8000/api/v1/ws/logs');
+      const ws = new WebSocket(`ws://${API_HOST}/api/v1/ws/logs`);
       logWsRef.current = ws;
+
+      ws.onopen = () => setLogsWsConnected(true);
 
       ws.onmessage = (event) => {
         if (event.data !== 'pong') queueLog(event.data);
       };
 
       ws.onclose = () => {
+        setLogsWsConnected(false);
         retryTimer = setTimeout(connectLogs, 3000);
       };
 
       ws.onerror = () => ws.close();
     };
+
 
     const pingInterval = setInterval(() => {
       if (logWsRef.current?.readyState === WebSocket.OPEN) {
@@ -126,7 +136,7 @@ function App() {
   // ── 控制操作（带反馈提示） ────────────────────────────────
   const handleAction = useCallback(async (action: string) => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/control', {
+      const res = await fetch(`http://${API_HOST}/api/v1/control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -264,21 +274,28 @@ function App() {
             <span>Live Audit Stream</span>
             <span className="ml-auto text-slate-600">{logs.length} lines</span>
           </div>
-          <div className="flex-1 overflow-y-auto pr-2 space-y-1 text-slate-300">
-            {logs.length === 0 ? (
-              <div className="opacity-50">Waiting for backend connection...</div>
-            ) : (
-              logs.map((log, i) => (
-                <div
-                  key={i}
-                  className="break-all whitespace-pre-wrap leading-relaxed py-0.5 border-b border-slate-800/50 last:border-0 hover:bg-slate-800/20 transition-colors"
-                >
-                  {log}
+            <div className="flex-1 overflow-auto p-4 font-mono text-sm space-y-1 scrollbar-thin scrollbar-thumb-gray-700">
+              {logs.length === 0 && (
+                <div className="flex flex-col items-center justify-center h-full text-gray-500 space-y-2">
+                  <RefreshCcw className={`w-6 h-6 ${!logsWsConnected ? 'animate-spin' : ''}`} />
+                  <p className="italic">
+                    {!logsWsConnected 
+                      ? "Establishing secure connection to audit stream..." 
+                      : "Audit stream connected. Waiting for engine activity..."}
+                  </p>
                 </div>
-              ))
-            )}
-            <div ref={logEndRef} />
-          </div>
+              )}
+              {logs.map((log, i) => (
+                <div key={i} className="border-l-2 border-blue-500/30 pl-2 py-0.5 hover:bg-white/5 transition-colors">
+                  <span className="text-blue-400 opacity-70">[{new Date().toLocaleTimeString()}]</span>{" "}
+                  <span className={log.includes('ERROR') ? 'text-red-400' : log.includes('WARNING') ? 'text-yellow-400' : 'text-gray-300'}>
+                    {log}
+                  </span>
+                </div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+
         </div>
 
       </div>

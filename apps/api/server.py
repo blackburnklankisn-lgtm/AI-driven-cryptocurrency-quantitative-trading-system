@@ -13,13 +13,16 @@ apps/api/server.py — FastAPI 后端桥接服务
 
 import asyncio
 import json
-import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from core.logger import get_logger
+
+log = get_logger(__name__)
 
 
 @asynccontextmanager
@@ -49,6 +52,7 @@ _global_trader_instance = None
 def set_trader_instance(trader) -> None:
     global _global_trader_instance
     _global_trader_instance = trader
+    log.info("API: Trader instance set. id(trader)={}", id(trader))
 
 
 # ── WebSocket 连接管理器（带死连接清理） ─────────────────────
@@ -165,11 +169,13 @@ async def _drain_and_broadcast(q):
         except Exception:
             break
     # 批量广播
-    for msg in msgs:
+    if msgs:
+        combined = "".join(msgs)
         try:
-            await log_manager.broadcast(msg)
+            await log_manager.broadcast(combined)
         except Exception:
             pass
+
 
 
 # ── 状态推送后台任务 ─────────────────────────────────────────
@@ -204,9 +210,9 @@ def _build_status_response() -> Dict[str, Any]:
     positions = {sym: float(qty) for sym, qty in trader._positions.items() if qty > 0}
 
     return {
-        "status": "running",
-        "mode": trader.mode,
-        "exchange": trader.gateway.exchange_id,
+        "status": "running" if getattr(trader, "_running", False) else "stopped",
+        "mode": getattr(trader, "mode", "unknown"),
+        "exchange": getattr(trader.gateway, "exchange_id", "unknown"),
         "equity": float(trader._current_equity),
         "positions": positions,
         "circuit_broken": circuit_broken,
@@ -215,6 +221,7 @@ def _build_status_response() -> Dict[str, Any]:
         "poll_interval_s": trader._poll_interval_s,
         "ws_log_connections": log_manager.connection_count(),
     }
+
 
 
 # ── REST Endpoints ────────────────────────────────────────────
@@ -270,7 +277,14 @@ async def health_check() -> Dict[str, Any]:
 async def websocket_logs_endpoint(websocket: WebSocket):
     """供前端连接以接收实时终端流输出。支持心跳 ping/pong。"""
     await log_manager.connect(websocket)
+    # 连接成功后立即发送欢迎/确认消息
     try:
+        await websocket.send_text(f"[{datetime.now().strftime('%H:%M:%S')}] system | Successfully connected to live audit stream.\n")
+    except Exception:
+        pass
+    
+    try:
+
         while True:
             data = await websocket.receive_text()
             if data == "ping":
