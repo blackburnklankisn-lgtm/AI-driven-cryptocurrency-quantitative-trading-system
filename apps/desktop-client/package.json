@@ -19,8 +19,7 @@
     "win": {
       "target": [
         "nsis"
-      ],
-      "icon": "public/favicon.svg"
+      ]
     },
     "files": [
       "dist/**/*",
@@ -29,31 +28,11 @@
     "extraResources": [
       {
         "from": "../../configs",
-        "to": "configs",
-        "filter": [
-          "**/*"
-        ]
+        "to": "configs"
       },
       {
-        "from": "../../apps",
-        "to": "backend/apps",
-        "filter": [
-          "**/*.py"
-        ]
-      },
-      {
-        "from": "../../modules",
-        "to": "backend/modules",
-        "filter": [
-          "**/*.py"
-        ]
-      },
-      {
-        "from": "../../core",
-        "to": "backend/core",
-        "filter": [
-          "**/*.py"
-        ]
+        "from": "../../dist/backend_trader.exe",
+        "to": "dist/backend_trader.exe"
       }
     ],
     "nsis": {

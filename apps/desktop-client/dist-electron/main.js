@@ -42,22 +42,19 @@ let pythonProcess = null;
 const isDev = process.env.NODE_ENV === 'development';
 // ── Python 后端进程管理 ──────────────────────────────────────
 function findPythonExecutable() {
-    // 生产模式：优先查找打包在 extraResources 中的 Python 可执行文件
+    // 生产模式：使用打包好的 backend_trader.exe
     if (!isDev) {
         const resourcesPath = process.resourcesPath;
-        const candidates = [
-            path.join(resourcesPath, 'backend', 'trader.exe'), // PyInstaller 打包版
-            path.join(resourcesPath, 'python', 'python.exe'), // 内嵌 Python
-        ];
-        for (const candidate of candidates) {
-            try {
-                require('fs').accessSync(candidate);
-                return candidate;
-            }
-            catch (_) { }
+        const candidate = path.join(resourcesPath, 'dist', 'backend_trader.exe');
+        try {
+            require('fs').accessSync(candidate);
+            return candidate;
+        }
+        catch (_) {
+            console.error(`[Electron] Packed backend not found at: ${candidate}`);
         }
     }
-    // 开发模式或回退：使用系统 Python
+    // 开发模式：使用系统 Python
     return process.platform === 'win32' ? 'python' : 'python3';
 }
 function startPythonBackend() {
@@ -67,19 +64,19 @@ function startPythonBackend() {
         return;
     }
     const pythonExe = findPythonExecutable();
-    const projectRoot = path.join(process.resourcesPath, 'backend');
+    // 生产模式下的项目根目录（用于 .env 和 状态 存取）
+    // 默认为应用程序 exe 同级目录
+    const execDir = path.dirname(electron_1.app.getPath('exe'));
     console.log(`[Electron] Starting Python backend: ${pythonExe}`);
-    const args = pythonExe.endsWith('.exe') && !pythonExe.includes('python')
-        ? [] // PyInstaller 打包版，直接运行
-        : ['-m', 'apps.trader.main']; // 系统 Python，模块方式运行
+    const args = !isDev ? [] : ['-m', 'apps.trader.main'];
     pythonProcess = (0, child_process_1.spawn)(pythonExe, args, {
-        cwd: pythonExe.endsWith('.exe') && !pythonExe.includes('python')
-            ? path.dirname(pythonExe)
-            : projectRoot,
+        cwd: execDir,
         env: {
             ...process.env,
             TRADING_MODE: 'paper',
-            CONFIG_PATH: path.join(process.resourcesPath, 'configs', 'system.yaml'),
+            CONFIG_PATH: isDev
+                ? path.join(__dirname, '../../configs/system.yaml')
+                : path.join(process.resourcesPath, 'configs', 'system.yaml'),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
