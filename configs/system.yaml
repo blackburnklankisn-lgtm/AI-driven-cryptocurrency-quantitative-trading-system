@@ -11,9 +11,10 @@ trading_mode: paper
 # 交易所配置
 # ---------------------------
 exchange:
-  exchange_id: binance
+  exchange_id: htx
   rate_limit: true
   request_timeout_ms: 10000
+
 
 # ---------------------------
 # 数据层配置

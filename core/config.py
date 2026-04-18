@@ -34,7 +34,7 @@ class ExchangeConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
-    exchange_id: str = "binance"
+    exchange_id: str = Field(default="binance", alias="EXCHANGE_ID")
 
     # ── 密钥：强制来自环境变量，不在 YAML 中配置 ───────────
     binance_api_key: str = Field(default="", alias="BINANCE_API_KEY")
@@ -42,9 +42,26 @@ class ExchangeConfig(BaseSettings):
     okx_api_key: str = Field(default="", alias="OKX_API_KEY")
     okx_secret: str = Field(default="", alias="OKX_SECRET")
     okx_passphrase: str = Field(default="", alias="OKX_PASSPHRASE")
+    htx_api_key: str = Field(default="", alias="HTX_API_KEY")
+    htx_secret: str = Field(default="", alias="HTX_SECRET")
 
     rate_limit: bool = True          # 是否启用 CCXT 内置限速
     request_timeout_ms: int = 10_000 # 单次请求超时，毫秒
+
+    def get_credentials(self) -> tuple[str, str, str]:
+        """
+        根据当前 exchange_id 返回对应的 (api_key, secret, passphrase)。
+        动态选择，无需在网关初始化时硬编码交易所名称。
+        """
+        eid = self.exchange_id.lower()
+        if eid in ("htx", "huobi", "huobipro"):
+            return self.htx_api_key, self.htx_secret, ""
+        elif eid == "binance":
+            return self.binance_api_key, self.binance_secret, ""
+        elif eid == "okx":
+            return self.okx_api_key, self.okx_secret, self.okx_passphrase
+        else:
+            return "", "", ""
 
 
 class RiskConfig(BaseSettings):

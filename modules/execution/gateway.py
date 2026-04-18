@@ -233,6 +233,25 @@ class CCXTGateway:
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             raise ExchangeConnectionError(f"获取行情网络错误: {exc}") from exc
 
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        limit: int = 50,
+    ) -> List[List]:
+        """
+        获取历史 OHLCV K 线数据。
+
+        Returns:
+            CCXT 标准格式的 K 线列表: [[timestamp, open, high, low, close, volume], ...]
+        """
+        try:
+            return self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit) or []
+        except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
+            raise ExchangeConnectionError(f"获取K线网络错误: {exc}") from exc
+        except ccxt.ExchangeError as exc:
+            raise ExchangeConnectionError(f"获取K线交易所错误: {exc}") from exc
+
     def close(self) -> None:
         """释放连接和资源（asyncio 场景下需调用）。"""
         if hasattr(self._exchange, "close"):

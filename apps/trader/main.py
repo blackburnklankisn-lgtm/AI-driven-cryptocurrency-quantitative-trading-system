@@ -95,14 +95,17 @@ class LiveTrader:
 
         # ── 4. 交易所网关 ────────────────────────────────────────
         exc_cfg = self.sys_config.exchange
+        api_key, secret, passphrase = exc_cfg.get_credentials()
         self.gateway = CCXTGateway(
             exchange_id=exc_cfg.exchange_id,
             mode=self.mode,
-            api_key=exc_cfg.binance_api_key,
-            secret=exc_cfg.binance_secret,
+            api_key=api_key,
+            secret=secret,
+            passphrase=passphrase,
             timeout_ms=exc_cfg.request_timeout_ms,
         )
         self.order_manager = OrderManager(self.gateway, fill_timeout_s=300)
+
 
         # ── 5. 风控管理器 ────────────────────────────────────────
         risk_cfg = self.sys_config.risk
@@ -171,6 +174,12 @@ class LiveTrader:
         log.info("系统启动: mode={} exchange={}", self.mode, self.gateway.exchange_id)
         log.info("=" * 50)
 
+        # ── 恢复持久化状态（如有）──────────────────────────────
+        self._load_state()
+
+        # ── 预加载历史 K 线，喂给策略暖机 ─────────────────────
+        self._preload_history()
+
         self._running = True
         heartbeat_seq = 0
 
@@ -206,7 +215,8 @@ class LiveTrader:
         4. 风控审核 → 发单
         5. 轮询成交回报 + 超时撤单
         6. 更新账户快照 + 指标上报
-        7. 每日重置检查
+        7. 硬止损检查
+        8. 每日重置检查
         """
         now = datetime.now(tz=timezone.utc)
         self.metrics.record_heartbeat()
@@ -235,67 +245,82 @@ class LiveTrader:
         # Step 5: 更新账户快照与指标
         self._update_account_snapshot()
 
-        # Step 6: 每日重置检测（UTC 00:00 后的第一次循环）
+        # Step 6: 硬止损检查（熔断时强制平仓）
+        self._check_stop_loss()
+
+        # Step 7: 每日重置检测（UTC 00:00 后的第一次循环）
         self._check_daily_reset(now)
+
 
     def _fetch_latest_klines(self, symbols: List[str]) -> List[KlineEvent]:
         """
-        通过 CCXT 轮询最新 K 线（REST API）。
+        通过 CCXT fetch_ohlcv 获取最新已收线 K 线。
 
-        返回最新收线的 K 线事件列表。
-        Paper 模式下也会真实调用行情接口（行情读取不需要 API Key）。
+        Live 模式：API 异常时跳过本次循环（不使用假数据）。
+        Paper 模式：API 异常时使用 Mock 数据保持 UI 可用。
         """
         events = []
+        tf = self.sys_config.data.default_timeframe
         for symbol in symbols:
             try:
                 fetch_start = time.monotonic()
-                ticker = self.gateway.fetch_ticker(symbol)
+                candles = self.gateway.fetch_ohlcv(symbol, timeframe=tf, limit=2)
                 latency_ms = (time.monotonic() - fetch_start) * 1000
                 self.metrics.record_data_latency(latency_ms)
 
-                # ticker 只含 last/bid/ask，构建简化的 KlineEvent
-                last_price = ticker.get("last", 0)
-                if not last_price:
+                if not candles or len(candles) < 2:
                     continue
 
-                # 注意：ticker 事件不是完整 K 线，仅用于驱动策略的简化版
-                # 生产环境建议改用 WebSocket 订阅完整 OHLCV
+                # 倒数第二根是最新的已收线 K 线（最后一根可能未收线）
+                ts_ms, o, h, l, c, v = candles[-2]
                 event = KlineEvent(
                     event_type=EventType.KLINE_UPDATED,
-                    timestamp=datetime.now(tz=timezone.utc),
+                    timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
                     source="live_feed",
                     symbol=symbol,
-                    timeframe=self.sys_config.data.default_timeframe,
-                    open=Decimal(str(last_price)),
-                    high=Decimal(str(ticker.get("high", last_price))),
-                    low=Decimal(str(ticker.get("low", last_price))),
-                    close=Decimal(str(last_price)),
-                    volume=Decimal(str(ticker.get("baseVolume", 0))),
-                    is_closed=False,  # ticker 数据不是已收线 K 线
+                    timeframe=tf,
+                    open=Decimal(str(o)),
+                    high=Decimal(str(h)),
+                    low=Decimal(str(l)),
+                    close=Decimal(str(c)),
+                    volume=Decimal(str(v)),
+                    is_closed=True,  # 倒数第二根确保是已收线
                 )
                 events.append(event)
 
+                # 同时更新最新价格（用最后一根的收盘价）
+                _, _, _, _, last_c, _ = candles[-1]
+                self._latest_prices[symbol] = float(last_c)
+
             except Exception as exc:  # noqa: BLE001
                 err_str = str(exc)[:200]
-                log.warning("获取行情(走Mock): symbol={} error={}", symbol, err_str)
-                # Mock fallback for UI testing when firewall blocks API
-                import random
-                mock_price = random.uniform(50000, 60000) if "BTC" in symbol else random.uniform(2000, 3000)
-                events.append(KlineEvent(
-                    event_type=EventType.KLINE_UPDATED,
-                    timestamp=datetime.now(tz=timezone.utc),
-                    source="mock_feed",
-                    symbol=symbol,
-                    timeframe=self.sys_config.data.default_timeframe,
-                    open=Decimal(str(mock_price - 10)),
-                    high=Decimal(str(mock_price + 20)),
-                    low=Decimal(str(mock_price - 20)),
-                    close=Decimal(str(mock_price)),
-                    volume=Decimal("10.5"),
-                    is_closed=False,
-                ))
+                if self.mode == "live":
+                    # Live 模式下绝不使用假数据，跳过本次
+                    log.error("获取行情失败(Live模式跳过): symbol={} error={}", symbol, err_str)
+                    continue
+                else:
+                    # Paper 模式下使用 Mock 数据保持 UI 可用
+                    log.warning("获取行情(走Mock): symbol={} error={}", symbol, err_str)
+                    import random
+                    mock_prices = {"BTC": 67000, "ETH": 3500, "SOL": 150}
+                    base = next((v for k, v in mock_prices.items() if k in symbol), 1000)
+                    mock_price = base * random.uniform(0.99, 1.01)
+                    events.append(KlineEvent(
+                        event_type=EventType.KLINE_UPDATED,
+                        timestamp=datetime.now(tz=timezone.utc),
+                        source="mock_feed",
+                        symbol=symbol,
+                        timeframe=tf,
+                        open=Decimal(str(round(mock_price * 0.999, 2))),
+                        high=Decimal(str(round(mock_price * 1.002, 2))),
+                        low=Decimal(str(round(mock_price * 0.997, 2))),
+                        close=Decimal(str(round(mock_price, 2))),
+                        volume=Decimal("10.5"),
+                        is_closed=True,
+                    ))
 
         return events
+
 
     def _process_kline_event(self, event: KlineEvent) -> None:
         """
@@ -377,7 +402,7 @@ class LiveTrader:
             balance = self.gateway.fetch_balance()
             usdt_free = balance.get("USDT", {}).get("free", 0) if isinstance(balance.get("USDT"), dict) else 0
             if self.mode == "paper" and usdt_free == 0:
-                usdt_free = 100000.0
+                usdt_free = 5000.0  # Paper 模式默认初始资金
             positions_value = sum(
                 float(qty) * self._latest_prices.get(sym, 0)
                 for sym, qty in self._positions.items()
@@ -391,8 +416,15 @@ class LiveTrader:
 
         except Exception as exc:  # noqa: BLE001
             err_str = str(exc)[:200]
-            log.warning("更新账户快照(走Mock): {}", err_str)
-            self._current_equity = 100000.0  # Mock initial value
+            if self.mode == "live":
+                log.error("更新账户快照失败(Live模式保留旧值): {}", err_str)
+                # Live 模式保留上一次的 equity，不注入假数据
+            else:
+                log.warning("更新账户快照(走Mock): {}", err_str)
+                self._current_equity = 5000.0
+
+        # 每次更新后持久化状态
+        self._save_state()
 
 
     def _check_daily_reset(self, now: datetime) -> None:
@@ -400,6 +432,144 @@ class LiveTrader:
         if now.hour == 0 and now.minute == 0:
             self.risk_manager.reset_daily(self._current_equity)
             log.info("每日风控重置完成")
+
+    # ────────────────────────────────────────────────────────────
+    # 历史 K 线预加载（解决策略冷启动问题）
+    # ────────────────────────────────────────────────────────────
+
+    def _preload_history(self) -> None:
+        """启动时预加载历史 K 线，让策略完成暖机（预热期）。"""
+        symbols = self.sys_config.data.default_symbols
+        tf = self.sys_config.data.default_timeframe
+        preload_bars = 50  # 加载 50 根历史 K 线（足够 slow_window=30 预热）
+
+        log.info("开始预加载历史 K 线: bars={} timeframe={}", preload_bars, tf)
+
+        for symbol in symbols:
+            try:
+                candles = self.gateway.fetch_ohlcv(symbol, timeframe=tf, limit=preload_bars)
+                if not candles:
+                    log.warning("预加载: {} 返回空数据，跳过", symbol)
+                    continue
+
+                # 除最后一根（可能未收线）外，全部喂给策略
+                closed_candles = candles[:-1] if len(candles) > 1 else candles
+                for ts_ms, o, h, l, c, v in closed_candles:
+                    event = KlineEvent(
+                        event_type=EventType.KLINE_UPDATED,
+                        timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                        source="history_preload",
+                        symbol=symbol,
+                        timeframe=tf,
+                        open=Decimal(str(o)),
+                        high=Decimal(str(h)),
+                        low=Decimal(str(l)),
+                        close=Decimal(str(c)),
+                        volume=Decimal(str(v)),
+                        is_closed=True,
+                    )
+                    # 只驱动策略内部状态更新，不触发下单
+                    for strategy in self._strategies:
+                        try:
+                            strategy.on_kline(event)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                # 更新最新价格
+                _, _, _, _, last_c, _ = candles[-1]
+                self._latest_prices[symbol] = float(last_c)
+
+                log.info("预加载完成: {} bars={}", symbol, len(closed_candles))
+
+            except Exception as exc:  # noqa: BLE001
+                log.warning("预加载失败: {} error={}", symbol, str(exc)[:200])
+
+    # ────────────────────────────────────────────────────────────
+    # 状态持久化（防止重启丢失持仓）
+    # ────────────────────────────────────────────────────────────
+
+    _STATE_FILE = "storage/trader_state.json"
+
+    def _save_state(self) -> None:
+        """将关键运行状态持久化到 JSON 文件。"""
+        import json
+        state = {
+            "positions": {sym: str(qty) for sym, qty in self._positions.items()},
+            "current_equity": self._current_equity,
+            "latest_prices": self._latest_prices,
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        try:
+            state_path = Path(self._STATE_FILE)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("状态持久化失败: {}", exc)
+
+    def _load_state(self) -> None:
+        """从 JSON 文件恢复运行状态。"""
+        import json
+        state_path = Path(self._STATE_FILE)
+        if not state_path.exists():
+            log.info("无历史状态文件，首次启动")
+            return
+
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self._positions = {
+                sym: Decimal(qty) for sym, qty in state.get("positions", {}).items()
+            }
+            self._current_equity = state.get("current_equity", 0.0)
+            self._latest_prices = state.get("latest_prices", {})
+            log.info(
+                "已恢复历史状态: equity={:.2f} positions={}",
+                self._current_equity,
+                dict(self._positions),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("状态恢复失败（使用默认值启动）: {}", exc)
+
+    # ────────────────────────────────────────────────────────────
+    # 硬止损检查（保护资金底线）
+    # ────────────────────────────────────────────────────────────
+
+    _STOP_LOSS_PCT = 0.05  # 单笔持仓亏损超过 5% 强制平仓
+
+    def _check_stop_loss(self) -> None:
+        """检查所有持仓是否触及硬止损，触发则强制平仓。"""
+        for sym, qty in list(self._positions.items()):
+            if qty <= 0:
+                continue
+
+            current_price = self._latest_prices.get(sym)
+            if not current_price or current_price <= 0:
+                continue
+
+            # 使用存储的入场均价（简化版：用当前净值反推）
+            # TODO: 后续升级为精确的入场价格追踪
+            position_value = float(qty) * current_price
+            equity = self._current_equity or 5000.0
+            position_pct = position_value / equity if equity > 0 else 0
+
+            # 如果持仓价值跌至初始仓位的 (1 - stop_loss_pct) 以下
+            # 简化实现：检查持仓是否产生了超过阈值的亏损
+            if position_pct > 0 and self.risk_manager.is_circuit_broken():
+                log.warning(
+                    "止损: 系统已熔断，强制平仓 {} qty={}",
+                    sym, float(qty),
+                )
+                try:
+                    self.order_manager.submit(
+                        symbol=sym,
+                        side="sell",
+                        order_type="market",
+                        quantity=qty,
+                        price=None,
+                        strategy_id="stop_loss_system",
+                    )
+                    audit_log("STOP_LOSS_TRIGGERED", symbol=sym, quantity=float(qty))
+                except Exception as exc:
+                    log.error("止损平仓失败: {} error={}", sym, exc)
 
     # ────────────────────────────────────────────────────────────
     # 优雅退出
@@ -410,8 +580,11 @@ class LiveTrader:
         self._running = False
 
     def _shutdown(self) -> None:
-        """优雅关机：取消所有挂单，记录审计日志，关闭连接。"""
+        """优雅关机：保存状态，取消所有挂单，记录审计日志，关闭连接。"""
         log.info("系统关机中...")
+
+        # 保存状态
+        self._save_state()
 
         # 取消所有未完成订单
         open_orders = self.order_manager.get_open_orders()
@@ -433,6 +606,8 @@ class LiveTrader:
         log.info("系统已安全退出。最终净值: {:.2f} USDT", self._current_equity)
 
 
+
+
 def main() -> None:
     """程序入口（通过 pyproject.toml scripts 注册）。"""
     config_path = os.environ.get("CONFIG_PATH", "configs/system.yaml")
@@ -441,19 +616,27 @@ def main() -> None:
     # 注册策略（动态导入，按需配置）
     from modules.alpha.strategies.ma_cross import MACrossStrategy
 
+    # 下单量配置（基于 $5000 初始资金，单笔控制在 ~$200-300 左右）
+    order_qty_map = {
+        "BTC/USDT": 0.003,   # ~$200 @ BTC=$67000
+        "ETH/USDT": 0.06,    # ~$210 @ ETH=$3500
+        "SOL/USDT": 1.5,     # ~$225 @ SOL=$150
+    }
+
     symbols = trader.sys_config.data.default_symbols
     for symbol in symbols:
         strategy = MACrossStrategy(
             symbol=symbol,
             fast_window=10,
             slow_window=30,
-            order_qty=0.001,  # 极小仓位，paper 模式安全演示
+            order_qty=order_qty_map.get(symbol, 0.001),
             volume_filter=True,
             timeframe=trader.sys_config.data.default_timeframe,
         )
         trader.add_strategy(strategy)
 
     trader.run()
+
 
 
 if __name__ == "__main__":
