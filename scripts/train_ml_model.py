@@ -122,6 +122,8 @@ def main() -> None:
             "random_state": 42,
         },
         expanding=True,
+        calibrate=True,          # 启用概率校准
+        feature_selection=True,  # 启用特征筛选
     )
 
     result = trainer.train(
@@ -129,7 +131,7 @@ def main() -> None:
         n_splits=5,
         test_size=150,
         min_train_size=300,
-        val_size=0,      # RF 不需要 early stopping 验证集
+        val_size=50,     # 提供验证集用于概率校准
         label_type="binary",
     )
 
@@ -141,6 +143,20 @@ def main() -> None:
     avg = result.avg_metrics()
     print(f"\n平均 OOS: accuracy={avg['accuracy']:.3f}  f1={avg['f1']:.3f}")
     print(f"           precision={avg['precision']:.3f}  recall={avg['recall']:.3f}")
+
+    # 自适应阈值
+    print(f"\n自适应阈值 (Youden's J):")
+    print(f"  buy_threshold  = {result.optimal_buy_threshold:.3f}")
+    print(f"  sell_threshold = {result.optimal_sell_threshold:.3f}")
+    for fr in result.fold_results:
+        print(f"    Fold {fr.fold_id}: optimal_thresh={fr.optimal_threshold:.3f}")
+
+    # 特征筛选结果
+    if result.selected_features:
+        print(f"\n特征筛选: {len(result.feature_names)} → {len(result.selected_features)}")
+        print(f"  保留: {result.selected_features[:10]}...")
+    else:
+        print(f"\n特征筛选: 未执行（保留全部 {len(result.feature_names)} 个）")
 
     if result.feature_importance_avg is not None:
         print("\nTop-10 特征重要性（多折平均）:")

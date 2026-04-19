@@ -44,6 +44,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 
 from core.exceptions import FutureLookAheadError
@@ -73,6 +74,7 @@ class FoldResult:
     oos_predictions: pd.Series         # 样本外预测（分类标签）
     oos_probabilities: pd.Series       # 样本外买入概率
     oos_actual: pd.Series              # 样本外真实标签
+    optimal_threshold: float = 0.5      # Youden's J 最优阈值
 
 
 @dataclass
@@ -84,6 +86,9 @@ class WalkForwardResult:
     oos_probabilities: Optional[pd.Series] = None
     feature_names: List[str] = field(default_factory=list)
     feature_importance_avg: Optional[pd.Series] = None  # 各折特征重要性平均值
+    optimal_buy_threshold: float = 0.60   # 各折 Youden's J 最优阈值均值
+    optimal_sell_threshold: float = 0.40  # 卖出阈值（= 1 - buy_threshold）
+    selected_features: Optional[List[str]] = None  # SHAP 筛选后的特征子集
 
     def summary(self) -> pd.DataFrame:
         """返回各折指标汇总表。"""
@@ -133,12 +138,18 @@ class WalkForwardTrainer:
         model_type: str = "rf",      # 默认 rf，避免 lgbm 未安装时的初始失败
         model_params: Optional[Dict[str, Any]] = None,
         expanding: bool = True,
+        calibrate: bool = True,        # 是否对模型做概率校准
+        feature_selection: bool = True, # 是否基于重要性筛选特征
+        importance_threshold: float = 0.001,  # 特征重要性筛选阈值
     ) -> None:
         self.feature_builder = feature_builder or MLFeatureBuilder()
         self.labeler = labeler or ReturnLabeler()
         self.model_type = model_type
         self.model_params = model_params or {}
         self.expanding = expanding
+        self.calibrate = calibrate
+        self.feature_selection = feature_selection
+        self.importance_threshold = importance_threshold
 
     def train(
         self,
@@ -164,8 +175,10 @@ class WalkForwardTrainer:
             WalkForwardResult 对象（含各折指标和 OOS 预测序列）
         """
         log.info(
-            "Walk-Forward 训练启动: n_splits={} test_size={} min_train={} model={}",
+            "Walk-Forward 训练启动: n_splits={} test_size={} min_train={} model={} "
+            "calibrate={} feat_selection={}",
             n_splits, test_size, min_train_size, self.model_type,
+            self.calibrate, self.feature_selection,
         )
 
         # ── 1. 构建特征矩阵和标签 ────────────────────────────────
@@ -220,6 +233,7 @@ class WalkForwardTrainer:
         all_importance_series = []
         oos_preds_list = []
         oos_proba_list = []
+        fold_thresholds = []  # 收集每折 Youden's J 阈值
 
         for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
             log.info(
@@ -259,6 +273,7 @@ class WalkForwardTrainer:
                 model_type=self.model_type,
                 params=self.model_params,
                 label_type=label_type,
+                calibrate=self.calibrate,
             )
             model.fit(X_train, y_train, X_val, y_val)
 
@@ -271,9 +286,15 @@ class WalkForwardTrainer:
 
             # 计算指标
             fold_metrics = self._compute_metrics(y_test.values, preds, proba)
+
+            # Youden's J 最优阈值
+            opt_thresh = self._compute_optimal_threshold(y_test.values, proba)
+            fold_thresholds.append(opt_thresh)
+
             log.info(
-                "Fold {} OOS: acc={:.3f} f1={:.3f} auc={:.3f}",
-                fold_id, fold_metrics["accuracy"], fold_metrics["f1"], fold_metrics["auc"],
+                "Fold {} OOS: acc={:.3f} f1={:.3f} auc={:.3f} optimal_thresh={:.3f}",
+                fold_id, fold_metrics["accuracy"], fold_metrics["f1"],
+                fold_metrics["auc"], opt_thresh,
             )
 
             fold_result = FoldResult(
@@ -287,6 +308,7 @@ class WalkForwardTrainer:
                 oos_predictions=pd.Series(preds, index=X_test.index),
                 oos_probabilities=pd.Series(proba, index=X_test.index),
                 oos_actual=y_test,
+                optimal_threshold=opt_thresh,
                 **fold_metrics,
             )
             result.fold_results.append(fold_result)
@@ -311,6 +333,40 @@ class WalkForwardTrainer:
             # 多折特征重要性取均值（更稳定）
             imp_df = pd.concat(all_importance_series, axis=1)
             result.feature_importance_avg = imp_df.mean(axis=1).sort_values(ascending=False)
+
+            # P2: 基于重要性的特征筛选
+            if self.feature_selection and result.feature_importance_avg is not None:
+                selected = result.feature_importance_avg[
+                    result.feature_importance_avg > self.importance_threshold
+                ].index.tolist()
+                if len(selected) >= 10:  # 至少保留 10 个特征
+                    result.selected_features = selected
+                    dropped = len(feature_names) - len(selected)
+                    log.info(
+                        "[FeatSelect] 特征筛选: {} → {} (剔除 {} 个低重要性特征, "
+                        "threshold={})",
+                        len(feature_names), len(selected), dropped,
+                        self.importance_threshold,
+                    )
+                else:
+                    log.debug(
+                        "[FeatSelect] 筛选后只剩 {} 个特征（< 10），保留全部",
+                        len(selected),
+                    )
+
+        # ── 自适应阈值（各折 Youden's J 的中位数）────────────────
+        if fold_thresholds:
+            result.optimal_buy_threshold = float(np.median(fold_thresholds))
+            result.optimal_sell_threshold = max(
+                0.30, 1.0 - result.optimal_buy_threshold
+            )  # 卖出阈值 = 1 - 买入阈值，下限 0.30
+            log.info(
+                "[Threshold] 自适应阈值: buy={:.3f} sell={:.3f} "
+                "(各折: {})",
+                result.optimal_buy_threshold,
+                result.optimal_sell_threshold,
+                ["{:.3f}".format(t) for t in fold_thresholds],
+            )
 
         # 打印汇总
         summary = result.summary()
@@ -423,3 +479,39 @@ class WalkForwardTrainer:
             "recall": recall,
             "auc": auc,
         }
+
+    @staticmethod
+    def _compute_optimal_threshold(
+        y_true: np.ndarray,
+        y_proba: np.ndarray,
+    ) -> float:
+        """
+        用 Youden's J 统计量找最优分类阈值。
+
+        J = Sensitivity + Specificity - 1 = TPR - FPR
+        threshold* = argmax_t J(t)
+
+        Returns:
+            最优阈值 (0, 1)，若无法计算返回 0.50
+        """
+        try:
+            unique_classes = np.unique(y_true)
+            if len(unique_classes) > 2 or len(y_proba) == 0:
+                return 0.50
+
+            fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+            j_scores = tpr - fpr
+            best_idx = int(np.argmax(j_scores))
+            optimal = float(thresholds[best_idx])
+
+            # 限制在合理范围 [0.35, 0.80]
+            optimal = max(0.35, min(0.80, optimal))
+
+            log.debug(
+                "[YoudenJ] best_J={:.3f} threshold={:.3f} (raw_idx={}/{})",
+                j_scores[best_idx], optimal, best_idx, len(thresholds),
+            )
+            return optimal
+        except Exception as exc:
+            log.debug("[YoudenJ] 计算失败（返回默认 0.50）: {}", exc)
+            return 0.50

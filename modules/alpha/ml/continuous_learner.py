@@ -63,6 +63,7 @@ class ContinuousLearnerConfig:
     max_saved_versions: int = 3           # 最多保留的历史版本数
     ab_test_window: int = 50              # A/B 测试窗口（K 线数）
     min_bars_for_retrain: int = 400       # 触发重训所需的最少数据量
+    max_buffer_size: int = 10000          # OHLCV 缓冲区最大长度（防内存泄漏）
     label_type: str = "binary"            # "binary" | "multiclass"
 
 
@@ -104,8 +105,8 @@ class ContinuousLearner:
         self.labeler = labeler
         self.config = config or ContinuousLearnerConfig()
 
-        # 滚动 OHLCV 缓冲区（无限大，累积所有历史数据用于重训）
-        self._ohlcv_buffer: List[dict] = []
+        # 滑动 OHLCV 缓冲区（有界 deque，防内存泄漏）
+        self._ohlcv_buffer: deque = deque(maxlen=self.config.max_buffer_size)
 
         # 模型版本历史
         self._versions: List[ModelVersion] = []
@@ -123,11 +124,17 @@ class ContinuousLearner:
         self._bars_since_retrain: int = 0
         self._is_retraining: bool = False  # 防止并发重训
 
+        # 自适应阈值（由重训后注入）
+        self._optimal_buy_threshold: float = 0.60
+        self._optimal_sell_threshold: float = 0.40
+
         log.info(
-            "ContinuousLearner 初始化: retrain_every={} drift_p={} min_acc={}",
-            config.retrain_every_n_bars if config else 500,
-            config.drift_significance if config else 0.05,
-            config.min_accuracy_threshold if config else 0.55,
+            "[ContLearn] 初始化: retrain_every={} drift_p={} min_acc={} "
+            "max_buf={}",
+            self.config.retrain_every_n_bars,
+            self.config.drift_significance,
+            self.config.min_accuracy_threshold,
+            self.config.max_buffer_size,
         )
 
     # ────────────────────────────────────────────────────────────
@@ -147,6 +154,14 @@ class ContinuousLearner:
         self._ohlcv_buffer.append(ohlcv_row)
         self._bar_count += 1
         self._bars_since_retrain += 1
+
+        if self._bar_count % 100 == 0:
+            log.debug(
+                "[ContLearn] bar={} buf_size={}/{} since_retrain={}",
+                self._bar_count, len(self._ohlcv_buffer),
+                self.config.max_buffer_size,
+                self._bars_since_retrain,
+            )
 
         if len(self._ohlcv_buffer) < self.config.min_bars_for_retrain:
             return None
@@ -181,6 +196,10 @@ class ContinuousLearner:
         if self._active_version:
             return self._active_version.model
         return None
+
+    def get_optimal_thresholds(self) -> tuple:
+        """返回当前最优阈值 (buy_threshold, sell_threshold)。"""
+        return self._optimal_buy_threshold, self._optimal_sell_threshold
 
     def get_model_version_info(self) -> List[Dict]:
         """返回所有已训练模型的版本信息。"""
@@ -332,6 +351,14 @@ class ContinuousLearner:
             avg_metrics = result.avg_metrics()
             oos_acc = avg_metrics.get("accuracy", 0.0)
             oos_f1 = avg_metrics.get("f1", 0.0)
+
+            # 提取自适应阈值
+            self._optimal_buy_threshold = result.optimal_buy_threshold
+            self._optimal_sell_threshold = result.optimal_sell_threshold
+            log.info(
+                "[ContLearn] 重训阈值更新: buy={:.3f} sell={:.3f}",
+                self._optimal_buy_threshold, self._optimal_sell_threshold,
+            )
 
             # 生成版本 ID
             version_id = self._make_version_id()

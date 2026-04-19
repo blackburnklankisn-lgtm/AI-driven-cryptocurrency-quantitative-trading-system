@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -103,6 +104,7 @@ class SignalModel:
         model_type:  "lgbm" | "rf" | "lr"
         params:      模型超参数（将合并进默认配置）
         label_type:  "binary"（0/1）| "multiclass"（-1/0/1）
+        calibrate:   是否对输出概率做 Platt Scaling 校准（默认 True）
     """
 
     def __init__(
@@ -110,13 +112,16 @@ class SignalModel:
         model_type: str = "lgbm",
         params: Optional[Dict[str, Any]] = None,
         label_type: str = "binary",
+        calibrate: bool = True,
     ) -> None:
         if model_type not in {"lgbm", "rf", "lr"}:
             raise ValueError(f"model_type 必须是 lgbm/rf/lr，实际: {model_type}")
 
         self.model_type = model_type
         self.label_type = label_type
+        self.calibrate = calibrate
         self._pipeline: Optional[Pipeline] = None
+        self._calibrated_pipeline: Optional[Pipeline] = None  # 概率校准后的 pipeline
         self._feature_names: Optional[list] = None
         self._classes: Optional[np.ndarray] = None
 
@@ -198,6 +203,32 @@ class SignalModel:
         self._pipeline.fit(X_train, y_train, **fit_params)
 
         log.info("模型训练完成: {}", self.model_type)
+
+        # ── 概率校准（Platt Scaling）──────────────────────────────
+        if self.calibrate and X_val is not None and y_val is not None:
+            try:
+                log.info("[Calibration] 执行 Platt Scaling 概率校准 (val_size={})...", len(X_val))
+                # 兼容 sklearn >= 1.6: 优先使用 FrozenEstimator
+                try:
+                    from sklearn.frozen import FrozenEstimator
+                    calibrated = CalibratedClassifierCV(
+                        FrozenEstimator(self._pipeline), method="sigmoid",
+                    )
+                except ImportError:
+                    calibrated = CalibratedClassifierCV(
+                        self._pipeline, method="sigmoid", cv="prefit",
+                    )
+                calibrated.fit(X_val, y_val)
+                self._calibrated_pipeline = calibrated
+                log.info("[Calibration] 概率校准完成")
+            except Exception as exc:
+                log.warning("[Calibration] 校准失败（使用未校准概率）: {}", exc)
+                self._calibrated_pipeline = None
+        else:
+            if self.calibrate:
+                log.debug("[Calibration] 无验证集，跳过概率校准")
+            self._calibrated_pipeline = None
+
         return self
 
     # ────────────────────────────────────────────────────────────
@@ -220,13 +251,17 @@ class SignalModel:
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """
-        预测各类别概率。
+        预测各类别概率（优先使用校准后的概率）。
 
         Returns:
             形状为 (n_samples, n_classes) 的概率数组
         """
         self._check_fitted()
         X_aligned = self._align_features(X)
+        if self._calibrated_pipeline is not None:
+            proba = self._calibrated_pipeline.predict_proba(X_aligned)
+            log.debug("[Model] 使用校准概率输出")
+            return proba
         return self._pipeline.predict_proba(X_aligned)
 
     def predict_signal_proba(self, X: pd.DataFrame) -> np.ndarray:
@@ -293,9 +328,11 @@ class SignalModel:
 
         model_data = {
             "pipeline": self._pipeline,
+            "calibrated_pipeline": self._calibrated_pipeline,
             "feature_names": self._feature_names,
             "model_type": self.model_type,
             "label_type": self.label_type,
+            "calibrate": self.calibrate,
             "params": self._params,
         }
         with open(path, "wb") as f:
@@ -316,10 +353,16 @@ class SignalModel:
         with open(path, "rb") as f:
             data = pickle.load(f)
 
-        instance = cls(model_type=data["model_type"], label_type=data["label_type"])
+        instance = cls(
+            model_type=data["model_type"],
+            label_type=data["label_type"],
+            calibrate=data.get("calibrate", False),
+        )
         instance._pipeline = data["pipeline"]
+        instance._calibrated_pipeline = data.get("calibrated_pipeline")
         instance._feature_names = data["feature_names"]
-        log.info("模型已加载: {} ({})", path, data["model_type"])
+        calibrated_str = "calibrated" if instance._calibrated_pipeline else "uncalibrated"
+        log.info("模型已加载: {} ({}, {})", path, data["model_type"], calibrated_str)
         return instance
 
     # ────────────────────────────────────────────────────────────

@@ -789,9 +789,14 @@ class LiveTrader:
                     )
                     # 同步策略层持仓状态
                     for s in self._strategies:
-                        if hasattr(s, '_in_position') and getattr(s, 'symbol', '') == sym:
-                            s._in_position = False
-                            log.debug("[StopLoss] 同步策略 {} _in_position=False", s.strategy_id)
+                        if getattr(s, 'symbol', '') == sym:
+                            # v2 MLPredictor 同步接口
+                            if hasattr(s, 'sync_position'):
+                                s.sync_position(0.0)
+                                log.debug("[StopLoss] 同步策略 {} sync_position(0)", s.strategy_id)
+                            elif hasattr(s, '_in_position'):
+                                s._in_position = False
+                                log.debug("[StopLoss] 同步策略 {} _in_position=False", s.strategy_id)
                 except Exception as exc:
                     log.error("[StopLoss] 止损平仓失败: {} error={}", sym, exc)
 
@@ -883,12 +888,92 @@ def main() -> None:
         )
         trader.add_strategy(mom_strategy)
 
+    # ── 策略 3: ML Predictor（条件注册：需要已训练模型文件）─────────
+    _register_ml_strategies(trader, symbols)
+
     log.info(
         "策略注册完成: {} 个策略 — {}",
         len(trader._strategies),
         [getattr(s, 'strategy_id', type(s).__name__) for s in trader._strategies],
     )
     trader.run()
+
+
+def _register_ml_strategies(trader, symbols: list) -> None:
+    """
+    条件注册 ML 策略：如果 models/ 下存在已训练模型则注册，否则跳过。
+
+    查找规则：
+    - models/{symbol_safe}_rf_model.pkl  （如 btcusdt_rf_model.pkl）
+    - models/{symbol_safe}_lgbm_model.pkl
+    - 按优先级 lgbm > rf 选取
+    """
+    from modules.alpha.ml.predictor_v2 import MLPredictor as MLPredictorV2, PredictorConfig
+    from modules.alpha.ml.model import SignalModel
+    from modules.alpha.ml.feature_builder import MLFeatureBuilder, FeatureConfig
+
+    model_dir = Path("./models")
+    if not model_dir.exists():
+        log.info("[MLReg] models/ 目录不存在，跳过 ML 策略注册")
+        return
+
+    # ML 专用下单量（较小，由 PositionSizer 动态调整）
+    ml_qty_map = {
+        "BTC/USDT": 0.002,
+        "ETH/USDT": 0.03,
+        "SOL/USDT": 0.8,
+    }
+
+    registered = 0
+    for symbol in symbols:
+        symbol_safe = symbol.replace("/", "").lower()
+
+        # 按优先级查找模型文件
+        model_path = None
+        for suffix in ["lgbm_model.pkl", "rf_model.pkl"]:
+            candidate = model_dir / f"{symbol_safe}_{suffix}"
+            if candidate.exists():
+                model_path = candidate
+                break
+
+        if model_path is None:
+            log.debug("[MLReg] {} 无已训练模型，跳过", symbol)
+            continue
+
+        try:
+            log.info("[MLReg] 加载 ML 模型: {} → {}", symbol, model_path)
+            model = SignalModel.load(model_path)
+
+            # 使用较保守的配置（实际阈值在首次 ContinuousLearner 重训后自动更新）
+            config = PredictorConfig(
+                buy_threshold=0.60,
+                sell_threshold=0.40,
+                order_qty=ml_qty_map.get(symbol, 0.001),
+                cooling_bars=5,
+                min_buffer_size=300,
+                enable_feature_cache=True,
+            )
+
+            predictor = MLPredictorV2(
+                model=model,
+                symbol=symbol,
+                config=config,
+                timeframe=trader.sys_config.data.default_timeframe,
+            )
+            trader.add_strategy(predictor)
+            registered += 1
+            log.info(
+                "[MLReg] ML 策略注册成功: {} model={} thresh={}/{}",
+                predictor.strategy_id, model.model_type,
+                config.buy_threshold, config.sell_threshold,
+            )
+        except Exception as exc:
+            log.warning("[MLReg] ML 策略注册失败: {} error={}", symbol, exc)
+
+    if registered > 0:
+        log.info("[MLReg] ML 策略注册完成: {} 个品种", registered)
+    else:
+        log.info("[MLReg] 无可用 ML 模型文件，ML 策略未注册（可通过 train_ml_model.py 训练）")
 
 
 
