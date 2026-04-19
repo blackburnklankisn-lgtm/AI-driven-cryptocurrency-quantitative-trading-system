@@ -49,11 +49,12 @@ class TestCCXTGatewayPaperMode:
 
     def test_submit_market_order_returns_paper_id(self, gateway: CCXTGateway) -> None:
         """Paper 模式下提交市价单应返回 paper_ 前缀的虚拟 ID。"""
+        gateway.update_paper_price("BTC/USDT", 67000.0)
         order_id = gateway.submit_order(
             symbol="BTC/USDT",
             side="buy",
             order_type="market",
-            quantity=0.1,
+            quantity=0.01,
         )
         assert order_id.startswith("paper_")
 
@@ -79,10 +80,11 @@ class TestCCXTGatewayPaperMode:
         assert order["status"] == "closed"
 
     def test_fetch_balance_paper_returns_dict(self, gateway: CCXTGateway) -> None:
-        """Paper 模式查询余额应返回字典。"""
+        """Paper 模式查询余额应返回字典，含初始资金。"""
         balance = gateway.fetch_balance()
         assert isinstance(balance, dict)
         assert "USDT" in balance
+        assert balance["USDT"]["free"] == 5000.0
 
 
 class TestCCXTGatewayInvalidExchange:
@@ -161,7 +163,9 @@ class TestCCXTGatewayLiveModeRetry:
 class TestOrderManager:
     @pytest.fixture
     def paper_gateway(self) -> CCXTGateway:
-        return CCXTGateway(exchange_id="binance", mode="paper")
+        gw = CCXTGateway(exchange_id="binance", mode="paper")
+        gw.update_paper_price("BTC/USDT", 67000.0)
+        return gw
 
     @pytest.fixture
     def om(self, paper_gateway: CCXTGateway) -> OrderManager:
@@ -173,7 +177,7 @@ class TestOrderManager:
             symbol="BTC/USDT",
             side="buy",
             order_type="market",
-            quantity=Decimal("0.1"),
+            quantity=Decimal("0.01"),
             price=None,
             strategy_id="test_strategy",
         )

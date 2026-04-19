@@ -49,6 +49,34 @@ risk:
   max_consecutive_losses: 5
 
 # ---------------------------
+# 组合管理配置
+# ---------------------------
+portfolio:
+  enabled: true
+  allocation_method: risk_parity   # equal_weight / risk_parity / momentum / minimum_variance
+  lookback_bars: 60
+  weight_cap: 0.40
+  min_weight: 0.0
+  rebalance_every_n: 24            # 每24根K线触发定时再平衡 (1h即每天)
+  drift_threshold: 0.05            # 权重漂移超过5%触发再平衡
+  min_trade_notional: 10.0         # 最小交易金额(USDT)，低于不调仓
+  cash_buffer_pct: 0.02            # 保留2%现金缓冲
+
+# ---------------------------
+# ML 连续学习配置
+# ---------------------------
+continuous_learning:
+  enabled: true
+  retrain_every_n_bars: 500        # 定时重训间隔(K线数)
+  min_accuracy_threshold: 0.55     # OOS精度低于此值触发重训
+  drift_significance: 0.05         # KS检验显著性水平
+  drift_check_window: 100          # 漂移检测使用的近期样本窗口
+  max_buffer_size: 10000           # OHLCV缓冲区最大长度
+  max_saved_versions: 3            # 最多保留的历史模型版本数
+  ab_test_window: 50               # A/B测试窗口(K线数)
+  min_bars_for_retrain: 400        # 触发重训所需的最少数据量
+
+# ---------------------------
 # 日志配置
 # ---------------------------
 logging:

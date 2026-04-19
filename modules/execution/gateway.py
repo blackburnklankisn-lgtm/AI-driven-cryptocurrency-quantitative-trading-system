@@ -32,6 +32,7 @@ modules/execution/gateway.py — CCXT 交易所执行网关
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import ccxt
@@ -97,6 +98,15 @@ class CCXTGateway:
             config["password"] = passphrase
 
         self._exchange: ccxt.Exchange = exchange_class(config)
+
+        # ── Paper 模式：模拟交易账户 ────────────────────────────
+        if self.mode == "paper":
+            self._paper_cash: Decimal = Decimal("5000")
+            self._paper_positions: Dict[str, Decimal] = {}
+            self._paper_orders: Dict[str, Dict[str, Any]] = {}
+            self._paper_latest_prices: Dict[str, float] = {}
+            self._paper_fee_rate = Decimal("0.001")   # 0.1%
+            self._paper_slippage_rate = Decimal("0.001")  # 0.1%
 
         log.info(
             "CCXTGateway 初始化: exchange={} mode={}",
@@ -188,7 +198,14 @@ class CCXTGateway:
             标准化的订单字典，包含 status/filled/remaining/average_price 等字段。
         """
         if self.mode == "paper":
-            return {"id": order_id, "status": "closed", "filled": 0, "remaining": 0}
+            paper_data = self._paper_orders.get(order_id, {})
+            return {
+                "id": order_id,
+                "status": paper_data.get("status", "closed"),
+                "filled": paper_data.get("filled", 0),
+                "remaining": 0,
+                "average": paper_data.get("average", 0),
+            }
 
         try:
             return self._exchange.fetch_order(order_id, symbol)
@@ -215,7 +232,8 @@ class CCXTGateway:
             CCXT 标准格式的余额字典，包含 free/used/total 三类余额。
         """
         if self.mode == "paper":
-            return {"USDT": {"free": 0, "used": 0, "total": 0}}
+            cash = float(self._paper_cash)
+            return {"USDT": {"free": cash, "used": 0, "total": cash}}
 
         try:
             return self._exchange.fetch_balance()
@@ -262,6 +280,34 @@ class CCXTGateway:
         log.info("CCXTGateway 已关闭: exchange={}", self.exchange_id)
 
     # ────────────────────────────────────────────────────────────
+    # Paper 模式辅助接口
+    # ────────────────────────────────────────────────────────────
+
+    def update_paper_price(self, symbol: str, price: float) -> None:
+        """更新 Paper 模式最新行情价（用于模拟成交价计算）。"""
+        if self.mode == "paper":
+            self._paper_latest_prices[symbol] = price
+
+    def set_paper_cash(self, amount: float) -> None:
+        """设置 Paper 模式现金余额（用于状态恢复）。"""
+        if self.mode == "paper":
+            self._paper_cash = Decimal(str(amount))
+            log.info("[PAPER] 现金余额设置: {:.2f}", amount)
+
+    def set_paper_positions(self, positions: Dict[str, Decimal]) -> None:
+        """设置 Paper 模式持仓（用于状态恢复）。"""
+        if self.mode == "paper":
+            self._paper_positions = dict(positions)
+            log.info("[PAPER] 持仓恢复: {}", {s: float(q) for s, q in positions.items() if q > 0})
+
+    @property
+    def paper_cash(self) -> float:
+        """获取 Paper 模式当前现金余额。"""
+        if self.mode == "paper":
+            return float(self._paper_cash)
+        return 0.0
+
+    # ────────────────────────────────────────────────────────────
     # 私有实现
     # ────────────────────────────────────────────────────────────
 
@@ -273,21 +319,109 @@ class CCXTGateway:
         quantity: float,
         price: Optional[float],
     ) -> str:
-        """Paper 模式：生成虚拟订单 ID，写入审计日志。"""
+        """
+        Paper 模式：模拟真实交易撮合。
+
+        市价单立即按最新价格（含滑点）成交，更新现金和持仓。
+        限价单按指定价格成交。
+        余额不足或持仓不足时抛出 OrderSubmissionError。
+        """
         import uuid
         order_id = f"paper_{uuid.uuid4().hex[:12]}"
+        qty = Decimal(str(quantity))
+
+        # ── 确定成交价 ────────────────────────────────────────
+        if order_type == "market":
+            latest_price = self._paper_latest_prices.get(symbol)
+            if latest_price is None or latest_price <= 0:
+                log.warning("[PAPER] {} 无行情价格，无法模拟成交", symbol)
+                self._paper_orders[order_id] = {
+                    "status": "rejected", "filled": 0, "average": 0,
+                }
+                raise OrderSubmissionError(f"Paper模式: {symbol} 无行情数据")
+
+            fill_price = Decimal(str(latest_price))
+            if side == "buy":
+                fill_price = fill_price * (1 + self._paper_slippage_rate)
+            else:
+                fill_price = fill_price * (1 - self._paper_slippage_rate)
+        else:
+            # 限价单：按指定价格成交
+            if price is None or price <= 0:
+                raise OrderSubmissionError("限价单必须提供有效价格")
+            fill_price = Decimal(str(price))
+
+        notional = qty * fill_price
+        fee = notional * self._paper_fee_rate
+
+        # ── 执行模拟成交 ──────────────────────────────────────
+        if side == "buy":
+            total_cost = notional + fee
+            if total_cost > self._paper_cash:
+                reason = (
+                    f"余额不足: 需要 {float(total_cost):.2f} USDT, "
+                    f"可用 {float(self._paper_cash):.2f} USDT"
+                )
+                log.warning("[PAPER] {} {} 被拒: {}", symbol, side, reason)
+                self._paper_orders[order_id] = {
+                    "status": "rejected", "filled": 0, "average": 0,
+                }
+                audit_log(
+                    "ORDER_REJECTED", mode="paper", order_id=order_id,
+                    symbol=symbol, side=side, reason="insufficient_funds",
+                    need=float(total_cost), have=float(self._paper_cash),
+                )
+                raise OrderSubmissionError(reason)
+
+            self._paper_cash -= total_cost
+            self._paper_positions[symbol] = (
+                self._paper_positions.get(symbol, Decimal("0")) + qty
+            )
+
+        elif side == "sell":
+            current_pos = self._paper_positions.get(symbol, Decimal("0"))
+            actual_qty = min(qty, current_pos)
+            if actual_qty <= 0:
+                reason = f"持仓不足: {symbol} 当前持仓={float(current_pos)}"
+                log.warning("[PAPER] {} {} 被拒: {}", symbol, side, reason)
+                self._paper_orders[order_id] = {
+                    "status": "rejected", "filled": 0, "average": 0,
+                }
+                raise OrderSubmissionError(reason)
+
+            # 按实际可卖数量成交
+            qty = actual_qty
+            notional = qty * fill_price
+            fee = notional * self._paper_fee_rate
+            self._paper_cash += notional - fee
+            self._paper_positions[symbol] = current_pos - qty
+
+        # ── 记录成交结果 ──────────────────────────────────────
+        self._paper_orders[order_id] = {
+            "status": "closed",
+            "filled": float(qty),
+            "average": float(fill_price),
+            "fee": float(fee),
+        }
 
         audit_log(
-            "ORDER_SUBMITTED",
-            mode="paper",
+            "PAPER_FILL",
             order_id=order_id,
             symbol=symbol,
             side=side,
             order_type=order_type,
-            quantity=quantity,
-            price=price,
+            quantity=float(qty),
+            fill_price=float(fill_price),
+            fee=float(fee),
+            notional=float(notional),
+            cash_after=float(self._paper_cash),
         )
-        log.info("[PAPER] 虚拟订单已记录: order_id={}", order_id)
+        log.info(
+            "[PAPER] 模拟成交: {} {} {} qty={:.6f} price={:.4f} "
+            "fee={:.4f} notional={:.2f} cash={:.2f}",
+            order_id, symbol, side, float(qty), float(fill_price),
+            float(fee), float(notional), float(self._paper_cash),
+        )
         return order_id
 
     def _live_submit(

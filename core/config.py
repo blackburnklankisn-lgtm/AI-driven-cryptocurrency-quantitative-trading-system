@@ -111,6 +111,38 @@ class DataConfig(BaseSettings):
     storage_dir: str = "./storage"
 
 
+class PortfolioConfig(BaseSettings):
+    """组合管理配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    enabled: bool = True
+    allocation_method: str = "risk_parity"  # equal_weight / risk_parity / momentum / minimum_variance
+    lookback_bars: int = 60
+    weight_cap: float = 0.40
+    min_weight: float = 0.0
+    rebalance_every_n: int = 24
+    drift_threshold: float = 0.05
+    min_trade_notional: float = 10.0
+    cash_buffer_pct: float = 0.02
+
+
+class ContinuousLearningConfig(BaseSettings):
+    """ML 连续学习配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    enabled: bool = True
+    retrain_every_n_bars: int = 500
+    min_accuracy_threshold: float = 0.55
+    drift_significance: float = 0.05
+    drift_check_window: int = 100
+    max_buffer_size: int = 10000
+    max_saved_versions: int = 3
+    ab_test_window: int = 50
+    min_bars_for_retrain: int = 400
+
+
 class LoggingConfig(BaseSettings):
     """日志配置。"""
 
@@ -164,6 +196,8 @@ class SystemConfig(BaseSettings):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    continuous_learning: ContinuousLearningConfig = Field(default_factory=ContinuousLearningConfig)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -215,6 +249,8 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
         # DataConfig：YAML 提供 default_symbols 等纯配置字段，未被 env 覆盖，
         #   用 model_validate 保留这些值。
         data_yaml = yaml_data.pop("data", {}) or {}
+        portfolio_yaml = yaml_data.pop("portfolio", {}) or {}
+        cl_yaml = yaml_data.pop("continuous_learning", {}) or {}
         yaml_data.pop("exchange", None)   # 由 ExchangeConfig() 从 env 读取
         yaml_data.pop("risk", None)       # 由 RiskConfig()    从 env 读取
         yaml_data.pop("logging", None)    # 由 LoggingConfig() 从 env 读取
@@ -225,6 +261,8 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
             "risk": RiskConfig(),                          # env 优先：MAX_* 风控限制
             "data": DataConfig.model_validate(data_yaml),  # YAML 优先：default_symbols 等
             "logging": LoggingConfig(),                    # env 优先：LOG_LEVEL 等
+            "portfolio": PortfolioConfig.model_validate(portfolio_yaml),
+            "continuous_learning": ContinuousLearningConfig.model_validate(cl_yaml),
         })
     except Exception as exc:
         raise ConfigError(f"系统配置验证失败: {exc}") from exc

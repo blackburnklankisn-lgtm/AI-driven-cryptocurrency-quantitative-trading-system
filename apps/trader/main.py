@@ -39,7 +39,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import threading
 import uvicorn
 import asyncio
@@ -47,12 +47,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from core.config import load_config
 from core.event import EventBus, EventType, KlineEvent, OrderRequestEvent
-from core.logger import audit_log, get_logger, setup_logging
+from core.logger import audit_log, get_logger, setup_logging, trade_log
 from modules.execution.gateway import CCXTGateway
 from modules.execution.order_manager import OrderManager
 from modules.monitoring.metrics import SystemMetrics
 from modules.risk.manager import RiskConfig, RiskManager
 from modules.risk.position_sizer import PositionSizer
+from modules.portfolio.allocator import AllocationMethod, PortfolioAllocator
+from modules.portfolio.rebalancer import PortfolioRebalancer, RebalanceOrder
+from modules.portfolio.performance_attribution import PerformanceAttributor
 from apps.api.server import app as fast_app, set_trader_instance, WebsocketLogSink
 
 log = get_logger(__name__)
@@ -144,6 +147,47 @@ class LiveTrader:
         # 轮询间隔（根据 timeframe 动态调整，1h K 线每 60s 轮询一次）
         self._poll_interval_s: float = 60.0
 
+        # ── 7. 收益率跟踪（Allocator/Optimizer 数据源）────────────
+        self._prev_closes: Dict[str, float] = {}
+
+        # ── 8. 组合管理层（可通过配置 enabled 开关）──────────────
+        pf_cfg = self.sys_config.portfolio
+        self._portfolio_enabled = pf_cfg.enabled
+        if self._portfolio_enabled:
+            method_map = {
+                "equal_weight": AllocationMethod.EQUAL_WEIGHT,
+                "risk_parity": AllocationMethod.RISK_PARITY,
+                "momentum": AllocationMethod.MOMENTUM_WEIGHTED,
+                "minimum_variance": AllocationMethod.MINIMUM_VARIANCE,
+            }
+            self.allocator = PortfolioAllocator(
+                method=method_map.get(pf_cfg.allocation_method, AllocationMethod.RISK_PARITY),
+                lookback_bars=pf_cfg.lookback_bars,
+                weight_cap=pf_cfg.weight_cap,
+                min_weight=pf_cfg.min_weight,
+            )
+            self.rebalancer = PortfolioRebalancer(
+                allocator=self.allocator,
+                rebalance_every_n=pf_cfg.rebalance_every_n,
+                drift_threshold=pf_cfg.drift_threshold,
+                min_trade_notional=pf_cfg.min_trade_notional,
+                cash_buffer_pct=pf_cfg.cash_buffer_pct,
+            )
+            log.info(
+                "组合管理层已启用: method={} rebalance_every={} drift={}",
+                pf_cfg.allocation_method, pf_cfg.rebalance_every_n, pf_cfg.drift_threshold,
+            )
+        else:
+            self.allocator = None
+            self.rebalancer = None
+            log.info("组合管理层已禁用 (portfolio.enabled=false)")
+
+        # ── 9. 绩效归因器 ────────────────────────────────────────
+        self.attributor = PerformanceAttributor()
+
+        # ── 10. ContinuousLearner 实例表 {strategy_id: learner} ──
+        self._continuous_learners: Dict[str, object] = {}
+
         log.info(
             "LiveTrader 初始化完成: exchange={} mode={} symbols={}",
             exc_cfg.exchange_id,
@@ -200,6 +244,14 @@ class LiveTrader:
         self._running = True
         heartbeat_seq = 0
 
+        log.info(
+            "[System] 主循环就绪启动: 策略={} 组合管理={} CL实例={} 轮询间隔={}s",
+            len(self._strategies),
+            self._portfolio_enabled,
+            len(self._continuous_learners),
+            self._poll_interval_s,
+        )
+
         while self._running:
             loop_start = time.monotonic()
             heartbeat_seq += 1
@@ -239,39 +291,140 @@ class LiveTrader:
         self.metrics.record_heartbeat()
         log.debug("主循环心跳: seq={} ts={}", seq, now.isoformat())
 
+        # 每 10 次循环输出一次 INFO 级状态摘要（约每 10 分钟），监控各模块健康状态
+        if seq % 10 == 1:
+            _cl_summary = {
+                sid: f"{len(l._ohlcv_buffer)}/{l.config.min_bars_for_retrain}"
+                for sid, l in self._continuous_learners.items()
+            }
+            _alloc_warm = {
+                s: self.allocator.is_warm(s)
+                for s in self.sys_config.data.default_symbols
+            } if (self._portfolio_enabled and self.allocator) else {}
+            log.info(
+                "[Loop#{}] 状态: equity={:.2f} positions={} CL_buf={} alloc_warm={}",
+                seq, self._current_equity,
+                {s: float(q) for s, q in self._positions.items() if q > 0},
+                _cl_summary,
+                _alloc_warm,
+            )
+
         symbols = self.sys_config.data.default_symbols
 
         # Step 1: 拉取最新行情，构建 KlineEvent
         kline_events = self._fetch_latest_klines(symbols)
         log.debug("[Loop#{0}] 拉取K线: {1}个事件", seq, len(kline_events))
 
-        # Step 2: 驱动策略并缓存 K 线
+        # Step 2: 驱动策略并缓存 K 线 + 收益率跟踪
+        rebalance_triggered = False
         for event in kline_events:
+            close_f = float(event.close)
             prev_price = self._latest_prices.get(event.symbol, 0)
-            self._latest_prices[event.symbol] = float(event.close)
+            self._latest_prices[event.symbol] = close_f
             self._cache_kline_event(event)
+
+            # ── 收益率计算（Allocator 数据源）────────────────────
+            prev_close = self._prev_closes.get(event.symbol, close_f)
+            if prev_close > 0:
+                period_return = (close_f - prev_close) / prev_close
+            else:
+                period_return = 0.0
+            self._prev_closes[event.symbol] = close_f
+
+            # 喂入 Allocator
+            if self._portfolio_enabled and self.allocator:
+                self.allocator.update_return(event.symbol, period_return)
+                log.debug(
+                    "[Allocator] update_return: {} ret={:.5f} warm={}",
+                    event.symbol, period_return, self.allocator.is_warm(event.symbol),
+                )
+
+            # 喂入 PerformanceAttributor (价格记录)
+            self.attributor.record_price(event.symbol, close_f, now)
+
+            # 喂入 ContinuousLearner (OHLCV)
+            _sym_safe = event.symbol.replace("/", "_")
+            for sid, learner in self._continuous_learners.items():
+                if _sym_safe in sid:
+                    ohlcv_row = {
+                        "timestamp": event.timestamp,
+                        "open": float(event.open),
+                        "high": float(event.high),
+                        "low": float(event.low),
+                        "close": close_f,
+                        "volume": float(event.volume),
+                    }
+                    new_model = learner.on_new_bar(ohlcv_row)
+                    buf_len = len(learner._ohlcv_buffer)
+                    # 每100根输出一次 INFO 里程碑日志，方便观察进度
+                    if buf_len % 100 == 0 or buf_len == learner.config.min_bars_for_retrain:
+                        log.info(
+                            "[CL] {} buf={}/{} since_retrain={} 触发阈值={}",
+                            sid, buf_len,
+                            learner.config.max_buffer_size,
+                            learner._bars_since_retrain,
+                            learner.config.min_bars_for_retrain,
+                        )
+                    else:
+                        log.debug(
+                            "[CL] on_new_bar: {} buf={}/{} since_retrain={} new_model={}",
+                            sid, buf_len,
+                            learner.config.min_bars_for_retrain,
+                            learner._bars_since_retrain,
+                            new_model is not None,
+                        )
+                    if new_model is not None:
+                        self._on_model_updated(sid, learner, new_model)
+
             log.debug(
-                "[Loop#{0}] 处理K线: {1} close={2:.4f} (prev={3:.4f})",
-                seq, event.symbol, float(event.close), prev_price,
+                "[Loop#{0}] 处理K线: {1} close={2:.4f} (prev={3:.4f}) ret={4:.5f}",
+                seq, event.symbol, close_f, prev_price, period_return,
             )
             self._process_kline_event(event)
 
-        # Step 3: 周期性 AI 深度分析 (如每小时一次)
+        # Step 3: 组合再平衡检查（再平衡优先于策略信号冲突）
+        if self._portfolio_enabled and self.rebalancer and kline_events:
+            weights = self.allocator.compute_weights(symbols) if self.allocator else {}
+            log.debug(
+                "[Rebalancer] 当前目标权重: {}",
+                {s: f"{w:.3f}" for s, w in weights.items()},
+            )
+            rebal_orders = self.rebalancer.on_bar_close(
+                equity=self._current_equity or 5000.0,
+                positions=dict(self._positions),
+                prices=self._latest_prices,
+                symbols=symbols,
+            )
+            if rebal_orders:
+                rebalance_triggered = True
+                log.info(
+                    "[Rebalancer] 触发再平衡: {} 笔订单 (bar={})",
+                    len(rebal_orders), self.rebalancer._bar_count,
+                )
+                self._process_rebalance_orders(rebal_orders)
+            else:
+                log.debug(
+                    "[Rebalancer] bar={} bars_since_last={} 未触发再平衡",
+                    self.rebalancer._bar_count,
+                    self.rebalancer._bar_count - self.rebalancer._last_rebalance_bar,
+                )
+
+        # Step 4: 周期性 AI 深度分析 (如每小时一次)
         if now.minute == 0 and now.second < 10:
              self._run_ai_analysis()
 
-        # Step 4: 轮询成交回报
+        # Step 5: 轮询成交回报
         fills = self.order_manager.poll_fills()
         log.debug("[Loop#{0}] 成交回报: {1}笔", seq, len(fills))
         for fill in fills:
             self._on_fill(fill)
 
-        # Step 4: 撤销超时订单
+        # Step 5b: 撤销超时订单
         cancelled = self.order_manager.cancel_timed_out_orders()
         if cancelled > 0:
             log.warning("超时撤单 {} 笔", cancelled)
 
-        # Step 5: 更新账户快照与指标
+        # Step 6: 更新账户快照与指标
         self._update_account_snapshot()
         log.debug(
             "[Loop#{0}] 账户快照: equity={1:.2f} positions={2} entry_prices={3}",
@@ -280,10 +433,10 @@ class LiveTrader:
             {s: f"{p:.4f}" for s, p in self._entry_prices.items()},
         )
 
-        # Step 6: 硬止损检查（熔断时强制平仓）
+        # Step 7: 硬止损检查（熔断时强制平仓）
         self._check_stop_loss()
 
-        # Step 7: 每日重置检测（UTC 00:00 后的第一次循环）
+        # Step 8: 每日重置检测（UTC 00:00 后的第一次循环）
         self._check_daily_reset(now)
 
 
@@ -326,6 +479,9 @@ class LiveTrader:
                 # 同时更新最新价格（用最后一根的收盘价）
                 _, _, _, _, last_c, _ = candles[-1]
                 self._latest_prices[symbol] = float(last_c)
+                # Paper 模式：同步行情到网关（用于模拟成交价计算）
+                if self.mode == "paper":
+                    self.gateway.update_paper_price(symbol, float(last_c))
 
             except Exception as exc:  # noqa: BLE001
                 err_str = str(exc)[:200]
@@ -452,6 +608,14 @@ class LiveTrader:
                 req.strategy_id, req.symbol, req.side, quantity, reason,
             )
             self.metrics.record_order_rejected(req.symbol, reason)
+            trade_log(
+                event_type="REJECTED",
+                strategy=req.strategy_id,
+                symbol=req.symbol,
+                side=req.side,
+                quantity=f"{quantity}",
+                reason=reason,
+            )
             return
 
         log.info(
@@ -473,19 +637,106 @@ class LiveTrader:
         except Exception as exc:
             log.error("订单提交失败: {} {} 原因={}", req.symbol, req.side, exc)
 
+    def _process_rebalance_orders(self, rebal_orders: List[RebalanceOrder]) -> None:
+        """
+        将 RebalanceOrder 转换为风控→发单管道执行。
+
+        设计说明：
+        - 再平衡订单不经过 PositionSizer（qty 已由 Allocator 精确计算）
+        - 再平衡订单不受 max_position_pct 限制（Allocator 的 weight_cap 负责权重约束）
+        - 仅受系统熔断器保护：熔断时取消全部再平衡
+
+        RiskManager.max_position_pct 设计用于单策略单次买入上限，
+        而 Allocator 管理的是整个组合权重，两者职责分离。
+        """
+        # 熔断检查：若已熔断，取消本次再平衡
+        if self.risk_manager.is_circuit_broken():
+            log.warning("[Rebalance] 系统已熔断，取消本次再平衡 (orders={})", len(rebal_orders))
+            return
+
+        equity = self._current_equity or 5000.0
+        submitted = 0
+        rejected = 0
+        for order in rebal_orders:
+            log.info(
+                "[Rebalance] {} {} qty={:.6f} notional={:.2f} reason={} weight:{:.3f}→{:.3f}",
+                order.symbol, order.side, float(order.quantity), order.notional,
+                order.reason, order.current_weight, order.target_weight,
+            )
+
+            # 简单安全边界：单笔名义金额不超过总净值的 50%（防止异常权重）
+            if order.notional > equity * 0.5:
+                log.warning(
+                    "[Rebalance] {} notional={:.2f} > equity*50%={:.2f}，跳过异常订单",
+                    order.symbol, order.notional, equity * 0.5,
+                )
+                rejected += 1
+                continue
+
+            try:
+                self.order_manager.submit(
+                    symbol=order.symbol,
+                    side=order.side,
+                    order_type="market",
+                    quantity=order.quantity,
+                    price=None,
+                    strategy_id="portfolio_rebalancer",
+                )
+                submitted += 1
+            except Exception as exc:
+                log.error("[Rebalance] 订单提交失败: {} error={}", order.symbol, exc)
+                rejected += 1
+
+        log.info(
+            "[Rebalance] 完成: submitted={} rejected={} total={}",
+            submitted, rejected, len(rebal_orders),
+        )
+
+    def _on_model_updated(self, strategy_id: str, learner, new_model) -> None:
+        """ContinuousLearner 产出新模型时的热替换回调。"""
+        log.info("[CL] 新模型产出，开始热替换: strategy_id={}", strategy_id)
+        replaced = False
+        for s in self._strategies:
+            sid = getattr(s, 'strategy_id', '')
+            if sid == strategy_id:
+                # 热替换模型
+                if hasattr(s, 'model'):
+                    old_type = getattr(s.model, 'model_type', '?')
+                    s.model = new_model
+                    log.info(
+                        "[CL] 模型热替换成功: {} old={} → new={}",
+                        sid, old_type, getattr(new_model, 'model_type', '?'),
+                    )
+                    replaced = True
+                # 注入自适应阈值
+                if hasattr(s, 'set_thresholds') and hasattr(learner, 'get_optimal_thresholds'):
+                    buy_t, sell_t = learner.get_optimal_thresholds()
+                    s.set_thresholds(buy_t, sell_t)
+                    log.info("[CL] 自适应阈值注入: {} buy={:.3f} sell={:.3f}", sid, buy_t, sell_t)
+                break
+        if not replaced:
+            log.warning("[CL] 未找到对应策略进行热替换: {}", strategy_id)
+
     def _on_fill(self, fill) -> None:
-        """处理成交回报：更新持仓和入场均价，记录指标。"""
+        """处理成交回报：更新持仓和入场均价，记录指标，写入交易日志。"""
         rec = fill.order_record
+        fill_price = float(fill.avg_price)
+        fill_qty = float(fill.new_filled_qty)
+        notional = fill_qty * fill_price
+        fee = notional * 0.001
+
         log.info(
             "[Fill] strategy={} {} {} qty={} avg_price={} order_id={}",
             rec.strategy_id, rec.symbol, rec.side,
-            float(fill.new_filled_qty), float(fill.avg_price), rec.exchange_id,
+            fill_qty, fill_price, rec.exchange_id,
         )
+
+        pnl = 0.0
         if rec.side == "buy":
             old_qty = float(self._positions.get(rec.symbol, Decimal("0")))
             old_entry = self._entry_prices.get(rec.symbol, 0.0)
-            new_qty = float(fill.new_filled_qty)
-            new_price = float(fill.avg_price)
+            new_qty = fill_qty
+            new_price = fill_price
             # 加权平均入场价
             total_qty = old_qty + new_qty
             if total_qty > 0:
@@ -505,9 +756,12 @@ class LiveTrader:
                 Decimal("0"), current - fill.new_filled_qty
             )
             remaining = float(self._positions[rec.symbol])
+            # 计算本笔盈亏
+            entry_price = self._entry_prices.get(rec.symbol, fill_price)
+            pnl = (fill_price - entry_price) * fill_qty - fee
             log.info(
-                "[Fill] 卖出成交: {} remaining_qty={:.6f}",
-                rec.symbol, remaining,
+                "[Fill] 卖出成交: {} remaining_qty={:.6f} entry={:.4f} pnl={:.4f}",
+                rec.symbol, remaining, entry_price, pnl,
             )
             # 清仓时移除入场价，并清除止损待处理标记
             if self._positions[rec.symbol] <= 0:
@@ -515,18 +769,51 @@ class LiveTrader:
                 self._stop_loss_pending.discard(rec.symbol)
                 log.info("[Fill] {} 已清仓，移除入场价和止损待处理标记", rec.symbol)
 
-        notional = float(fill.new_filled_qty * fill.avg_price)
         self.metrics.record_order_filled(
-            rec.symbol, rec.side, float(fill.new_filled_qty), notional, fee=notional * 0.001
+            rec.symbol, rec.side, fill_qty, notional, fee=fee
         )
+
+        # ── 写入专用交易日志（每日轮转） ─────────────────────
+        cash_after = self.gateway.paper_cash if self.mode == "paper" else 0
+        trade_log(
+            event_type="FILL",
+            strategy=rec.strategy_id,
+            symbol=rec.symbol,
+            side=rec.side,
+            quantity=f"{fill_qty:.6f}",
+            price=f"{fill_price:.4f}",
+            notional=f"{notional:.2f}",
+            fee=f"{fee:.4f}",
+            pnl=f"{pnl:.4f}" if rec.side == "sell" else "N/A",
+            entry_price=f"{self._entry_prices.get(rec.symbol, 0):.4f}" if rec.side == "buy" else f"{self._entry_prices.get(rec.symbol, fill_price):.4f}",
+            positions={s: f"{float(q):.6f}" for s, q in self._positions.items() if q > 0},
+            equity=f"{self._current_equity:.2f}",
+            cash=f"{cash_after:.2f}",
+        )
+
+        # ── PerformanceAttributor 记录成交 ─────────────────────
+        try:
+            self.attributor.record_trade(
+                symbol=rec.symbol,
+                strategy_id=rec.strategy_id,
+                side=rec.side,
+                quantity=float(fill.new_filled_qty),
+                price=float(fill.avg_price),
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            log.debug(
+                "[Attributor] 记录成交: {} {} {} qty={:.6f} price={:.4f}",
+                rec.strategy_id, rec.symbol, rec.side,
+                float(fill.new_filled_qty), float(fill.avg_price),
+            )
+        except Exception:
+            log.debug("[Attributor] record_trade 失败（非关键）")
 
     def _update_account_snapshot(self) -> None:
         """查询账户余额，更新净值和持仓指标。"""
         try:
             balance = self.gateway.fetch_balance()
             usdt_free = balance.get("USDT", {}).get("free", 0) if isinstance(balance.get("USDT"), dict) else 0
-            if self.mode == "paper" and usdt_free == 0:
-                usdt_free = 5000.0  # Paper 模式默认初始资金
             positions_value = sum(
                 float(qty) * self._latest_prices.get(sym, 0)
                 for sym, qty in self._positions.items()
@@ -544,8 +831,8 @@ class LiveTrader:
                 log.error("更新账户快照失败(Live模式保留旧值): {}", err_str)
                 # Live 模式保留上一次的 equity，不注入假数据
             else:
-                log.warning("更新账户快照(走Mock): {}", err_str)
-                self._current_equity = 5000.0
+                log.warning("更新账户快照(Paper保留旧值): {}", err_str)
+                # Paper 模式也保留旧值，不再注入默认 5000
 
         # 每次更新后持久化状态
         self._save_state()
@@ -565,7 +852,7 @@ class LiveTrader:
         """启动时预加载历史 K 线，让策略完成暖机（预热期）。"""
         symbols = self.sys_config.data.default_symbols
         tf = self.sys_config.data.default_timeframe
-        preload_bars = 50  # 加载 50 根历史 K 线（足够 slow_window=30 预热）
+        preload_bars = 500  # 加载 500 根历史 K 线（满足 ML min_buffer_size=300 + Allocator lookback=60）
 
         log.info("开始预加载历史 K 线: bars={} timeframe={}", preload_bars, tf)
 
@@ -578,6 +865,7 @@ class LiveTrader:
 
                 # 除最后一根（可能未收线）外，全部喂给策略
                 closed_candles = candles[:-1] if len(candles) > 1 else candles
+                prev_close = None
                 for ts_ms, o, h, l, c, v in closed_candles:
                     event = KlineEvent(
                         event_type=EventType.KLINE_UPDATED,
@@ -593,6 +881,31 @@ class LiveTrader:
                         is_closed=True,
                     )
                     self._cache_kline_event(event) # 同时也放入前端缓存
+
+                    # 喂给 Allocator 收益率
+                    if self._portfolio_enabled and self.allocator:
+                        if prev_close and prev_close > 0:
+                            period_return = (float(c) - prev_close) / prev_close
+                        else:
+                            period_return = 0.0
+                        self.allocator.update_return(symbol, period_return)
+                    prev_close = float(c)
+
+                    # 喂给 ContinuousLearner（预加载期直接追加数据，不触发重训）
+                    _sym_safe_pre = symbol.replace("/", "_")
+                    for sid, learner in self._continuous_learners.items():
+                        if _sym_safe_pre in sid:
+                            ohlcv_row = {
+                                "timestamp": event.timestamp,
+                                "open": float(o), "high": float(h),
+                                "low": float(l), "close": float(c),
+                                "volume": float(v),
+                            }
+                            # 预加载期直接追加缓冲区，跳过重训触发检查
+                            learner._ohlcv_buffer.append(ohlcv_row)
+                            learner._bar_count += 1
+                            learner._bars_since_retrain += 1
+
                     # 只驱动策略内部状态更新，不触发下单
                     for strategy in self._strategies:
                         try:
@@ -600,16 +913,42 @@ class LiveTrader:
                         except Exception:  # noqa: BLE001
                             pass
 
-                # 更新最新价格
+                # 更新最新价格和 prev_closes
                 _, _, _, _, last_c, _ = candles[-1]
                 self._latest_prices[symbol] = float(last_c)
+                self._prev_closes[symbol] = float(closed_candles[-1][4]) if closed_candles else float(last_c)
+                # Paper 模式：同步行情到网关
+                if self.mode == "paper":
+                    self.gateway.update_paper_price(symbol, float(last_c))
 
-                log.info("预加载完成: {} bars={}", symbol, len(closed_candles))
-
+                # 预加载后的状态摘要
+                _sym_safe_sum = symbol.replace("/", "_")
+                cl_buf = next(
+                    (len(l._ohlcv_buffer) for sid, l in self._continuous_learners.items() if _sym_safe_sum in sid),
+                    0,
+                )
+                alloc_warm = (
+                    self.allocator.is_warm(symbol)
+                    if (self._portfolio_enabled and self.allocator) else False
+                )
+                log.info(
+                    "预加载完成: {} bars={} alloc_warm={} CL_buf={}",
+                    symbol, len(closed_candles), alloc_warm, cl_buf,
+                )
 
             except Exception as exc:  # noqa: BLE001
                 log.warning("预加载失败: {} error={}", symbol, str(exc)[:200])
-        
+
+        # 预加载整体摘要
+        if self._portfolio_enabled and self.allocator:
+            warm_symbols = [s for s in symbols if self.allocator.is_warm(s)]
+            log.info("[Preload] Allocator 预热完成: {}/{} 品种已达 lookback_bars/2",
+                     len(warm_symbols), len(symbols))
+        if self._continuous_learners:
+            for sid, learner in self._continuous_learners.items():
+                log.info("[Preload] ContinuousLearner {}: buf={}/{}",
+                         sid, len(learner._ohlcv_buffer), learner.config.min_bars_for_retrain)
+
         log.info("AUDIT: K-line history cache is now ready and populated.")
 
     def _cache_kline_event(self, event: KlineEvent) -> None:
@@ -634,8 +973,8 @@ class LiveTrader:
         else:
             store.append(kline)
             # 限制长度，防止内存无限增长
-            if len(store) > 200:
-                self._kline_store[event.symbol] = store[-200:]
+            if len(store) > 600:
+                self._kline_store[event.symbol] = store[-600:]
 
     def _run_ai_analysis(self) -> None:
         """驱动 Gemini AI 对当前盘面进行解读（如果已配置 Key）。"""
@@ -674,6 +1013,7 @@ class LiveTrader:
             "entry_prices": self._entry_prices,
             "current_equity": self._current_equity,
             "latest_prices": self._latest_prices,
+            "paper_cash": self.gateway.paper_cash if self.mode == "paper" else 0,
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
         try:
@@ -699,10 +1039,21 @@ class LiveTrader:
             self._entry_prices = state.get("entry_prices", {})
             self._current_equity = state.get("current_equity", 0.0)
             self._latest_prices = state.get("latest_prices", {})
+
+            # 恢复 Paper 模式网关状态（现金 + 持仓 + 行情价格）
+            if self.mode == "paper":
+                paper_cash = state.get("paper_cash", 5000.0)
+                self.gateway.set_paper_cash(paper_cash)
+                self.gateway.set_paper_positions(self._positions)
+                # 恢复行情价格（用于首个交易周期的成交价计算）
+                for sym, price in self._latest_prices.items():
+                    self.gateway.update_paper_price(sym, price)
+
             log.info(
-                "已恢复历史状态: equity={:.2f} positions={}",
+                "已恢复历史状态: equity={:.2f} positions={} paper_cash={:.2f}",
                 self._current_equity,
                 dict(self._positions),
+                state.get("paper_cash", 5000.0),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("状态恢复失败（使用默认值启动）: {}", exc)
@@ -773,6 +1124,15 @@ class LiveTrader:
 
             if should_stop:
                 log.warning("[StopLoss] 触发平仓: {} {} qty={}", sym, reason, float(qty))
+                trade_log(
+                    event_type="STOP_LOSS",
+                    symbol=sym,
+                    side="sell",
+                    quantity=f"{float(qty):.6f}",
+                    current_price=f"{current_price:.4f}",
+                    entry_price=f"{entry_price:.4f}" if entry_price else "N/A",
+                    reason=reason,
+                )
                 try:
                     self.order_manager.submit(
                         symbol=sym,
@@ -911,6 +1271,9 @@ def _register_ml_strategies(trader, symbols: list) -> None:
     from modules.alpha.ml.predictor_v2 import MLPredictor as MLPredictorV2, PredictorConfig
     from modules.alpha.ml.model import SignalModel
     from modules.alpha.ml.feature_builder import MLFeatureBuilder, FeatureConfig
+    from modules.alpha.ml.continuous_learner import ContinuousLearner, ContinuousLearnerConfig
+    from modules.alpha.ml.trainer import WalkForwardTrainer
+    from modules.alpha.ml.labeler import ReturnLabeler
 
     model_dir = Path("./models")
     if not model_dir.exists():
@@ -967,6 +1330,57 @@ def _register_ml_strategies(trader, symbols: list) -> None:
                 predictor.strategy_id, model.model_type,
                 config.buy_threshold, config.sell_threshold,
             )
+
+            # ── ContinuousLearner 接入（如已启用）─────────────────
+            cl_cfg = trader.sys_config.continuous_learning
+            if cl_cfg.enabled:
+                try:
+                    feature_builder = MLFeatureBuilder()
+                    labeler = ReturnLabeler()
+                    trainer = WalkForwardTrainer(
+                        feature_builder=feature_builder,
+                        labeler=labeler,
+                        calibrate=True,
+                        feature_selection=True,
+                    )
+                    learner_config = ContinuousLearnerConfig(
+                        retrain_every_n_bars=cl_cfg.retrain_every_n_bars,
+                        min_accuracy_threshold=cl_cfg.min_accuracy_threshold,
+                        drift_significance=cl_cfg.drift_significance,
+                        drift_check_window=cl_cfg.drift_check_window,
+                        max_buffer_size=cl_cfg.max_buffer_size,
+                        max_saved_versions=cl_cfg.max_saved_versions,
+                        ab_test_window=cl_cfg.ab_test_window,
+                        min_bars_for_retrain=cl_cfg.min_bars_for_retrain,
+                    )
+                    learner = ContinuousLearner(
+                        trainer=trainer,
+                        feature_builder=feature_builder,
+                        labeler=labeler,
+                        config=learner_config,
+                    )
+                    # 注入初始活跃模型
+                    from modules.alpha.ml.continuous_learner import ModelVersion
+                    init_version = ModelVersion(
+                        version_id="init_loaded",
+                        model=model,
+                        trained_at=datetime.now(tz=timezone.utc),
+                        train_bars=0,
+                        oos_accuracy=0.0,
+                        oos_f1=0.0,
+                        is_active=True,
+                        model_path=str(model_path),
+                    )
+                    learner._active_version = init_version
+                    learner._versions.append(init_version)
+
+                    trader._continuous_learners[predictor.strategy_id] = learner
+                    log.info(
+                        "[MLReg] ContinuousLearner 已绑定: {} retrain_every={}",
+                        predictor.strategy_id, cl_cfg.retrain_every_n_bars,
+                    )
+                except Exception as cl_exc:
+                    log.warning("[MLReg] ContinuousLearner 创建失败: {} error={}", symbol, cl_exc)
         except Exception as exc:
             log.warning("[MLReg] ML 策略注册失败: {} error={}", symbol, exc)
 

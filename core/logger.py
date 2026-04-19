@@ -156,13 +156,27 @@ def setup_logging(
     logger.add(
         log_path / "audit_{time:YYYY-MM-DD}.log",
         level="CRITICAL",
-        rotation=rotation,
+        rotation="00:00",
         retention="90 days",  # 审计日志保留更长时间
         compression="zip",
         enqueue=True,
         encoding="utf-8",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | AUDIT | {name}:{function}:{line} | {message}",
         filter=_sanitizing_filter,
+    )
+
+    # ── 交易日志文件（每日轮转，记录所有交易详情） ──────────
+    # 独立于系统日志，专注记录每笔交易的完整信息
+    logger.add(
+        log_path / "trades_{time:YYYY-MM-DD}.log",
+        level="INFO",
+        rotation="00:00",
+        retention="365 days",
+        compression="zip",
+        enqueue=True,
+        encoding="utf-8",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}",
+        filter=lambda record: record["extra"].get("trade", False),
     )
 
     _initialized = True
@@ -196,3 +210,20 @@ def audit_log(event_type: str, **kwargs: object) -> None:
     """
     fields = " | ".join(f"{k}={v!r}" for k, v in kwargs.items())
     logger.critical("[AUDIT] event={} | {}", event_type, fields)
+
+
+def trade_log(event_type: str, **kwargs: object) -> None:
+    """
+    写入专用交易日志（trades_{date}.log）。
+
+    记录每笔交易的完整详情，包括：
+    - 成交（FILL）：策略、品种、方向、数量、价格、手续费、盈亏
+    - 拒绝（REJECTED）：策略、品种、方向、拒绝原因
+    - 止损（STOP_LOSS）：品种、触发价、入场价、亏损原因
+
+    Args:
+        event_type: 事件类型（FILL / REJECTED / STOP_LOSS）
+        **kwargs:   交易相关字段
+    """
+    fields = " | ".join(f"{k}={v}" for k, v in kwargs.items())
+    logger.bind(trade=True).info("[TRADE] event={} | {}", event_type, fields)
