@@ -120,10 +120,18 @@ class LiveTrader:
         self._strategies = []
 
         # 运行状态
-        self._running = False
         self._positions: Dict[str, Decimal] = {}
         self._latest_prices: Dict[str, float] = {}
         self._current_equity: float = 0.0
+        self._running: bool = False
+        
+        # K 线存储库 (最近 100 根，供前端绘图使用)
+        # 格式: { symbol: [ {time, open, high, low, close, volume}, ... ] }
+        self._kline_store: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Gemini 配置
+        self._gemini_api_key = os.getenv("GOOGLE_API_KEY")
+        self._last_ai_analysis = "Waiting for AI analysis..."
 
         # 轮询间隔（根据 timeframe 动态调整，1h K 线每 60s 轮询一次）
         self._poll_interval_s: float = 60.0
@@ -161,8 +169,9 @@ class LiveTrader:
         trader_thread.start()
         
         # 主线程阻塞运行 API
-        log.info("启动本地通信层 API: http://0.0.0.0:8000")
-        uvicorn.run(fast_app, host="0.0.0.0", port=8000, log_level="info")
+        log.info("启动本地通信层 API: http://127.0.0.1:8000 (Dual Stack Support)")
+        # 使用 host="::" 以支持 IPv4 和 IPv6 客户端
+        uvicorn.run(fast_app, host="::", port=8000, log_level="info")
 
     def _run_loop(self) -> None:
         """原有的交易主引擎循环"""
@@ -227,12 +236,17 @@ class LiveTrader:
         # Step 1: 拉取最新行情，构建 KlineEvent
         kline_events = self._fetch_latest_klines(symbols)
 
-        # Step 2: 驱动策略
+        # Step 2: 驱动策略并缓存 K 线
         for event in kline_events:
             self._latest_prices[event.symbol] = float(event.close)
+            self._cache_kline_event(event) # 缓存 K 线供前端拉取
             self._process_kline_event(event)
 
-        # Step 3: 轮询成交回报
+        # Step 3: 周期性 AI 深度分析 (如每小时一次)
+        if now.minute == 0 and now.second < 10:
+             self._run_ai_analysis()
+
+        # Step 4: 轮询成交回报
         fills = self.order_manager.poll_fills()
         for fill in fills:
             self._on_fill(fill)
@@ -468,6 +482,7 @@ class LiveTrader:
                         volume=Decimal(str(v)),
                         is_closed=True,
                     )
+                    self._cache_kline_event(event) # 同时也放入前端缓存
                     # 只驱动策略内部状态更新，不触发下单
                     for strategy in self._strategies:
                         try:
@@ -481,12 +496,63 @@ class LiveTrader:
 
                 log.info("预加载完成: {} bars={}", symbol, len(closed_candles))
 
+
             except Exception as exc:  # noqa: BLE001
                 log.warning("预加载失败: {} error={}", symbol, str(exc)[:200])
+        
+        log.info("AUDIT: K-line history cache is now ready and populated.")
+
+    def _cache_kline_event(self, event: KlineEvent) -> None:
+        """将其缓存到内存中，供前端通过 API 请求历史轨迹。"""
+        if event.symbol not in self._kline_store:
+            self._kline_store[event.symbol] = []
+        
+        # 转换为前端友好格式
+        kline = {
+            "time": int(event.timestamp.timestamp()),
+            "open": float(event.open),
+            "high": float(event.high),
+            "low": float(event.low),
+            "close": float(event.close),
+            "volume": float(event.volume)
+        }
+        
+        # 避免重复（通过时间戳）
+        store = self._kline_store[event.symbol]
+        if store and store[-1]["time"] == kline["time"]:
+            store[-1] = kline
+        else:
+            store.append(kline)
+            # 限制长度，防止内存无限增长
+            if len(store) > 200:
+                self._kline_store[event.symbol] = store[-200:]
+
+    def _run_ai_analysis(self) -> None:
+        """驱动 Gemini AI 对当前盘面进行解读（如果已配置 Key）。"""
+        if not self._gemini_api_key:
+            return
+            
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self._gemini_api_key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            # 构建 Prompt: 选取最近 10 根价格
+            symbol = "BTC/USDT"
+            klines = self._kline_store.get(symbol, [])[-10:]
+            prices = [k["close"] for k in klines]
+            
+            prompt = f"你是一个专业的加密货币交易员。当前 {symbol} 最近的价格序列是: {prices}。请用一段简短的话分析当前市场情绪并给出风险提示。"
+            response = model.generate_content(prompt)
+            self._last_ai_analysis = response.text
+            log.info("Gemini AI 分析完成: {}", self._last_ai_analysis[:50] + "...")
+        except Exception as e:
+            log.error("Gemini AI 分析失败: {}", e)
 
     # ────────────────────────────────────────────────────────────
     # 状态持久化（防止重启丢失持仓）
     # ────────────────────────────────────────────────────────────
+
 
     _STATE_FILE = "storage/trader_state.json"
 

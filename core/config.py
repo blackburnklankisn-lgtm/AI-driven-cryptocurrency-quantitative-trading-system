@@ -177,6 +177,8 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
     """
     从 YAML 文件 + 环境变量加载系统配置。
 
+    优先级：os 环境变量 > .env 文件 > YAML 文件 > 代码默认值。
+
     Args:
         yaml_path: YAML 配置文件路径
 
@@ -187,6 +189,14 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
         ConfigError: 配置文件缺失、格式错误或验证失败时
     """
     global _config  # noqa: PLW0603
+
+    # ── 将 .env 文件的值推入 os.environ（不覆盖已存在的环境变量）──────────
+    # 这样后续各子配置调用 BaseSettings() 时可从 os.environ 读取 .env 的值。
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv(override=False)
+    except ImportError:
+        pass  # python-dotenv 不可用时降级，不阻断启动
 
     yaml_file = Path(yaml_path)
     yaml_data: dict = {}
@@ -199,7 +209,23 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
             raise ConfigError(f"YAML 配置文件解析失败: {yaml_path}") from exc
 
     try:
-        _config = SystemConfig.model_validate(yaml_data)
+        # ── 从 yaml_data 中摘出各子配置段，分别按优先级构建 ────────────────
+        # ExchangeConfig / RiskConfig / LoggingConfig：使用 BaseSettings()
+        #   构造器，可直接读取 os.environ（含 .env 推入的值），实现 env > default。
+        # DataConfig：YAML 提供 default_symbols 等纯配置字段，未被 env 覆盖，
+        #   用 model_validate 保留这些值。
+        data_yaml = yaml_data.pop("data", {}) or {}
+        yaml_data.pop("exchange", None)   # 由 ExchangeConfig() 从 env 读取
+        yaml_data.pop("risk", None)       # 由 RiskConfig()    从 env 读取
+        yaml_data.pop("logging", None)    # 由 LoggingConfig() 从 env 读取
+
+        _config = SystemConfig.model_validate({
+            **yaml_data,                                   # 顶层：trading_mode 等
+            "exchange": ExchangeConfig(),                  # env 优先：EXCHANGE_ID 等
+            "risk": RiskConfig(),                          # env 优先：MAX_* 风控限制
+            "data": DataConfig.model_validate(data_yaml),  # YAML 优先：default_symbols 等
+            "logging": LoggingConfig(),                    # env 优先：LOG_LEVEL 等
+        })
     except Exception as exc:
         raise ConfigError(f"系统配置验证失败: {exc}") from exc
 

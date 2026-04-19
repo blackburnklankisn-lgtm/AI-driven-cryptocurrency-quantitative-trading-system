@@ -140,7 +140,7 @@ async def log_flood_generator(url: str, duration: int):
 async def main():
     parser = argparse.ArgumentParser(description="WebSocket 连通性压测")
     parser.add_argument("--duration", type=int, default=1800, help="压测持续时间（秒），默认 1800s = 30分钟")
-    parser.add_argument("--url", default="ws://127.0.0.1:8000", help="后端 WebSocket URL")
+    parser.add_argument("--url", default="ws://localhost:8000", help="后端 WebSocket URL")
     parser.add_argument("--clients", type=int, default=3, help="并发客户端数量")
     args = parser.parse_args()
 

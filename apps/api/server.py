@@ -31,6 +31,7 @@ async def lifespan(application: FastAPI):
     # 注册主线程 event loop 到 WebsocketLogSink，使子线程日志能跨线程推送
     WebsocketLogSink.set_main_loop(asyncio.get_running_loop())
     asyncio.create_task(_status_push_worker())
+    asyncio.create_task(_ticker_refresh_worker())
     yield
 
 
@@ -40,7 +41,8 @@ app = FastAPI(title="AI Quant Trader API", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -197,6 +199,36 @@ async def _status_push_worker():
             pass
 
 
+async def _ticker_refresh_worker():
+    """
+    每 5 秒通过 CCXT fetch_ticker 获取最新实时价格并更新 _latest_prices。
+
+    背景：主循环 (_main_loop_step) 每 60 秒才跑一次，两次轮询之间
+    `_latest_prices` 不会变化，导致 ws/status 推送的价格长达 60 秒不更新。
+    此 worker 独立运行，在两次主循环之间保持价格新鲜度（约 5 s 延迟）。
+    """
+    _symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+    while True:
+        await asyncio.sleep(5)
+        trader = _global_trader_instance
+        if not trader:
+            continue
+        loop = asyncio.get_running_loop()
+        symbols = getattr(trader, '_symbols', None) or _symbols
+        for symbol in symbols:
+            try:
+                ticker = await loop.run_in_executor(
+                    None, trader.gateway.fetch_ticker, symbol
+                )
+                last = ticker.get('last') or ticker.get('close')
+                if last:
+                    old = trader._latest_prices.get(symbol, 0)
+                    trader._latest_prices[symbol] = float(last)
+                    log.debug("[Ticker] {} {:.4f} → {:.4f}", symbol, old, float(last))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("[Ticker] fetch_ticker 失败: {} {}", symbol, str(exc)[:80])
+
+
 # ── 状态构建辅助函数 ─────────────────────────────────────────
 
 def _build_status_response() -> Dict[str, Any]:
@@ -208,6 +240,7 @@ def _build_status_response() -> Dict[str, Any]:
     circuit_broken = trader.risk_manager.is_circuit_broken()
     risk_summary = trader.risk_manager.get_state_summary()
     positions = {sym: float(qty) for sym, qty in trader._positions.items() if qty > 0}
+    latest_prices = {sym: float(price) for sym, price in getattr(trader, '_latest_prices', {}).items()}
 
     return {
         "status": "running" if getattr(trader, "_running", False) else "stopped",
@@ -220,6 +253,8 @@ def _build_status_response() -> Dict[str, Any]:
         "risk_state": risk_summary,
         "poll_interval_s": trader._poll_interval_s,
         "ws_log_connections": log_manager.connection_count(),
+        "ai_analysis": getattr(trader, "_last_ai_analysis", "N/A"),
+        "latest_prices": latest_prices,
     }
 
 
@@ -229,7 +264,52 @@ def _build_status_response() -> Dict[str, Any]:
 @app.get("/api/v1/status")
 async def get_system_status() -> Dict[str, Any]:
     """获取系统完整状态，包含熔断原因和风控摘要。"""
-    return _build_status_response()
+    try:
+        return _build_status_response()
+    except Exception as e:
+        log.error("API Error (Status): {}", e)
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/v1/klines")
+async def get_klines(symbol: str = "BTC/USDT") -> List[Dict[str, Any]]:
+    """获取缓存的历史 K 线数据供前端绘图，末尾附加当前正在形成中的蜡烛。"""
+    trader = _global_trader_instance
+    if not trader:
+        log.warning("API: Request for klines but trader instance is None")
+        return []
+
+    closed_bars: List[Dict[str, Any]] = list(trader._kline_store.get(symbol, []))
+    log.info("API: Returning {} closed klines for {}", len(closed_bars), symbol)
+
+    # 附加当前正在形成中的蜡烛（open bar），让图表实时反映最新价格
+    current_price = trader._latest_prices.get(symbol)
+    if current_price and closed_bars:
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        # 当前 1h 蜡烛的开盘时间
+        current_bar_open_ts = int(
+            _dt.datetime(now.year, now.month, now.day, now.hour, 0, 0,
+                         tzinfo=_dt.timezone.utc).timestamp()
+        )
+        last_closed = closed_bars[-1]
+        if last_closed["time"] != current_bar_open_ts:
+            # 仅当闭合蜡烛不是当前小时才追加（避免重复）
+            open_price = float(last_closed["close"])
+            developing_bar = {
+                "time": current_bar_open_ts,
+                "open": open_price,
+                "high": max(open_price, float(current_price)),
+                "low":  min(open_price, float(current_price)),
+                "close": float(current_price),
+                "volume": 0.0,
+            }
+            closed_bars.append(developing_bar)
+            log.debug("API: Appended developing bar for {} at ts={} price={:.4f}",
+                      symbol, current_bar_open_ts, current_price)
+
+    return closed_bars
+
 
 
 class ControlAction(BaseModel):

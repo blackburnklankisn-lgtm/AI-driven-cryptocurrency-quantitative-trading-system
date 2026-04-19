@@ -15,21 +15,26 @@ function findPythonExecutable(): string {
   if (!isDev) {
     const resourcesPath = process.resourcesPath;
     const candidate = path.join(resourcesPath, 'dist', 'backend_trader.exe');
+    console.log(`[Electron] Looking for packed backend at: ${candidate}`);
     try {
       require('fs').accessSync(candidate);
+      console.log('[Electron] Packed backend found ✅');
       return candidate;
     } catch (_) {
-      console.error(`[Electron] Packed backend not found at: ${candidate}`);
+      console.error(`[Electron] ❌ Packed backend NOT found at: ${candidate}`);
     }
   }
   // 开发模式：使用系统 Python
-  return process.platform === 'win32' ? 'python' : 'python3';
+  const exe = process.platform === 'win32' ? 'python' : 'python3';
+  console.log(`[Electron] Dev mode: using system Python executable: ${exe}`);
+  return exe;
 }
 
 function startPythonBackend(): void {
   if (isDev) {
     // 开发模式：假定用户已手动启动 Python 后端，不自动拉起
-    console.log('[Electron] Dev mode: assuming Python backend is already running.');
+    console.log('[Electron] Dev mode: assuming Python backend is already running on localhost:8000.');
+    console.log('[Electron] To start backend manually: $env:TRADING_MODE="paper"; python -m apps.trader.main');
     return;
   }
 
@@ -38,8 +43,12 @@ function startPythonBackend(): void {
   // 生产模式下的项目根目录（用于 .env 和 状态 存取）
   // 默认为应用程序 exe 同级目录
   const execDir = path.dirname(app.getPath('exe'));
+  const configPath = path.join(process.resourcesPath, 'configs', 'system.yaml');
 
-  console.log(`[Electron] Starting Python backend: ${pythonExe}`);
+  console.log(`[Electron] Backend exe   : ${pythonExe}`);
+  console.log(`[Electron] Working dir   : ${execDir}`);
+  console.log(`[Electron] CONFIG_PATH   : ${configPath}`);
+  console.log(`[Electron] TRADING_MODE  : paper`);
 
   const args = !isDev ? [] : ['-m', 'apps.trader.main']; 
 
@@ -48,12 +57,12 @@ function startPythonBackend(): void {
     env: {
       ...process.env,
       TRADING_MODE: 'paper',
-      CONFIG_PATH: isDev 
-        ? path.join(__dirname, '../../configs/system.yaml')
-        : path.join(process.resourcesPath, 'configs', 'system.yaml'),
+      CONFIG_PATH: configPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+
+  console.log(`[Electron] Python process started, PID: ${pythonProcess.pid}`);
 
   pythonProcess.stdout?.on('data', (data: Buffer) => {
     console.log(`[Python] ${data.toString().trim()}`);
@@ -84,19 +93,25 @@ function waitForBackend(maxRetries = 30, intervalMs = 1000): Promise<void> {
     let attempts = 0;
     const check = () => {
       attempts++;
-      const req = http.get('http://127.0.0.1:8000/api/v1/health', (res) => {
+      console.log(`[Electron] Health check #${attempts}/${maxRetries} → GET http://localhost:8000/api/v1/health`);
+      const req = http.get('http://localhost:8000/api/v1/health', (res) => {
+        console.log(`[Electron] Health check response: HTTP ${res.statusCode}`);
         if (res.statusCode === 200) {
-          console.log('[Electron] Backend is ready.');
+          console.log('[Electron] ✅ Backend is ready.');
           resolve();
         } else {
           retry();
         }
       });
-      req.on('error', retry);
+      req.on('error', (err: Error) => {
+        console.warn(`[Electron] Health check #${attempts} error: ${err.message}`);
+        retry();
+      });
       req.setTimeout(500, () => { req.destroy(); retry(); });
     };
     const retry = () => {
       if (attempts >= maxRetries) {
+        console.error(`[Electron] ❌ Backend did not start after ${maxRetries} attempts.`);
         reject(new Error('Backend did not start in time'));
       } else {
         setTimeout(check, intervalMs);

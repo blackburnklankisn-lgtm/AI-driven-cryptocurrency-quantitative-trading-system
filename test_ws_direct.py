@@ -3,7 +3,7 @@ import websockets
 import json
 
 async def test_ws():
-    uri = "ws://127.0.0.1:8000/api/v1/ws/status"
+    uri = "ws://localhost:8000/api/v1/ws/status"
     print(f"Connecting to {uri}...")
     try:
         async with websockets.connect(uri) as websocket:
@@ -20,7 +20,7 @@ async def test_ws():
         print(f"websocket error: {e}")
 
 async def test_logs_ws():
-    uri = "ws://127.0.0.1:8000/api/v1/ws/logs"
+    uri = "ws://localhost:8000/api/v1/ws/logs"
     print(f"Connecting to {uri}...")
     try:
         async with websockets.connect(uri) as websocket:
