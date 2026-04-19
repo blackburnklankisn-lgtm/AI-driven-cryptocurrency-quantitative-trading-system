@@ -1,27 +1,32 @@
 """
-modules/alpha/strategies/ma_cross.py — 双均线穿越策略（MA Cross）
+modules/alpha/strategies/ma_cross.py — 双均线穿越策略（MA Cross）v2
+
+v2 优化记录：
+- EMA 替代 SMA：降低信号滞后，更快识别趋势启动
+- ADX 趋势过滤：ADX > 25 才允许开仓，ADX < 20 关闭新开仓信号
+- 成交量过滤保留
 
 设计说明：
-- 这是系统的"标准策略模板"，展示如何正确实现一个完整策略
-- 策略逻辑：快线（短期 SMA）上穿慢线（长期 SMA）时买入，下穿时卖出
+- 策略逻辑：快线（短期 EMA）上穿慢线（长期 EMA）时买入，下穿时卖出
 - 只有当策略维护的全仓（full position）不在持仓中时才买入
 
 策略细节（防过拟合处理）：
 - 需要至少 slow_window 根已收线 K 线才发出信号（预热期保护）
+- ADX 过滤：趋势强度不够时不开仓，避免震荡市锯齿亏损
 - 成交量过滤：信号产生当根 K 线的成交量必须高于 N 日均量（确认信号有效性）
 - 不允许同根 K 线内反复开平仓
 
-仓位管理（保守原则）：
-- 固定名义金额下单（fraction of equity），由风控层最终决定仓位大小
-- 策略只发出"方向 + 建议数量"，最终数量由 RiskManager 可削减
-
 参数：
-    fast_window:   快线窗口（默认 10）
-    slow_window:   慢线窗口（默认 30）
-    order_pct:     建议下单占当前账户估值的比例（默认 0.95，近满仓）
-    volume_filter: 是否开启成交量过滤（默认 True）
-    vol_ma_window: 成交量均线窗口（默认 20）
-    vol_multiplier:成交量过滤倍数（默认 0.8，允许略低于均量）
+    fast_window:     快线窗口（默认 10）
+    slow_window:     慢线窗口（默认 30）
+    order_pct:       建议下单占当前账户估值的比例
+    use_ema:         是否使用 EMA（默认 True，False 退化为 SMA）
+    adx_filter:      是否开启 ADX 趋势过滤（默认 True）
+    adx_entry_threshold:  ADX 开仓阈值（默认 25）
+    adx_close_threshold:  ADX 休眠阈值（默认 20）
+    volume_filter:   是否开启成交量过滤（默认 True）
+    vol_ma_window:   成交量均线窗口（默认 20）
+    vol_multiplier:  成交量过滤倍数（默认 0.8）
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from __future__ import annotations
 from collections import deque
 from decimal import Decimal
 from typing import Deque, List, Optional
+
+import pandas as pd
 
 from modules.alpha.base import BaseAlpha
 from modules.alpha.features import FeatureEngine
@@ -40,25 +47,19 @@ log = get_logger(__name__)
 
 class MACrossStrategy(BaseAlpha):
     """
-    双均线穿越（Golden Cross / Death Cross）策略。
+    双均线穿越（Golden Cross / Death Cross）策略 v2。
+
+    v2 改进：
+    - 默认使用 EMA（指数移动平均），信号更灵敏
+    - ADX 趋势过滤：ADX > adx_entry_threshold 时才允许开仓
+    - ADX < adx_close_threshold 时关闭新开仓信号避免震荡市锯齿亏损
 
     信号规则：
-    - 金叉（fast SMA > slow SMA，前一根 fast SMA <= slow SMA）→ 买入
-    - 死叉（fast SMA < slow SMA，前一根 fast SMA >= slow SMA）→ 卖出
+    - 金叉（fast MA > slow MA，前一根 fast MA <= slow MA）且 ADX > 25 → 买入
+    - 死叉（fast MA < slow MA，前一根 fast MA >= slow MA）→ 卖出（不受 ADX 限制）
 
-    仓位状态机（简单版）：
-        FLAT → (金叉信号) → LONG → (死叉信号) → FLAT
-
-    Args:
-        symbol:         目标交易对
-        fast_window:    快线窗口
-        slow_window:    慢线窗口
-        order_qty:      每次建仓的基础数量（基础币，如 BTC）。
-                        建议由 RiskManager 在运行时动态调整。
-        volume_filter:  是否开启成交量过滤
-        vol_ma_window:  成交量均线窗口
-        vol_multiplier: 过滤阈值倍数（当前成交量 >= vol_multiplier * 均量才确认信号）
-        timeframe:      K 线周期
+    仓位状态机：
+        FLAT → (金叉 + ADX确认) → LONG → (死叉信号) → FLAT
     """
 
     def __init__(
@@ -67,6 +68,10 @@ class MACrossStrategy(BaseAlpha):
         fast_window: int = 10,
         slow_window: int = 30,
         order_qty: float = 0.01,
+        use_ema: bool = True,
+        adx_filter: bool = True,
+        adx_entry_threshold: float = 25.0,
+        adx_close_threshold: float = 20.0,
         volume_filter: bool = True,
         vol_ma_window: int = 20,
         vol_multiplier: float = 0.8,
@@ -85,13 +90,19 @@ class MACrossStrategy(BaseAlpha):
         self.fast_window = fast_window
         self.slow_window = slow_window
         self.order_qty = Decimal(str(order_qty))
+        self.use_ema = use_ema
+        self.adx_filter = adx_filter
+        self.adx_entry_threshold = adx_entry_threshold
+        self.adx_close_threshold = adx_close_threshold
         self.volume_filter = volume_filter
         self.vol_ma_window = vol_ma_window
         self.vol_multiplier = vol_multiplier
 
         # 内部状态：滑动窗口缓存最近 N 根 K 线
-        max_buf = max(slow_window, vol_ma_window) + 2  # 多留 2 根用于穿越判断
+        max_buf = max(slow_window, vol_ma_window) + 20  # ADX 也需要额外缓冲
         self._closes: Deque[float] = deque(maxlen=max_buf)
+        self._highs: Deque[float] = deque(maxlen=max_buf)
+        self._lows: Deque[float] = deque(maxlen=max_buf)
         self._volumes: Deque[float] = deque(maxlen=max_buf)
 
         # 持仓状态：True = 持有多头
@@ -102,11 +113,13 @@ class MACrossStrategy(BaseAlpha):
         self._prev_slow: Optional[float] = None
 
         log.info(
-            "{} 初始化: fast={} slow={} qty={} vol_filter={}",
+            "{} 初始化: fast={} slow={} qty={} ema={} adx_filter={} vol_filter={}",
             self.strategy_id,
             fast_window,
             slow_window,
             order_qty,
+            use_ema,
+            adx_filter,
             volume_filter,
         )
 
@@ -115,20 +128,22 @@ class MACrossStrategy(BaseAlpha):
         处理新 K 线：
         1. 更新滑动窗口缓存
         2. 检查是否在预热期
-        3. 计算快慢均线
-        4. 判断穿越信号（金叉/死叉）
-        5. 可选：成交量过滤确认
-        6. 产出订单请求（或返回空列表）
+        3. 计算快慢均线（EMA 或 SMA）
+        4. 计算 ADX 趋势强度（可选）
+        5. 判断穿越信号（金叉/死叉）
+        6. 成交量过滤确认（可选）
+        7. 产出订单请求（或返回空列表）
         """
-        # 只处理已收线 K 线（实盘中也适用，避免在 K 线未收盘时产出噪声信号）
         if not event.is_closed or event.symbol != self.symbol:
             return []
 
         self._increment_bar(event)
         self._closes.append(float(event.close))
+        self._highs.append(float(event.high))
+        self._lows.append(float(event.low))
         self._volumes.append(float(event.volume))
 
-        # 预热期检查：至少需要 slow_window 根 K 线
+        # 预热期检查
         if self._is_warming_up(self.slow_window):
             log.debug(
                 "{} 预热中 ({}/{})",
@@ -138,15 +153,47 @@ class MACrossStrategy(BaseAlpha):
             )
             return []
 
-        # 计算当前快慢均线
-        import statistics
-        closes_list = list(self._closes)
-        curr_fast = statistics.mean(closes_list[-self.fast_window:])
-        curr_slow = statistics.mean(closes_list[-self.slow_window:])
+        # 构建 DataFrame 用于指标计算
+        closes_series = pd.Series(list(self._closes))
+
+        # 计算快慢均线
+        if self.use_ema:
+            fast_series = FeatureEngine.ema(closes_series, self.fast_window)
+            slow_series = FeatureEngine.ema(closes_series, self.slow_window)
+        else:
+            fast_series = FeatureEngine.sma(closes_series, self.fast_window)
+            slow_series = FeatureEngine.sma(closes_series, self.slow_window)
+
+        curr_fast = fast_series.iloc[-1]
+        curr_slow = slow_series.iloc[-1]
+
+        if pd.isna(curr_fast) or pd.isna(curr_slow):
+            return []
+
+        # ADX 计算（需要 high/low/close）
+        curr_adx = None
+        if self.adx_filter:
+            df = pd.DataFrame({
+                "high": list(self._highs),
+                "low": list(self._lows),
+                "close": list(self._closes),
+            })
+            adx_series = FeatureEngine.adx(df, window=14)
+            curr_adx = adx_series.iloc[-1] if not pd.isna(adx_series.iloc[-1]) else None
+
+        ma_type = "EMA" if self.use_ema else "SMA"
+        log.debug(
+            "[{}] bar#{} close={:.4f} fast_{}={:.4f} slow_{}={:.4f} ADX={} in_pos={}",
+            self.strategy_id, self._bar_count,
+            float(self._closes[-1]),
+            ma_type, curr_fast, ma_type, curr_slow,
+            f"{curr_adx:.1f}" if curr_adx is not None else "N/A",
+            self._in_position,
+        )
 
         orders: List[OrderRequestEvent] = []
 
-        # 判断穿越（需要上一根均线值）
+        # 判断穿越
         if self._prev_fast is not None and self._prev_slow is not None:
             golden_cross = (
                 self._prev_fast <= self._prev_slow and curr_fast > curr_slow
@@ -160,13 +207,26 @@ class MACrossStrategy(BaseAlpha):
             if self.volume_filter:
                 vol_confirmed = self._check_volume()
 
-            if golden_cross and not self._in_position and vol_confirmed:
+            # ADX 过滤（仅限买入信号，卖出不受限制）
+            adx_confirmed = True
+            if self.adx_filter and curr_adx is not None:
+                if curr_adx < self.adx_entry_threshold:
+                    adx_confirmed = False
+                    if golden_cross:
+                        log.info(
+                            "{} 金叉被 ADX 过滤: ADX={:.1f} < 阈值 {:.0f}",
+                            self.strategy_id, curr_adx, self.adx_entry_threshold,
+                        )
+
+            if golden_cross and not self._in_position and vol_confirmed and adx_confirmed:
+                ma_type = "EMA" if self.use_ema else "SMA"
                 log.info(
-                    "{} 金叉信号: close={} fast={:.4f} slow={:.4f}",
+                    "{} 金叉信号: close={} fast_{}={:.4f} slow_{}={:.4f}{}",
                     self.strategy_id,
                     float(event.close),
-                    curr_fast,
-                    curr_slow,
+                    ma_type, curr_fast,
+                    ma_type, curr_slow,
+                    f" ADX={curr_adx:.1f}" if curr_adx is not None else "",
                 )
                 orders.append(
                     self._make_market_order(event, "buy", self.order_qty)
@@ -174,12 +234,14 @@ class MACrossStrategy(BaseAlpha):
                 self._in_position = True
 
             elif death_cross and self._in_position:
+                ma_type = "EMA" if self.use_ema else "SMA"
                 log.info(
-                    "{} 死叉信号: close={} fast={:.4f} slow={:.4f}",
+                    "{} 死叉信号: close={} fast_{}={:.4f} slow_{}={:.4f}{}",
                     self.strategy_id,
                     float(event.close),
-                    curr_fast,
-                    curr_slow,
+                    ma_type, curr_fast,
+                    ma_type, curr_slow,
+                    f" ADX={curr_adx:.1f}" if curr_adx is not None else "",
                 )
                 orders.append(
                     self._make_market_order(event, "sell", self.order_qty)
@@ -200,8 +262,7 @@ class MACrossStrategy(BaseAlpha):
             return True  # 样本不足时不过滤
 
         volumes_list = list(self._volumes)
-        import statistics
-        avg_vol = statistics.mean(volumes_list[-self.vol_ma_window:])
+        avg_vol = sum(volumes_list[-self.vol_ma_window:]) / self.vol_ma_window
         curr_vol = volumes_list[-1]
 
         confirmed = curr_vol >= avg_vol * self.vol_multiplier

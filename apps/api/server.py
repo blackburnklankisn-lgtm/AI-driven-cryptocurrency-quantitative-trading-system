@@ -208,6 +208,7 @@ async def _ticker_refresh_worker():
     此 worker 独立运行，在两次主循环之间保持价格新鲜度（约 5 s 延迟）。
     """
     _symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+    cycle = 0
     while True:
         await asyncio.sleep(5)
         trader = _global_trader_instance
@@ -215,6 +216,8 @@ async def _ticker_refresh_worker():
             continue
         loop = asyncio.get_running_loop()
         symbols = getattr(trader, '_symbols', None) or _symbols
+        cycle += 1
+        updated = []
         for symbol in symbols:
             try:
                 ticker = await loop.run_in_executor(
@@ -224,9 +227,18 @@ async def _ticker_refresh_worker():
                 if last:
                     old = trader._latest_prices.get(symbol, 0)
                     trader._latest_prices[symbol] = float(last)
-                    log.debug("[Ticker] {} {:.4f} → {:.4f}", symbol, old, float(last))
+                    if old != float(last):
+                        updated.append(f"{symbol}: {old:.4f}→{float(last):.4f}")
             except Exception as exc:  # noqa: BLE001
                 log.debug("[Ticker] fetch_ticker 失败: {} {}", symbol, str(exc)[:80])
+        if updated:
+            log.debug("[Ticker] cycle#{} 价格更新: {}", cycle, " | ".join(updated))
+        elif cycle % 12 == 0:  # 每 60s 打印一次"无变化"
+            log.debug(
+                "[Ticker] cycle#{} 价格无变化: {}",
+                cycle,
+                {s: f"{v:.4f}" for s, v in trader._latest_prices.items()},
+            )
 
 
 # ── 状态构建辅助函数 ─────────────────────────────────────────

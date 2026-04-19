@@ -52,6 +52,7 @@ from modules.execution.gateway import CCXTGateway
 from modules.execution.order_manager import OrderManager
 from modules.monitoring.metrics import SystemMetrics
 from modules.risk.manager import RiskConfig, RiskManager
+from modules.risk.position_sizer import PositionSizer
 from apps.api.server import app as fast_app, set_trader_instance, WebsocketLogSink
 
 log = get_logger(__name__)
@@ -116,11 +117,18 @@ class LiveTrader:
             max_consecutive_losses=risk_cfg.max_consecutive_losses,
         ))
 
+        # ── 5b. 动态仓位管理器 ───────────────────────────────────
+        self.position_sizer = PositionSizer(
+            max_position_pct=float(risk_cfg.max_position_pct),
+        )
+
         # ── 6. 策略列表（外部注入） ───────────────────────────────
         self._strategies = []
 
         # 运行状态
         self._positions: Dict[str, Decimal] = {}
+        self._entry_prices: Dict[str, float] = {}   # 入场均价追踪
+        self._stop_loss_pending: set = set()         # 已发出止损单的品种，防重复触发
         self._latest_prices: Dict[str, float] = {}
         self._current_equity: float = 0.0
         self._running: bool = False
@@ -235,11 +243,17 @@ class LiveTrader:
 
         # Step 1: 拉取最新行情，构建 KlineEvent
         kline_events = self._fetch_latest_klines(symbols)
+        log.debug("[Loop#{0}] 拉取K线: {1}个事件", seq, len(kline_events))
 
         # Step 2: 驱动策略并缓存 K 线
         for event in kline_events:
+            prev_price = self._latest_prices.get(event.symbol, 0)
             self._latest_prices[event.symbol] = float(event.close)
-            self._cache_kline_event(event) # 缓存 K 线供前端拉取
+            self._cache_kline_event(event)
+            log.debug(
+                "[Loop#{0}] 处理K线: {1} close={2:.4f} (prev={3:.4f})",
+                seq, event.symbol, float(event.close), prev_price,
+            )
             self._process_kline_event(event)
 
         # Step 3: 周期性 AI 深度分析 (如每小时一次)
@@ -248,6 +262,7 @@ class LiveTrader:
 
         # Step 4: 轮询成交回报
         fills = self.order_manager.poll_fills()
+        log.debug("[Loop#{0}] 成交回报: {1}笔", seq, len(fills))
         for fill in fills:
             self._on_fill(fill)
 
@@ -258,6 +273,12 @@ class LiveTrader:
 
         # Step 5: 更新账户快照与指标
         self._update_account_snapshot()
+        log.debug(
+            "[Loop#{0}] 账户快照: equity={1:.2f} positions={2} entry_prices={3}",
+            seq, self._current_equity,
+            {s: float(q) for s, q in self._positions.items() if q > 0},
+            {s: f"{p:.4f}" for s, p in self._entry_prices.items()},
+        )
 
         # Step 6: 硬止损检查（熔断时强制平仓）
         self._check_stop_loss()
@@ -358,25 +379,85 @@ class LiveTrader:
 
     def _process_order_request(self, req: OrderRequestEvent, equity: float) -> None:
         """
-        处理单个订单请求：风控审核 → 提交到 OrderManager。
+        处理单个订单请求：动态仓位 → 风控审核 → 提交到 OrderManager。
         """
         # 记录信号指标
         self.metrics.record_signal(req.strategy_id, req.side)
+        log.debug(
+            "[OrderReq] strategy={} symbol={} side={} qty={} price={}",
+            req.strategy_id, req.symbol, req.side, req.quantity, req.price,
+        )
+
+        # 动态仓位：买单使用波动率目标法替代固定 qty
+        quantity = req.quantity
+        if req.side == "buy":
+            price = self._latest_prices.get(req.symbol, 0)
+            if price > 0 and equity > 0:
+                klines = self._kline_store.get(req.symbol, [])
+                if len(klines) >= 15:
+                    import pandas as _pd
+                    from modules.alpha.features import FeatureEngine as _FE
+                    _df = _pd.DataFrame(klines[-50:])
+                    atr_pct_series = _FE.atr_pct(_df, window=14)
+                    atr_pct = atr_pct_series.iloc[-1]
+                    if _pd.notna(atr_pct) and atr_pct > 0:
+                        dynamic_qty = self.position_sizer.volatility_target(
+                            equity=equity,
+                            atr_pct=float(atr_pct),
+                            target_vol=0.02,
+                            price=price,
+                        )
+                        if dynamic_qty > 0:
+                            log.info(
+                                "[DynPos] {} 策略建议qty={} → 波动率目标qty={} "
+                                "(equity={:.2f} price={:.4f} atr%={:.4f} target_vol=2%)",
+                                req.symbol, req.quantity, dynamic_qty,
+                                equity, price, atr_pct,
+                            )
+                            quantity = dynamic_qty
+                        else:
+                            log.debug(
+                                "[DynPos] {} volatility_target 返回 0，使用策略建议 qty={}",
+                                req.symbol, req.quantity,
+                            )
+                    else:
+                        log.debug(
+                            "[DynPos] {} ATR% 无效({})，回退到策略建议 qty={}",
+                            req.symbol, atr_pct, req.quantity,
+                        )
+                else:
+                    log.debug(
+                        "[DynPos] {} klines 不足({}<15)，回退到策略建议 qty={}",
+                        req.symbol, len(klines), req.quantity,
+                    )
+            else:
+                log.debug(
+                    "[DynPos] {} price={} equity={:.2f} 无效，回退到策略建议 qty={}",
+                    req.symbol, price, equity, req.quantity,
+                )
 
         # 风控审核
         allowed, reason = self.risk_manager.check(
             side=req.side,
             symbol=req.symbol,
-            quantity=req.quantity,
+            quantity=quantity,
             price=float(req.price or 0),
             current_equity=equity,
             positions=dict(self._positions),
         )
 
         if not allowed:
+            log.warning(
+                "[RiskBlock] strategy={} {} {} qty={} 被拒绝: {}",
+                req.strategy_id, req.symbol, req.side, quantity, reason,
+            )
             self.metrics.record_order_rejected(req.symbol, reason)
             return
 
+        log.info(
+            "[OrderSubmit] strategy={} {} {} qty={} 通过风控，提交下单",
+            req.strategy_id, req.symbol, req.side, quantity,
+        )
         # 通过风控，提交订单
         try:
             self.metrics.record_order_submitted(req.symbol, req.side, req.order_type)
@@ -384,7 +465,7 @@ class LiveTrader:
                 symbol=req.symbol,
                 side=req.side,
                 order_type=req.order_type,
-                quantity=req.quantity,
+                quantity=quantity,
                 price=req.price,
                 strategy_id=req.strategy_id,
                 request_id=req.request_id,
@@ -393,17 +474,46 @@ class LiveTrader:
             log.error("订单提交失败: {} {} 原因={}", req.symbol, req.side, exc)
 
     def _on_fill(self, fill) -> None:
-        """处理成交回报：更新持仓，记录指标。"""
+        """处理成交回报：更新持仓和入场均价，记录指标。"""
         rec = fill.order_record
+        log.info(
+            "[Fill] strategy={} {} {} qty={} avg_price={} order_id={}",
+            rec.strategy_id, rec.symbol, rec.side,
+            float(fill.new_filled_qty), float(fill.avg_price), rec.exchange_id,
+        )
         if rec.side == "buy":
+            old_qty = float(self._positions.get(rec.symbol, Decimal("0")))
+            old_entry = self._entry_prices.get(rec.symbol, 0.0)
+            new_qty = float(fill.new_filled_qty)
+            new_price = float(fill.avg_price)
+            # 加权平均入场价
+            total_qty = old_qty + new_qty
+            if total_qty > 0:
+                self._entry_prices[rec.symbol] = (
+                    old_entry * old_qty + new_price * new_qty
+                ) / total_qty
             self._positions[rec.symbol] = (
                 self._positions.get(rec.symbol, Decimal("0")) + fill.new_filled_qty
+            )
+            log.info(
+                "[Fill] 入场价更新: {} entry={:.4f} (old_qty={} new_qty={} total_qty={})",
+                rec.symbol, self._entry_prices[rec.symbol], old_qty, new_qty, total_qty,
             )
         elif rec.side == "sell":
             current = self._positions.get(rec.symbol, Decimal("0"))
             self._positions[rec.symbol] = max(
                 Decimal("0"), current - fill.new_filled_qty
             )
+            remaining = float(self._positions[rec.symbol])
+            log.info(
+                "[Fill] 卖出成交: {} remaining_qty={:.6f}",
+                rec.symbol, remaining,
+            )
+            # 清仓时移除入场价，并清除止损待处理标记
+            if self._positions[rec.symbol] <= 0:
+                self._entry_prices.pop(rec.symbol, None)
+                self._stop_loss_pending.discard(rec.symbol)
+                log.info("[Fill] {} 已清仓，移除入场价和止损待处理标记", rec.symbol)
 
         notional = float(fill.new_filled_qty * fill.avg_price)
         self.metrics.record_order_filled(
@@ -561,6 +671,7 @@ class LiveTrader:
         import json
         state = {
             "positions": {sym: str(qty) for sym, qty in self._positions.items()},
+            "entry_prices": self._entry_prices,
             "current_equity": self._current_equity,
             "latest_prices": self._latest_prices,
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -585,6 +696,7 @@ class LiveTrader:
             self._positions = {
                 sym: Decimal(qty) for sym, qty in state.get("positions", {}).items()
             }
+            self._entry_prices = state.get("entry_prices", {})
             self._current_equity = state.get("current_equity", 0.0)
             self._latest_prices = state.get("latest_prices", {})
             log.info(
@@ -602,28 +714,65 @@ class LiveTrader:
     _STOP_LOSS_PCT = 0.05  # 单笔持仓亏损超过 5% 强制平仓
 
     def _check_stop_loss(self) -> None:
-        """检查所有持仓是否触及硬止损，触发则强制平仓。"""
-        for sym, qty in list(self._positions.items()):
-            if qty <= 0:
+        """
+        检查所有持仓是否触及硬止损，触发则强制平仓。
+
+        两层止损：
+        1. 入场价止损：当前价格跌破入场价 × (1 - STOP_LOSS_PCT) → 单品种平仓
+        2. 熔断清仓：熔断器触发时 → 全部持仓强制平仓
+
+        防重复：_stop_loss_pending 集合记录已发出止损单的品种，fill 后移除。
+        """
+        active_positions = {sym: qty for sym, qty in self._positions.items() if qty > 0}
+        if not active_positions:
+            return
+
+        circuit = self.risk_manager.is_circuit_broken()
+        log.debug(
+            "[StopLoss] 检查 {} 个持仓，熔断={} 待处理止损={}",
+            len(active_positions), circuit, self._stop_loss_pending,
+        )
+
+        for sym, qty in active_positions.items():
+            # 已发出止损单，等待成交，跳过重复触发
+            if sym in self._stop_loss_pending:
+                log.debug("[StopLoss] {} 止损单已挂出，等待成交，跳过", sym)
                 continue
 
             current_price = self._latest_prices.get(sym)
             if not current_price or current_price <= 0:
+                log.debug("[StopLoss] {} 无法获取当前价格，跳过", sym)
                 continue
 
-            # 使用存储的入场均价（简化版：用当前净值反推）
-            # TODO: 后续升级为精确的入场价格追踪
-            position_value = float(qty) * current_price
-            equity = self._current_equity or 5000.0
-            position_pct = position_value / equity if equity > 0 else 0
+            should_stop = False
+            reason = ""
 
-            # 如果持仓价值跌至初始仓位的 (1 - stop_loss_pct) 以下
-            # 简化实现：检查持仓是否产生了超过阈值的亏损
-            if position_pct > 0 and self.risk_manager.is_circuit_broken():
-                log.warning(
-                    "止损: 系统已熔断，强制平仓 {} qty={}",
-                    sym, float(qty),
+            # ① 入场价止损
+            entry_price = self._entry_prices.get(sym)
+            if entry_price and entry_price > 0:
+                stop_price = entry_price * (1 - self._STOP_LOSS_PCT)
+                loss_pct = (entry_price - current_price) / entry_price * 100
+                log.debug(
+                    "[StopLoss] {} entry={:.4f} stop={:.4f} current={:.4f} loss={:.2f}%",
+                    sym, entry_price, stop_price, current_price, loss_pct,
                 )
+                if current_price <= stop_price:
+                    reason = (
+                        f"入场价止损: entry={entry_price:.4f} "
+                        f"stop={stop_price:.4f} current={current_price:.4f} "
+                        f"loss={loss_pct:.2f}%"
+                    )
+                    should_stop = True
+            else:
+                log.debug("[StopLoss] {} 无入场价记录，跳过价格止损检查", sym)
+
+            # ② 熔断清仓
+            if not should_stop and circuit:
+                reason = "系统已熔断，强制平仓"
+                should_stop = True
+
+            if should_stop:
+                log.warning("[StopLoss] 触发平仓: {} {} qty={}", sym, reason, float(qty))
                 try:
                     self.order_manager.submit(
                         symbol=sym,
@@ -633,9 +782,18 @@ class LiveTrader:
                         price=None,
                         strategy_id="stop_loss_system",
                     )
-                    audit_log("STOP_LOSS_TRIGGERED", symbol=sym, quantity=float(qty))
+                    self._stop_loss_pending.add(sym)  # 标记已发出，防重复
+                    audit_log(
+                        "STOP_LOSS_TRIGGERED",
+                        symbol=sym, quantity=float(qty), reason=reason,
+                    )
+                    # 同步策略层持仓状态
+                    for s in self._strategies:
+                        if hasattr(s, '_in_position') and getattr(s, 'symbol', '') == sym:
+                            s._in_position = False
+                            log.debug("[StopLoss] 同步策略 {} _in_position=False", s.strategy_id)
                 except Exception as exc:
-                    log.error("止损平仓失败: {} error={}", sym, exc)
+                    log.error("[StopLoss] 止损平仓失败: {} error={}", sym, exc)
 
     # ────────────────────────────────────────────────────────────
     # 优雅退出
@@ -681,26 +839,55 @@ def main() -> None:
 
     # 注册策略（动态导入，按需配置）
     from modules.alpha.strategies.ma_cross import MACrossStrategy
+    from modules.alpha.strategies.momentum import MomentumStrategy
 
     # 下单量配置（基于 $5000 初始资金，单笔控制在 ~$200-300 左右）
+    # 注意：买单实际数量由 PositionSizer 波动率目标法动态调整
     order_qty_map = {
         "BTC/USDT": 0.003,   # ~$200 @ BTC=$67000
         "ETH/USDT": 0.06,    # ~$210 @ ETH=$3500
         "SOL/USDT": 1.5,     # ~$225 @ SOL=$150
     }
+    # Momentum 策略使用较小基础仓位（动态仓位会覆盖）
+    momentum_qty_map = {
+        "BTC/USDT": 0.002,
+        "ETH/USDT": 0.04,
+        "SOL/USDT": 1.0,
+    }
 
     symbols = trader.sys_config.data.default_symbols
     for symbol in symbols:
-        strategy = MACrossStrategy(
+        # 策略 1: MA Cross (EMA + ADX 过滤)
+        ma_strategy = MACrossStrategy(
             symbol=symbol,
             fast_window=10,
             slow_window=30,
             order_qty=order_qty_map.get(symbol, 0.001),
+            use_ema=True,
+            adx_filter=True,
             volume_filter=True,
             timeframe=trader.sys_config.data.default_timeframe,
         )
-        trader.add_strategy(strategy)
+        trader.add_strategy(ma_strategy)
 
+        # 策略 2: Momentum (ROC + RSI)
+        mom_strategy = MomentumStrategy(
+            symbol=symbol,
+            roc_window=10,
+            roc_entry_pct=2.0,
+            rsi_window=14,
+            rsi_upper=70.0,
+            rsi_lower=30.0,
+            order_qty=momentum_qty_map.get(symbol, 0.001),
+            timeframe=trader.sys_config.data.default_timeframe,
+        )
+        trader.add_strategy(mom_strategy)
+
+    log.info(
+        "策略注册完成: {} 个策略 — {}",
+        len(trader._strategies),
+        [getattr(s, 'strategy_id', type(s).__name__) for s in trader._strategies],
+    )
     trader.run()
 
 

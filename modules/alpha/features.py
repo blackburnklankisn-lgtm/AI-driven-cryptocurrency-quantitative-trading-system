@@ -156,6 +156,44 @@ class FeatureEngine:
     # ────────────────────────────────────────────────────────────
 
     @staticmethod
+    def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
+        """
+        平均趋向指数（ADX, Average Directional Index）。
+
+        衡量趋势强度（不区分方向）：
+        - ADX < 20：无趋势 / 震荡
+        - ADX 25~50：趋势明确
+        - ADX > 50：强趋势
+
+        Args:
+            df:     必须含 high, low, close 列
+            window: 计算窗口（默认 14）
+
+        Returns:
+            ADX 序列，值域 [0, 100]
+        """
+        high = df["high"]
+        low = df["low"]
+
+        # +DM / -DM
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+        atr = FeatureEngine.atr(df, window)
+
+        # +DI / -DI
+        plus_di = 100 * plus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr
+        minus_di = 100 * minus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr
+
+        # DX → ADX
+        dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
+        adx_series = dx.ewm(alpha=1 / window, adjust=False).mean()
+
+        return adx_series
+
+    @staticmethod
     def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
         """
         平均真实波幅（ATR）。
