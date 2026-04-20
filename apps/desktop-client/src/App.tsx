@@ -162,12 +162,15 @@ function App() {
   useEffect(() => {
     let retryTimer: any = null;
     let retryCount = 0;
+    let destroyed = false;
     const connectStatus = () => {
+      if (destroyed) return;
       const url = `ws://${API_HOST}/api/v1/ws/status`;
       console.log(`[WS:status] Connecting (attempt #${retryCount + 1}):`, url);
       const ws = new WebSocket(url);
       statusWsRef.current = ws;
       ws.onopen = () => {
+        if (destroyed) { ws.close(); return; }
         console.log('[WS:status] ✅ Connected');
         retryCount = 0;
         setWsConnected(true);
@@ -213,6 +216,7 @@ function App() {
         }
       };
       ws.onclose = (e) => {
+        if (destroyed) return;
         retryCount++;
         console.warn(`[WS:status] ❌ Closed (code=${e.code}, reason='${e.reason || 'none'}') — retry #${retryCount} in 3 s`);
         setWsConnected(false);
@@ -225,6 +229,7 @@ function App() {
     };
     connectStatus();
     return () => {
+      destroyed = true;
       if (retryTimer) clearTimeout(retryTimer);
       statusWsRef.current?.close();
     };
@@ -233,12 +238,15 @@ function App() {
   useEffect(() => {
     let retryTimer: any = null;
     let retryCount = 0;
+    let destroyed = false;
     const connectLogs = () => {
+      if (destroyed) return;
       const url = `ws://${API_HOST}/api/v1/ws/logs`;
       console.log(`[WS:logs] Connecting (attempt #${retryCount + 1}):`, url);
       const ws = new WebSocket(url);
       logWsRef.current = ws;
       ws.onopen = () => {
+        if (destroyed) { ws.close(); return; }
         console.log('[WS:logs] ✅ Connected');
         retryCount = 0;
       };
@@ -246,6 +254,7 @@ function App() {
         if (event.data !== 'pong') queueLog(event.data);
       };
       ws.onclose = (e) => {
+        if (destroyed) return;
         retryCount++;
         console.warn(`[WS:logs] ❌ Closed (code=${e.code}) — retry #${retryCount} in 3 s`);
         retryTimer = setTimeout(connectLogs, 3000);
@@ -257,6 +266,7 @@ function App() {
     };
     connectLogs();
     return () => {
+      destroyed = true;
       if (retryTimer) clearTimeout(retryTimer);
       logWsRef.current?.close();
     };

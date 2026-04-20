@@ -1049,6 +1049,10 @@ class LiveTrader:
                 for sym, price in self._latest_prices.items():
                     self.gateway.update_paper_price(sym, price)
 
+            # 以恢复后的净值重新校准风控基线，防止旧 peak_equity 触发熔断
+            if self._current_equity > 0:
+                self.risk_manager.reset_baseline(self._current_equity)
+
             log.info(
                 "已恢复历史状态: equity={:.2f} positions={} paper_cash={:.2f}",
                 self._current_equity,

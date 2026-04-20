@@ -31,6 +31,7 @@ modules/execution/gateway.py — CCXT 交易所执行网关
 
 from __future__ import annotations
 
+import threading
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -98,6 +99,8 @@ class CCXTGateway:
             config["password"] = passphrase
 
         self._exchange: ccxt.Exchange = exchange_class(config)
+        # CCXT is not thread-safe; serialize all _exchange calls with this lock
+        self._exchange_lock = threading.RLock()
 
         # ── Paper 模式：模拟交易账户 ────────────────────────────
         if self.mode == "paper":
@@ -179,7 +182,8 @@ class CCXTGateway:
             return True
 
         try:
-            self._exchange.cancel_order(order_id, symbol)
+            with self._exchange_lock:
+                self._exchange.cancel_order(order_id, symbol)
             audit_log("ORDER_CANCELLED", order_id=order_id, symbol=symbol, mode="live")
             return True
         except ccxt.OrderNotFound:
@@ -208,7 +212,8 @@ class CCXTGateway:
             }
 
         try:
-            return self._exchange.fetch_order(order_id, symbol)
+            with self._exchange_lock:
+                return self._exchange.fetch_order(order_id, symbol)
         except ccxt.OrderNotFound:
             return {"id": order_id, "status": "not_found"}
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
@@ -220,7 +225,8 @@ class CCXTGateway:
             return []
 
         try:
-            return self._exchange.fetch_open_orders(symbol) or []
+            with self._exchange_lock:
+                return self._exchange.fetch_open_orders(symbol) or []
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             raise ExchangeConnectionError(f"获取挂单网络错误: {exc}") from exc
 
@@ -236,7 +242,8 @@ class CCXTGateway:
             return {"USDT": {"free": cash, "used": 0, "total": cash}}
 
         try:
-            return self._exchange.fetch_balance()
+            with self._exchange_lock:
+                return self._exchange.fetch_balance()
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             raise ExchangeConnectionError(f"获取余额网络错误: {exc}") from exc
         except ccxt.AuthenticationError as exc:
@@ -247,7 +254,8 @@ class CCXTGateway:
         获取单个交易对的最新行情（last/bid/ask/volume）。
         """
         try:
-            return self._exchange.fetch_ticker(symbol)
+            with self._exchange_lock:
+                return self._exchange.fetch_ticker(symbol)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             raise ExchangeConnectionError(f"获取行情网络错误: {exc}") from exc
 
@@ -264,7 +272,8 @@ class CCXTGateway:
             CCXT 标准格式的 K 线列表: [[timestamp, open, high, low, close, volume], ...]
         """
         try:
-            return self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit) or []
+            with self._exchange_lock:
+                return self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit) or []
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             raise ExchangeConnectionError(f"获取K线网络错误: {exc}") from exc
         except ccxt.ExchangeError as exc:
@@ -442,12 +451,13 @@ class CCXTGateway:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                if order_type == "market":
-                    resp = self._exchange.create_market_order(symbol, side, quantity, params=params)
-                else:
-                    if price is None:
-                        raise OrderSubmissionError("限价单必须提供 price")
-                    resp = self._exchange.create_limit_order(symbol, side, quantity, price, params=params)
+                with self._exchange_lock:
+                    if order_type == "market":
+                        resp = self._exchange.create_market_order(symbol, side, quantity, params=params)
+                    else:
+                        if price is None:
+                            raise OrderSubmissionError("限价单必须提供 price")
+                        resp = self._exchange.create_limit_order(symbol, side, quantity, price, params=params)
 
                 order_id = resp.get("id", "unknown")
                 audit_log(

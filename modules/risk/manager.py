@@ -208,6 +208,21 @@ class RiskManager:
             "每日风控重置: 起始净值={:.2f}", current_equity
         )
 
+    def reset_baseline(self, current_equity: float) -> None:
+        """
+        以当前净值重置风控基线（peak_equity / daily_start_equity）。
+        在进程重启并恢复状态后调用，防止历史遗留的高 peak_equity
+        在新会话启动时立即触发回撤熔断。
+        """
+        eq = Decimal(str(current_equity))
+        self._state.peak_equity = eq
+        self._state.daily_start_equity = eq
+        self._state.daily_pnl = Decimal("0")
+        self._state.circuit_broken = False
+        self._state.circuit_reason = ""
+        self._state.consecutive_losses = 0
+        log.info("风控基线已重置: equity={:.2f}", current_equity)
+
     def reset_circuit_breaker(self, authorized_by: str = "manual") -> None:
         """
         手动恢复熔断（需要明确授权，不自动恢复）。
