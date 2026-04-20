@@ -14,6 +14,7 @@ core/config.py — 配置加载模块
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -251,9 +252,16 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
         data_yaml = yaml_data.pop("data", {}) or {}
         portfolio_yaml = yaml_data.pop("portfolio", {}) or {}
         cl_yaml = yaml_data.pop("continuous_learning", {}) or {}
-        yaml_data.pop("exchange", None)   # 由 ExchangeConfig() 从 env 读取
+        exchange_yaml = yaml_data.pop("exchange", {}) or {}
         yaml_data.pop("risk", None)       # 由 RiskConfig()    从 env 读取
         yaml_data.pop("logging", None)    # 由 LoggingConfig() 从 env 读取
+
+        # ── 将 YAML exchange_id 注入 os.environ 作为回退 ──────────────
+        # 优先级链：os.environ（Electron 注入）> .env > YAML > 代码默认值
+        # 解决安装包在目标 PC 找不到 .env 时回退为 binance 的问题
+        _eid = exchange_yaml.get("exchange_id")
+        if _eid and "EXCHANGE_ID" not in os.environ:
+            os.environ["EXCHANGE_ID"] = str(_eid)
 
         _config = SystemConfig.model_validate({
             **yaml_data,                                   # 顶层：trading_mode 等

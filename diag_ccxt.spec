@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['apps\\trader\\bundle_entry.py'],
-    pathex=['.'],
+    ['diag_ccxt.py'],
+    pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['dotenv'],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='backend_trader',
+    name='diag_ccxt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
