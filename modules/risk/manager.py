@@ -51,7 +51,7 @@ class RiskConfig:
 
 
 class RiskState:
-    """风控运行时状态（不持久化，仅内存维护）。"""
+    """风控运行时状态（关键字段通过 trader_state.json 持久化）。"""
 
     def __init__(self) -> None:
         self.circuit_broken: bool = False          # 是否触发了熔断
@@ -222,6 +222,27 @@ class RiskManager:
         self._state.circuit_reason = ""
         self._state.consecutive_losses = 0
         log.info("风控基线已重置: equity={:.2f}", current_equity)
+
+    def restore_state(
+        self,
+        peak_equity: float,
+        daily_start_equity: float,
+        consecutive_losses: int = 0,
+    ) -> None:
+        """
+        从持久化文件恢复风控状态，保留真实历史 peak_equity。
+        与 reset_baseline 不同，此方法不会丢弃历史峰值。
+        """
+        self._state.peak_equity = Decimal(str(peak_equity))
+        self._state.daily_start_equity = Decimal(str(daily_start_equity))
+        self._state.consecutive_losses = consecutive_losses
+        self._state.daily_pnl = Decimal("0")
+        self._state.circuit_broken = False
+        self._state.circuit_reason = ""
+        log.info(
+            "风控状态已恢复: peak={:.2f} daily_start={:.2f} consec_loss={}",
+            peak_equity, daily_start_equity, consecutive_losses,
+        )
 
     def reset_circuit_breaker(self, authorized_by: str = "manual") -> None:
         """

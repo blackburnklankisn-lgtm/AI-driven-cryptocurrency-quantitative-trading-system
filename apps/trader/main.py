@@ -1008,12 +1008,16 @@ class LiveTrader:
     def _save_state(self) -> None:
         """将关键运行状态持久化到 JSON 文件。"""
         import json
+        risk_summary = self.risk_manager.get_state_summary()
         state = {
             "positions": {sym: str(qty) for sym, qty in self._positions.items()},
             "entry_prices": self._entry_prices,
             "current_equity": self._current_equity,
             "latest_prices": self._latest_prices,
             "paper_cash": self.gateway.paper_cash if self.mode == "paper" else 0,
+            "risk_peak_equity": risk_summary.get("peak_equity", 0),
+            "risk_daily_start_equity": risk_summary.get("daily_start_equity", 0),
+            "risk_consecutive_losses": risk_summary.get("consecutive_losses", 0),
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
         try:
@@ -1049,15 +1053,26 @@ class LiveTrader:
                 for sym, price in self._latest_prices.items():
                     self.gateway.update_paper_price(sym, price)
 
-            # 以恢复后的净值重新校准风控基线，防止旧 peak_equity 触发熔断
-            if self._current_equity > 0:
+            # 恢复风控状态（peak_equity / daily_start_equity / consecutive_losses）
+            risk_peak = state.get("risk_peak_equity")
+            risk_daily_start = state.get("risk_daily_start_equity")
+            risk_consec = state.get("risk_consecutive_losses", 0)
+            if risk_peak is not None and self._current_equity > 0:
+                self.risk_manager.restore_state(
+                    peak_equity=risk_peak,
+                    daily_start_equity=risk_daily_start or self._current_equity,
+                    consecutive_losses=risk_consec,
+                )
+            elif self._current_equity > 0:
+                # 旧版状态文件无风控字段 → 回退到 reset_baseline
                 self.risk_manager.reset_baseline(self._current_equity)
 
             log.info(
-                "已恢复历史状态: equity={:.2f} positions={} paper_cash={:.2f}",
+                "已恢复历史状态: equity={:.2f} positions={} paper_cash={:.2f} peak={:.2f}",
                 self._current_equity,
                 dict(self._positions),
                 state.get("paper_cash", 5000.0),
+                risk_peak or self._current_equity,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("状态恢复失败（使用默认值启动）: {}", exc)
