@@ -264,6 +264,51 @@ class TestPortfolioRebalancer:
         orders = rebalancer.on_bar_close(equity, positions, prices, self.SYMBOLS)
         assert len(orders) == 0
 
+    def test_drift_suppressed_after_consecutive_noop(self, allocator: PortfolioAllocator) -> None:
+        """连续 drift noop 达到 3 次后，drift 触发应被抑制，仅保留 scheduled。"""
+        rebalancer = PortfolioRebalancer(
+            allocator=allocator,
+            rebalance_every_n=100,  # scheduled 间隔很长，不会触发
+            drift_threshold=0.05,
+            min_trade_notional=1.0,
+        )
+        equity = 100_000.0
+        # 全空仓，所有 target_weight > 0.05，每次都会 drift 触发
+        positions = {"BTC/USDT": Decimal("0"), "ETH/USDT": Decimal("0")}
+        prices = {"BTC/USDT": 50_000.0, "ETH/USDT": 3_000.0}
+
+        # 前 3 次 drift 正常触发
+        for i in range(3):
+            orders = rebalancer.on_bar_close(equity, positions, prices, self.SYMBOLS)
+            assert len(orders) > 0, f"第 {i+1} 次 drift 应触发"
+            # 模拟熔断拦截后递增 noop
+            rebalancer._consecutive_drift_noop += 1
+
+        assert rebalancer._consecutive_drift_noop >= 3
+
+        # 第 4 次：drift 被抑制
+        orders = rebalancer.on_bar_close(equity, positions, prices, self.SYMBOLS)
+        assert len(orders) == 0, "连续 noop>=3 后 drift 应被抑制"
+
+    def test_drift_noop_reset_on_scheduled(self, allocator: PortfolioAllocator) -> None:
+        """scheduled 触发应重置 drift noop 计数器。"""
+        rebalancer = PortfolioRebalancer(
+            allocator=allocator,
+            rebalance_every_n=2,  # 每 2 根触发 scheduled
+            drift_threshold=0.05,
+            min_trade_notional=1.0,
+        )
+        rebalancer._consecutive_drift_noop = 5  # 模拟已被抑制
+
+        equity = 100_000.0
+        positions = {"BTC/USDT": Decimal("0"), "ETH/USDT": Decimal("0")}
+        prices = {"BTC/USDT": 50_000.0, "ETH/USDT": 3_000.0}
+
+        # 触发 scheduled（bar_count=1, last=-1, 1-(-1)=2 >= 2）
+        orders = rebalancer.on_bar_close(equity, positions, prices, self.SYMBOLS)
+        assert len(orders) > 0
+        assert rebalancer._consecutive_drift_noop == 0
+
 
 # ─────────────────────────────────────────────────────────────
 # MeanVarianceOptimizer 测试

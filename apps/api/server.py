@@ -292,6 +292,18 @@ async def get_klines(symbol: str = "BTC/USDT") -> List[Dict[str, Any]]:
         return []
 
     closed_bars: List[Dict[str, Any]] = list(trader._kline_store.get(symbol, []))
+
+    # ── 排序 + 去重：防止 mock 数据或乱序缓存导致 lightweight-charts 报错 ──
+    if closed_bars:
+        closed_bars.sort(key=lambda x: x["time"])
+        deduped: List[Dict[str, Any]] = [closed_bars[0]]
+        for bar in closed_bars[1:]:
+            if bar["time"] > deduped[-1]["time"]:
+                deduped.append(bar)
+            elif bar["time"] == deduped[-1]["time"]:
+                deduped[-1] = bar  # 同时间戳取最新
+        closed_bars = deduped
+
     log.info("API: Returning {} closed klines for {}", len(closed_bars), symbol)
 
     # 附加当前正在形成中的蜡烛（open bar），让图表实时反映最新价格
@@ -305,8 +317,9 @@ async def get_klines(symbol: str = "BTC/USDT") -> List[Dict[str, Any]]:
                          tzinfo=_dt.timezone.utc).timestamp()
         )
         last_closed = closed_bars[-1]
-        if last_closed["time"] != current_bar_open_ts:
-            # 仅当闭合蜡烛不是当前小时才追加（避免重复）
+        # 仅当 developing bar 时间严格大于最后一根闭合蜡烛时才追加
+        # （用 > 而非 !=，防止 mock 数据时间戳在当前小时内导致倒序）
+        if current_bar_open_ts > last_closed["time"]:
             open_price = float(last_closed["close"])
             developing_bar = {
                 "time": current_bar_open_ts,

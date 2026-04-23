@@ -83,6 +83,7 @@ class PortfolioRebalancer:
         self._bar_count: int = 0
         self._last_rebalance_bar: int = -1
         self._target_weights: Dict[str, float] = {}
+        self._consecutive_drift_noop: int = 0  # 连续 drift 触发但未实际执行的次数
 
         log.info(
             "PortfolioRebalancer 初始化: every_n={} drift={} min_notional={}",
@@ -127,6 +128,9 @@ class PortfolioRebalancer:
         trigger_reason = self._check_triggers(current_weights)
 
         if trigger_reason:
+            # scheduled 触发时重置 drift noop 计数器（允许重新检测 drift）
+            if trigger_reason == "scheduled":
+                self._consecutive_drift_noop = 0
             orders = self._generate_orders(
                 equity=equity,
                 positions=positions,
@@ -228,7 +232,11 @@ class PortfolioRebalancer:
         ):
             return "scheduled"
 
-        # 漂移触发
+        # 漂移触发（当连续 drift 未被执行超过 3 次时降级为仅 scheduled 触发，
+        # 避免空仓+熔断场景下每分钟产生无效日志）
+        if self._consecutive_drift_noop >= 3:
+            return None
+
         if self._target_weights and self.drift_threshold > 0:
             for symbol, target_w in self._target_weights.items():
                 actual_w = current_weights.get(symbol, 0.0)

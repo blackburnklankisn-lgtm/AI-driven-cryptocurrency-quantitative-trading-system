@@ -47,6 +47,8 @@ risk:
   max_daily_loss: 0.03
   # 连续亏损超过此次数触发熔断
   max_consecutive_losses: 5
+  # 熔断冷却期（分钟），超过后自动解除熔断并重置基线
+  circuit_breaker_cooldown_minutes: 60
 
 # ---------------------------
 # 组合管理配置

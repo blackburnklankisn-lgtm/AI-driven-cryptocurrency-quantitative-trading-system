@@ -238,6 +238,7 @@ class TestRiskManager:
             max_daily_loss=kwargs.get("max_daily_loss", 0.05),
             max_consecutive_losses=kwargs.get("max_consecutive_losses", 3),
             blacklist=kwargs.get("blacklist", []),
+            circuit_breaker_cooldown_minutes=kwargs.get("circuit_breaker_cooldown_minutes", 60),
         )
         return RiskManager(cfg)
 
@@ -388,3 +389,78 @@ class TestRiskManager:
             positions={},
         )
         assert allowed is False
+
+    # ── 熔断冷却期自动恢复测试 ────────────────────────────────
+
+    def test_circuit_breaker_cooldown_auto_reset(self) -> None:
+        """熔断冷却期过后，update_equity 应自动解除熔断并重置 peak_equity。"""
+        from datetime import datetime, timedelta, timezone
+
+        rm = self._make_risk_manager(
+            max_portfolio_drawdown=0.10,
+            max_daily_loss=0.50,
+            circuit_breaker_cooldown_minutes=60,
+        )
+
+        rm.update_equity(100_000.0)  # 峰值
+        rm.update_equity(89_000.0)   # -11% → 触发熔断
+        assert rm.is_circuit_broken()
+        assert rm._state.circuit_broken_at is not None
+
+        # 模拟冷却期未到（30 分钟前触发）
+        rm._state.circuit_broken_at = datetime.now(tz=timezone.utc) - timedelta(minutes=30)
+        rm.update_equity(89_000.0)
+        assert rm.is_circuit_broken()  # 仍在熔断
+
+        # 模拟冷却期已过（61 分钟前触发）
+        rm._state.circuit_broken_at = datetime.now(tz=timezone.utc) - timedelta(minutes=61)
+        rm.update_equity(89_000.0)
+        assert not rm.is_circuit_broken()  # 已自动解除
+        assert float(rm._state.peak_equity) == 89_000.0  # peak 已重置为当前值
+
+    def test_circuit_breaker_cooldown_resets_consecutive_losses(self) -> None:
+        """冷却期自动恢复时应重置连续亏损计数。"""
+        from datetime import datetime, timedelta, timezone
+
+        rm = self._make_risk_manager(
+            max_consecutive_losses=3,
+            circuit_breaker_cooldown_minutes=60,
+        )
+
+        rm.record_trade_outcome(won=False)
+        rm.record_trade_outcome(won=False)
+        rm.record_trade_outcome(won=False)
+        assert rm.is_circuit_broken()
+
+        # 冷却期过后自动恢复
+        rm._state.circuit_broken_at = datetime.now(tz=timezone.utc) - timedelta(minutes=61)
+        rm.update_equity(50_000.0)
+        assert not rm.is_circuit_broken()
+        assert rm._state.consecutive_losses == 0
+
+    def test_no_phantom_peak_equity(self) -> None:
+        """peak_equity 不应被非正数 equity 更新（防止虚假峰值）。"""
+        rm = self._make_risk_manager()
+        assert rm._state.peak_equity == Decimal("0")
+
+        # 正常更新
+        rm.update_equity(5000.0)
+        assert rm._state.peak_equity == Decimal("5000")
+
+        # peak 只上升不下降
+        rm.update_equity(4500.0)
+        assert rm._state.peak_equity == Decimal("5000")
+
+    def test_circuit_broken_at_timestamp_set(self) -> None:
+        """触发熔断时应记录 circuit_broken_at 时间戳。"""
+        rm = self._make_risk_manager(
+            max_portfolio_drawdown=0.10,
+            max_daily_loss=0.50,
+        )
+
+        rm.update_equity(100_000.0)
+        assert rm._state.circuit_broken_at is None
+
+        rm.update_equity(89_000.0)  # -11%
+        assert rm.is_circuit_broken()
+        assert rm._state.circuit_broken_at is not None

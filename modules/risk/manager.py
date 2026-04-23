@@ -30,7 +30,7 @@ modules/risk/manager.py — 风险管理器（RiskManager）
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
@@ -48,6 +48,7 @@ class RiskConfig:
     max_daily_loss: float = 0.03          # 单日最大亏损（占净值比例）
     max_consecutive_losses: int = 5       # 连续亏损熔断次数
     blacklist: List[str] = field(default_factory=list)  # 黑名单币种
+    circuit_breaker_cooldown_minutes: int = 60  # 熔断冷却期（分钟），超过后自动解除
 
 
 class RiskState:
@@ -56,6 +57,7 @@ class RiskState:
     def __init__(self) -> None:
         self.circuit_broken: bool = False          # 是否触发了熔断
         self.circuit_reason: str = ""              # 熔断原因
+        self.circuit_broken_at: Optional[datetime] = None  # 熔断触发时间
         self.daily_pnl: Decimal = Decimal("0")    # 当日盈亏
         self.daily_start_equity: Optional[Decimal] = None  # 当日起始净值
         self.consecutive_losses: int = 0          # 连续亏损计数
@@ -158,8 +160,31 @@ class RiskManager:
         if self._state.daily_start_equity is None:
             self._state.daily_start_equity = equity
 
-        # 更新历史最高净值
-        if equity > self._state.peak_equity:
+        # ── 熔断冷却期自动恢复 ────────────────────────────────
+        if self._state.circuit_broken and self._state.circuit_broken_at:
+            cooldown = timedelta(minutes=self.config.circuit_breaker_cooldown_minutes)
+            elapsed = datetime.now(tz=timezone.utc) - self._state.circuit_broken_at
+            if elapsed >= cooldown:
+                # 冷却期已过，重置 peak_equity 为当前值并解除熔断
+                self._state.peak_equity = equity
+                self._state.daily_start_equity = equity
+                self._state.daily_pnl = Decimal("0")
+                self._state.circuit_broken = False
+                self._state.circuit_broken_at = None
+                self._state.circuit_reason = ""
+                self._state.consecutive_losses = 0
+                audit_log(
+                    "CIRCUIT_BREAKER_AUTO_RESET",
+                    cooldown_minutes=self.config.circuit_breaker_cooldown_minutes,
+                    new_baseline_equity=float(equity),
+                )
+                log.warning(
+                    "🔄 熔断冷却期 {}min 已过，自动解除熔断，peak_equity 重置为 {:.2f}",
+                    self.config.circuit_breaker_cooldown_minutes, float(equity),
+                )
+
+        # 更新历史最高净值（仅非熔断状态下上修）
+        if not self._state.circuit_broken and equity > self._state.peak_equity:
             self._state.peak_equity = equity
 
         # 更新当日盈亏
@@ -373,6 +398,7 @@ class RiskManager:
         """触发熔断，写入审计日志。"""
         self._state.circuit_broken = True
         self._state.circuit_reason = reason
+        self._state.circuit_broken_at = datetime.now(tz=timezone.utc)
         audit_log(
             "CIRCUIT_BREAKER_TRIGGERED",
             reason=reason,

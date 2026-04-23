@@ -118,6 +118,7 @@ class LiveTrader:
             max_portfolio_drawdown=float(risk_cfg.max_portfolio_drawdown),
             max_daily_loss=float(risk_cfg.max_daily_loss),
             max_consecutive_losses=risk_cfg.max_consecutive_losses,
+            circuit_breaker_cooldown_minutes=getattr(risk_cfg, 'circuit_breaker_cooldown_minutes', 60),
         ))
 
         # ── 5b. 动态仓位管理器 ───────────────────────────────────
@@ -139,6 +140,12 @@ class LiveTrader:
         # K 线存储库 (最近 100 根，供前端绘图使用)
         # 格式: { symbol: [ {time, open, high, low, close, volume}, ... ] }
         self._kline_store: Dict[str, List[Dict[str, Any]]] = {}
+
+        # ── 交易所连接状态追踪 ────────────────────────────────
+        # loadMarkets 是否成功（VPN 不通时会失败）
+        self._markets_loaded: bool = False
+        # 历史 K 线是否已成功预加载
+        self._preload_done: bool = False
 
         # Gemini 配置
         self._gemini_api_key = os.getenv("GOOGLE_API_KEY")
@@ -233,10 +240,22 @@ class LiveTrader:
         audit_log("SYSTEM_STARTUP", mode=self.mode)
         log.info("=" * 50)
         log.info("系统启动: mode={} exchange={}", self.mode, self.gateway.exchange_id)
+        log.info("用户数据目录: {}", self._state_file_path.parent)
         log.info("=" * 50)
 
         # ── 恢复持久化状态（如有）──────────────────────────────
         self._load_state()
+
+        # ── 确保 equity 在预加载/主循环前已正确计算 ──────────────
+        # 避免 _current_equity=0 导致风控注入假值
+        self._update_account_snapshot()
+        # 首次启动(无状态文件)时 peak_equity 可能为 0，用真实 equity 初始化
+        if self._current_equity > 0 and self.risk_manager._state.peak_equity <= 0:
+            self.risk_manager.reset_baseline(self._current_equity)
+            log.info(
+                "首次启动: 以当前权益 {:.2f} 初始化风控基线",
+                self._current_equity,
+            )
 
         # ── 预加载历史 K 线，喂给策略暖机 ─────────────────────
         self._preload_history()
@@ -314,6 +333,24 @@ class LiveTrader:
         # Step 1: 拉取最新行情，构建 KlineEvent
         kline_events = self._fetch_latest_klines(symbols)
         log.debug("[Loop#{0}] 拉取K线: {1}个事件", seq, len(kline_events))
+
+        # ── 延迟预加载检测：网络恢复后自动补充历史 K 线 ──────────
+        # 若启动时预加载失败（VPN 未连、网络不通等），当主循环首次从交易所
+        # 成功拿到真实行情数据时，说明网络已恢复，立即执行延迟预加载。
+        if not self._preload_done and kline_events:
+            has_live = any(e.source == "live_feed" for e in kline_events)
+            if has_live:
+                log.info(
+                    "[DeferredPreload] 检测到交易所连接恢复，开始延迟预加载历史 K 线…"
+                )
+                try:
+                    self._preload_history()
+                    if self._preload_done:
+                        log.info(
+                            "[DeferredPreload] ✅ 历史 K 线延迟预加载成功"
+                        )
+                except Exception:  # noqa: BLE001
+                    log.exception("[DeferredPreload] 延迟预加载异常")
 
         # Step 2: 驱动策略并缓存 K 线 + 收益率跟踪
         rebalance_triggered = False
@@ -496,9 +533,14 @@ class LiveTrader:
                     mock_prices = {"BTC": 67000, "ETH": 3500, "SOL": 150}
                     base = next((v for k, v in mock_prices.items() if k in symbol), 1000)
                     mock_price = base * random.uniform(0.99, 1.01)
+                    # 使用上一小时的整点时间戳（与真实 K 线对齐），
+                    # 避免 datetime.now() 产生的非整点时间戳导致
+                    # developing bar 追加时出现时间倒序。
+                    now_utc = datetime.now(tz=timezone.utc)
+                    mock_ts = now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
                     events.append(KlineEvent(
                         event_type=EventType.KLINE_UPDATED,
-                        timestamp=datetime.now(tz=timezone.utc),
+                        timestamp=mock_ts,
                         source="mock_feed",
                         symbol=symbol,
                         timeframe=tf,
@@ -520,16 +562,16 @@ class LiveTrader:
         # 发布到事件总线（其他订阅者可扩展）
         self.bus.publish(event)
 
-        # 更新风控状态
-        equity = self._current_equity or float(self.sys_config.risk.max_position_pct) * 100_000
-        self.risk_manager.update_equity(equity)
+        # 更新风控状态（仅当 equity 已被正确计算时才更新，避免注入假值）
+        if self._current_equity > 0:
+            self.risk_manager.update_equity(self._current_equity)
 
         # 驱动所有策略
         for strategy in self._strategies:
             try:
                 order_requests = strategy.on_kline(event)
                 for req in (order_requests or []):
-                    self._process_order_request(req, equity)
+                    self._process_order_request(req, self._current_equity)
             except Exception:  # noqa: BLE001
                 log.exception("策略异常: strategy={}", getattr(strategy, "strategy_id", "unknown"))
 
@@ -597,7 +639,7 @@ class LiveTrader:
             side=req.side,
             symbol=req.symbol,
             quantity=quantity,
-            price=float(req.price or 0),
+            price=float(req.price or self._latest_prices.get(req.symbol, 0)),
             current_equity=equity,
             positions=dict(self._positions),
         )
@@ -652,6 +694,9 @@ class LiveTrader:
         # 熔断检查：若已熔断，取消本次再平衡
         if self.risk_manager.is_circuit_broken():
             log.warning("[Rebalance] 系统已熔断，取消本次再平衡 (orders={})", len(rebal_orders))
+            # 通知 rebalancer 本次 drift 未被执行，用于抑制空仓下的日志风暴
+            if self.rebalancer:
+                self.rebalancer._consecutive_drift_noop += 1
             return
 
         equity = self._current_equity or 5000.0
@@ -691,6 +736,9 @@ class LiveTrader:
             "[Rebalance] 完成: submitted={} rejected={} total={}",
             submitted, rejected, len(rebal_orders),
         )
+        # 有订单成功提交时，重置 drift noop 计数器
+        if submitted > 0 and self.rebalancer:
+            self.rebalancer._consecutive_drift_noop = 0
 
     def _on_model_updated(self, strategy_id: str, learner, new_model) -> None:
         """ContinuousLearner 产出新模型时的热替换回调。"""
@@ -763,6 +811,8 @@ class LiveTrader:
                 "[Fill] 卖出成交: {} remaining_qty={:.6f} entry={:.4f} pnl={:.4f}",
                 rec.symbol, remaining, entry_price, pnl,
             )
+            # 记录盈亏结果到风控（用于连续亏损熔断）
+            self.risk_manager.record_trade_outcome(won=(pnl > 0))
             # 清仓时移除入场价，并清除止损待处理标记
             if self._positions[rec.symbol] <= 0:
                 self._entry_prices.pop(rec.symbol, None)
@@ -839,28 +889,90 @@ class LiveTrader:
 
 
     def _check_daily_reset(self, now: datetime) -> None:
-        """检查是否需要执行每日重置（UTC 00:00 ~ 00:01 之间的第一次循环）。"""
-        if now.hour == 0 and now.minute == 0:
+        """检查是否需要执行每日重置（UTC 日期变更时执行，有防重复机制）。"""
+        today = now.date()
+        if not hasattr(self, '_last_daily_reset_date'):
+            self._last_daily_reset_date = None
+        if self._last_daily_reset_date != today and now.hour == 0 and now.minute < 5:
             self.risk_manager.reset_daily(self._current_equity)
+            self._last_daily_reset_date = today
             log.info("每日风控重置完成")
 
     # ────────────────────────────────────────────────────────────
     # 历史 K 线预加载（解决策略冷启动问题）
     # ────────────────────────────────────────────────────────────
 
+    def _ensure_markets_loaded(self) -> bool:
+        """尝试加载 CCXT 市场元数据（带重试）。返回是否成功。
+
+        在 VPN/网络不通时可能失败，此时返回 False，后续主循环中
+        检测到交易所可用后会自动重试。
+        """
+        if self._markets_loaded:
+            return True
+
+        for attempt in range(1, 4):
+            try:
+                self.gateway._exchange.load_markets()
+                self._markets_loaded = True
+                log.info("CCXT loadMarkets 成功 (attempt={})", attempt)
+                return True
+            except Exception as exc:
+                log.warning(
+                    "CCXT loadMarkets 失败 (attempt={}/3): {}",
+                    attempt, str(exc)[:120],
+                )
+                if attempt < 3:
+                    time.sleep(3 * attempt)  # 渐进退避 3s, 6s
+
+        log.warning(
+            "CCXT loadMarkets 3 次重试均失败，等待网络恢复后自动重试"
+        )
+        return False
+
     def _preload_history(self) -> None:
-        """启动时预加载历史 K 线，让策略完成暖机（预热期）。"""
+        """启动时预加载历史 K 线，让策略完成暖机（预热期）。
+
+        若网络不通（VPN 未连接等），loadMarkets 和 fetch_ohlcv 都会失败，
+        此时标记 _preload_done=False。主循环会在检测到交易所恢复后
+        自动调用本方法完成延迟加载。
+        """
         symbols = self.sys_config.data.default_symbols
         tf = self.sys_config.data.default_timeframe
         preload_bars = 500  # 加载 500 根历史 K 线（满足 ML min_buffer_size=300 + Allocator lookback=60）
 
         log.info("开始预加载历史 K 线: bars={} timeframe={}", preload_bars, tf)
 
+        # ── 显式预加载 CCXT 市场元数据（带重试） ──
+        if not self._ensure_markets_loaded():
+            log.warning("预加载中止: 无法加载市场元数据，等待网络恢复")
+            return
+
+        preload_success_count = 0
         for symbol in symbols:
+            candles = None
+            # ── 每个品种最多重试 3 次 ──
+            for attempt in range(1, 4):
+                try:
+                    candles = self.gateway.fetch_ohlcv(
+                        symbol, timeframe=tf, limit=preload_bars,
+                    )
+                    if candles:
+                        break
+                    log.warning(
+                        "预加载: {} 返回空数据 (attempt={}/3)", symbol, attempt,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "预加载: {} attempt={}/3 失败: {}",
+                        symbol, attempt, str(exc)[:120],
+                    )
+                if attempt < 3:
+                    time.sleep(2 * attempt)  # 渐进退避 2s, 4s
+
             try:
-                candles = self.gateway.fetch_ohlcv(symbol, timeframe=tf, limit=preload_bars)
                 if not candles:
-                    log.warning("预加载: {} 返回空数据，跳过", symbol)
+                    log.warning("预加载: {} 所有重试失败，跳过", symbol)
                     continue
 
                 # 除最后一根（可能未收线）外，全部喂给策略
@@ -935,6 +1047,7 @@ class LiveTrader:
                     "预加载完成: {} bars={} alloc_warm={} CL_buf={}",
                     symbol, len(closed_candles), alloc_warm, cl_buf,
                 )
+                preload_success_count += 1
 
             except Exception as exc:  # noqa: BLE001
                 log.warning("预加载失败: {} error={}", symbol, str(exc)[:200])
@@ -949,7 +1062,21 @@ class LiveTrader:
                 log.info("[Preload] ContinuousLearner {}: buf={}/{}",
                          sid, len(learner._ohlcv_buffer), learner.config.min_bars_for_retrain)
 
-        log.info("AUDIT: K-line history cache is now ready and populated.")
+        # ── 标记预加载是否成功（至少有一个品种加载到数据）──
+        if preload_success_count > 0:
+            self._preload_done = True
+            log.info(
+                "AUDIT: K-line history cache is now ready and populated. "
+                "({}/{} 品种预加载成功)",
+                preload_success_count, len(symbols),
+            )
+        else:
+            self._preload_done = False
+            log.warning(
+                "AUDIT: K-line 历史预加载全部失败 ({} 品种均未成功)，"
+                "等待网络恢复后主循环将自动重试",
+                len(symbols),
+            )
 
     def _cache_kline_event(self, event: KlineEvent) -> None:
         """将其缓存到内存中，供前端通过 API 请求历史轨迹。"""
@@ -966,10 +1093,16 @@ class LiveTrader:
             "volume": float(event.volume)
         }
         
-        # 避免重复（通过时间戳）
+        # 避免重复（通过时间戳），并确保时间严格递增
         store = self._kline_store[event.symbol]
         if store and store[-1]["time"] == kline["time"]:
             store[-1] = kline
+        elif store and kline["time"] < store[-1]["time"]:
+            # 新 bar 时间早于 store 末尾（mock 数据或乱序场景）→ 跳过
+            log.debug(
+                "cache_kline: {} 跳过乱序 bar time={} < last={}",
+                event.symbol, kline["time"], store[-1]["time"],
+            )
         else:
             store.append(kline)
             # 限制长度，防止内存无限增长
@@ -1002,8 +1135,55 @@ class LiveTrader:
     # 状态持久化（防止重启丢失持仓）
     # ────────────────────────────────────────────────────────────
 
+    # 旧版状态文件路径（相对于 cwd，安装目录下）
+    _STATE_FILE_LEGACY = "storage/trader_state.json"
 
-    _STATE_FILE = "storage/trader_state.json"
+    @property
+    def _state_file_path(self) -> Path:
+        """
+        获取状态文件的绝对路径。
+
+        优先级：
+        1. 环境变量 USER_DATA_DIR（由 Electron 设置为 %APPDATA%/AI Quant Trader/）
+        2. 回退到 cwd 下的 storage/trader_state.json（开发模式）
+
+        将状态文件存入用户数据目录（%APPDATA%），确保软件升级/卸载/重装
+        均不会丢失 paper 模式下的资金和仓位数据。
+        """
+        user_data_dir = os.environ.get("USER_DATA_DIR")
+        if user_data_dir:
+            return Path(user_data_dir) / "trader_state.json"
+        return Path(self._STATE_FILE_LEGACY)
+
+    def _migrate_legacy_state(self) -> None:
+        """
+        将旧版安装目录下的状态文件迁移到用户数据目录（%APPDATA%）。
+
+        仅在以下条件全部满足时执行：
+        - 存在 USER_DATA_DIR 环境变量
+        - 新位置尚无状态文件
+        - 旧位置存在状态文件
+        """
+        user_data_dir = os.environ.get("USER_DATA_DIR")
+        if not user_data_dir:
+            return
+
+        new_path = Path(user_data_dir) / "trader_state.json"
+        old_path = Path(self._STATE_FILE_LEGACY)
+
+        if new_path.exists() or not old_path.exists():
+            return
+
+        try:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(str(old_path), str(new_path))
+            log.info(
+                "状态文件已迁移: {} → {}",
+                old_path, new_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("状态文件迁移失败（将从旧位置读取）: {}", exc)
 
     def _save_state(self) -> None:
         """将关键运行状态持久化到 JSON 文件。"""
@@ -1021,7 +1201,7 @@ class LiveTrader:
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
         try:
-            state_path = Path(self._STATE_FILE)
+            state_path = self._state_file_path
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
@@ -1030,7 +1210,11 @@ class LiveTrader:
     def _load_state(self) -> None:
         """从 JSON 文件恢复运行状态。"""
         import json
-        state_path = Path(self._STATE_FILE)
+
+        # ── 旧版状态文件自动迁移（安装目录 → %APPDATA%）──
+        self._migrate_legacy_state()
+
+        state_path = self._state_file_path
         if not state_path.exists():
             log.info("无历史状态文件，首次启动")
             return
@@ -1058,11 +1242,28 @@ class LiveTrader:
             risk_daily_start = state.get("risk_daily_start_equity")
             risk_consec = state.get("risk_consecutive_losses", 0)
             if risk_peak is not None and self._current_equity > 0:
-                self.risk_manager.restore_state(
-                    peak_equity=risk_peak,
-                    daily_start_equity=risk_daily_start or self._current_equity,
-                    consecutive_losses=risk_consec,
-                )
+                # 检查恢复的 peak_equity 是否会立即触发熔断
+                # 若 drawdown 已超阈值，说明 peak_equity 是过时的历史高点，
+                # 在新会话中应重置为当前值，避免启动即熔断
+                drawdown_threshold = float(self.sys_config.risk.max_portfolio_drawdown)
+                if risk_peak > 0:
+                    pending_drawdown = (risk_peak - self._current_equity) / risk_peak
+                else:
+                    pending_drawdown = 0.0
+                if pending_drawdown >= drawdown_threshold:
+                    log.warning(
+                        "状态恢复: peak={:.2f} equity={:.2f} drawdown={:.1f}% >= 阈值{:.0f}%，"
+                        "重置 peak_equity 为当前值以避免启动即熔断",
+                        risk_peak, self._current_equity,
+                        pending_drawdown * 100, drawdown_threshold * 100,
+                    )
+                    self.risk_manager.reset_baseline(self._current_equity)
+                else:
+                    self.risk_manager.restore_state(
+                        peak_equity=risk_peak,
+                        daily_start_equity=risk_daily_start or self._current_equity,
+                        consecutive_losses=risk_consec,
+                    )
             elif self._current_equity > 0:
                 # 旧版状态文件无风控字段 → 回退到 reset_baseline
                 self.risk_manager.reset_baseline(self._current_equity)

@@ -45,9 +45,14 @@ function startPythonBackend(): void {
   const execDir = path.dirname(app.getPath('exe'));
   const configPath = path.join(process.resourcesPath, 'configs', 'system.yaml');
 
+  // 用户数据目录：%APPDATA%/AI Quant Trader/
+  // 状态文件（trader_state.json）存放于此，确保卸载/升级不会丢失
+  const userDataDir = path.join(app.getPath('appData'), 'AI Quant Trader');
+
   console.log(`[Electron] Backend exe   : ${pythonExe}`);
   console.log(`[Electron] Working dir   : ${execDir}`);
   console.log(`[Electron] CONFIG_PATH   : ${configPath}`);
+  console.log(`[Electron] USER_DATA_DIR : ${userDataDir}`);
   console.log(`[Electron] TRADING_MODE  : paper`);
 
   const args = !isDev ? [] : ['-m', 'apps.trader.main']; 
@@ -58,6 +63,7 @@ function startPythonBackend(): void {
       ...process.env,
       TRADING_MODE: 'paper',
       CONFIG_PATH: configPath,
+      USER_DATA_DIR: userDataDir,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
