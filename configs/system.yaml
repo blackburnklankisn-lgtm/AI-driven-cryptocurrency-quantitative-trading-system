@@ -87,17 +87,20 @@ logging:
 
 # ---------------------------
 # Phase 3 高级策略 + 自进化配置
-# 所有 *_enabled 开关默认关闭，确保 Phase 1/2 路径不受影响。
-# 在 replay/paper 验证通过后再逐步开启。
+# realtime feed 在 paper 模式下默认开启，且默认走 HTX public market feed。
+# 如需离线/无外网验证，可将 provider 切回 mock。
+# 可用脚本验证: python scripts/verify_phase3_realtime_feed.py --provider htx --exchange htx --symbol BTC/USDT --timeout 20
 # ---------------------------
 phase3:
   enabled: true
-  realtime_feed_enabled: false
+  realtime_feed_enabled: true
   market_making_enabled: false
   rl_agent_enabled: false
   self_evolution_enabled: false
 
   realtime_feed:
+    provider: htx    # htx | mock
+    ws_url:
     reconnect_backoff_sec: 2
     heartbeat_timeout_sec: 15
     orderbook_depth_levels: 20

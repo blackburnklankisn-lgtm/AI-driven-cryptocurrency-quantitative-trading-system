@@ -677,7 +677,7 @@ class TestPhase3Config:
         from core.config import Phase3Config
         p3 = Phase3Config()
         assert p3.enabled is True
-        assert p3.realtime_feed_enabled is False
+        assert p3.realtime_feed_enabled is True
         assert p3.market_making_enabled is False
         assert p3.rl_agent_enabled is False
         assert p3.self_evolution_enabled is False
@@ -685,6 +685,7 @@ class TestPhase3Config:
     def test_phase3_subconfig_realtime_feed(self):
         from core.config import Phase3RealtimeFeedConfig
         rtf = Phase3RealtimeFeedConfig()
+        assert rtf.provider == "htx"
         assert rtf.reconnect_backoff_sec > 0
         assert rtf.orderbook_depth_levels > 0
         assert rtf.snapshot_recovery_enabled is True

@@ -36,6 +36,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -43,18 +44,43 @@ from typing import Any, Dict, List, Optional
 import threading
 import uvicorn
 import asyncio
+from uuid import uuid4
+
+import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from core.config import load_config
 from core.event import EventBus, EventType, KlineEvent, OrderRequestEvent
 from core.logger import audit_log, get_logger, setup_logging, trade_log
-from modules.alpha.runtime import AlphaRuntime, StrategyRegistry, BaseAlphaAdapter
 from modules.alpha.contracts import RegimeState
+from modules.alpha.ml.data_kitchen import DataKitchen
+from modules.alpha.orchestration.strategy_orchestrator import (
+    OrchestrationInput,
+    StrategyOrchestrator,
+)
+from modules.alpha.runtime import AlphaRuntime, StrategyRegistry, BaseAlphaAdapter
+from modules.alpha.regime.detector import MarketRegimeDetector
+from modules.data.realtime.depth_cache import DepthCacheConfig, DepthCacheRegistry
+from modules.data.realtime.feature_builder import MicroFeatureBuilder
+from modules.data.realtime.orderbook_types import OrderBookSnapshot
+from modules.data.realtime.subscription_manager import SubscriptionManager, SubscriptionManagerConfig
+from modules.data.realtime.trade_cache import TradeCacheConfig, TradeCacheRegistry
+from modules.data.realtime.ws_client import (
+    ExchangeWsClient,
+    MockWsClient,
+    WsClientConfig,
+    create_exchange_ws_client,
+)
 from modules.execution.gateway import CCXTGateway
 from modules.execution.order_manager import OrderManager
 from modules.monitoring.metrics import SystemMetrics
+from modules.risk.adaptive_matrix import AdaptiveRiskMatrix
+from modules.risk.budget_checker import BudgetChecker, BudgetConfig
+from modules.risk.kill_switch import KillSwitch, KillSwitchConfig
 from modules.risk.manager import RiskConfig, RiskManager
 from modules.risk.position_sizer import PositionSizer
+from modules.risk.snapshot import RiskSnapshot
+from modules.risk.state_store import StateStore
 from modules.portfolio.allocator import AllocationMethod, PortfolioAllocator
 from modules.portfolio.rebalancer import PortfolioRebalancer, RebalanceOrder
 from modules.portfolio.performance_attribution import PerformanceAttributor
@@ -128,6 +154,25 @@ class LiveTrader:
             max_position_pct=float(risk_cfg.max_position_pct),
         )
 
+        # ── 5c. Phase 2 风险守卫链 ─────────────────────────────
+        self._phase2_state_store = StateStore(
+            self._state_file_path.with_name("risk_runtime_state.json")
+        )
+        self._budget_checker = BudgetChecker(
+            BudgetConfig(
+                max_single_order_budget_pct=float(risk_cfg.max_position_pct),
+            ),
+            state_store=self._phase2_state_store,
+        )
+        self._kill_switch = KillSwitch(
+            KillSwitchConfig(
+                drawdown_trigger=float(risk_cfg.max_portfolio_drawdown),
+                daily_loss_trigger=float(risk_cfg.max_daily_loss),
+            ),
+            state_store=self._phase2_state_store,
+        )
+        self._adaptive_risk = AdaptiveRiskMatrix()
+
         # ── 6. 策略列表（外部注入） ───────────────────────────────
         self._strategies = []
         
@@ -142,6 +187,13 @@ class LiveTrader:
             bull_prob=0.33, bear_prob=0.33, sideways_prob=0.34,
             high_vol_prob=0.0, confidence=0.5, dominant_regime="sideways"
         )
+        self._phase1_orchestrator = StrategyOrchestrator()
+        self._phase1_data_kitchens: Dict[str, DataKitchen] = {}
+        self._phase1_regime_detectors: Dict[str, MarketRegimeDetector] = {}
+        self._phase1_feature_views: Dict[str, Dict[str, pd.DataFrame]] = {}
+        self._symbol_regimes: Dict[str, RegimeState] = {}
+        self._last_trace_ids: Dict[str, str] = {}
+        self._symbol_risk_plans: Dict[str, object] = {}
 
         # 运行状态
         self._positions: Dict[str, Decimal] = {}
@@ -216,6 +268,15 @@ class LiveTrader:
         self._phase3_mm: Optional[object] = None       # MarketMakingStrategy (shadow)
         self._phase3_ppo: Optional[object] = None      # PPOAgent (shadow)
         self._phase3_evolution: Optional[object] = None  # SelfEvolutionEngine
+        self._phase3_obs_builder: Optional[object] = None
+        self._phase3_action_adapter: Optional[object] = None
+        self._phase3_rl_policy_mode: str = "shadow"
+        self._phase3_realtime_enabled: bool = False
+        self._phase3_ws_client: Optional[ExchangeWsClient] = None
+        self._phase3_subscription_manager: Optional[SubscriptionManager] = None
+        self._phase3_depth_registry: Optional[DepthCacheRegistry] = None
+        self._phase3_trade_registry: Optional[TradeCacheRegistry] = None
+        self._phase3_micro_builder: Optional[MicroFeatureBuilder] = None
 
         p3_cfg = getattr(self.sys_config, "phase3", None)
         if p3_cfg is not None and getattr(p3_cfg, "enabled", False):
@@ -234,7 +295,7 @@ class LiveTrader:
 
     def _init_phase3_components(self, p3_cfg: object) -> None:
         """
-        初始化 Phase 3 组件（shadow-only 模式）。
+        初始化 Phase 3 组件。
 
         每个组件独立初始化，失败不阻断其他组件。
         初始化完成后设置 self._phase3_enabled = True。
@@ -244,12 +305,23 @@ class LiveTrader:
         # 初始化全局 Phase3TraceRecorder
         init_recorder()
 
-        # ── 做市策略 (shadow / paper_mode=True) ────────────────
+        rl_cfg = getattr(p3_cfg, "rl", None)
+        mm_cfg_raw = getattr(p3_cfg, "market_making", None)
+        self._phase3_rl_policy_mode = (
+            "paper"
+            if self.mode == "paper"
+            else getattr(rl_cfg, "policy_mode", "shadow")
+        )
+        self._init_phase3_realtime_runtime(p3_cfg)
+
+        # ── 做市策略（paper 优先，live 保持 shadow） ─────────────
         try:
             from modules.alpha.market_making.strategy import (
                 MarketMakingStrategy,
                 MarketMakingStrategyConfig,
             )
+            from modules.alpha.market_making.avellaneda_model import AvellanedaConfig
+            from modules.alpha.market_making.inventory_manager import InventoryConfig
 
             _symbol = (
                 self.sys_config.data.default_symbols[0]
@@ -259,30 +331,52 @@ class LiveTrader:
             mm_cfg = MarketMakingStrategyConfig(
                 symbol=_symbol,
                 exchange=self.sys_config.exchange.exchange_id,
-                paper_mode=True,  # shadow 模式永远不发真实订单
-                save_every_n=0,   # shadow 模式禁用持久化
+                paper_mode=(self.mode == "paper"),
+                save_every_n=10 if self.mode == "paper" else 0,
+                avellaneda=AvellanedaConfig(
+                    gamma=float(getattr(mm_cfg_raw, "risk_aversion_gamma", 0.12)),
+                ),
+                inventory=InventoryConfig(
+                    max_inventory_pct=float(
+                        getattr(mm_cfg_raw, "max_inventory_pct", 0.20)
+                    ),
+                ),
             )
             self._phase3_mm = MarketMakingStrategy(mm_cfg)
             log.info(
-                "[Phase3] MarketMakingStrategy 已加载 (shadow): symbol={} exchange={}",
-                _symbol, self.sys_config.exchange.exchange_id,
+                "[Phase3] MarketMakingStrategy 已加载: symbol={} exchange={} mode={}",
+                _symbol,
+                self.sys_config.exchange.exchange_id,
+                "paper" if self.mode == "paper" else "shadow",
             )
         except Exception as _exc:
             log.warning("[Phase3] MarketMakingStrategy 初始化失败（已忽略）: {}", _exc)
 
-        # ── RL Agent (shadow / predict-only) ───────────────────
+        # ── RL Agent (paper/shadow) ───────────────────────────
         try:
+            from modules.alpha.rl.action_adapter import (
+                ActionAdapter,
+                ActionAdapterConfig,
+            )
+            from modules.alpha.rl.observation_builder import ObservationBuilder
             from modules.alpha.rl.ppo_agent import PPOAgent, PPOConfig
 
-            rl_cfg = getattr(p3_cfg, "rl", None)
             obs_dim = 24   # ObservationBuilder.OBS_DIM
             n_actions = 8  # ActionAdapter 的离散动作数
             ppo_cfg = PPOConfig(obs_dim=obs_dim, n_actions=n_actions)
             self._phase3_ppo = PPOAgent(ppo_cfg)
+            self._phase3_obs_builder = ObservationBuilder()
+            self._phase3_action_adapter = ActionAdapter(
+                ActionAdapterConfig(
+                    confidence_floor=float(
+                        getattr(rl_cfg, "action_confidence_floor", 0.55)
+                    )
+                )
+            )
             log.info(
-                "[Phase3] PPOAgent 已加载 (shadow): obs_dim={} n_actions={} policy={}",
+                "[Phase3] PPOAgent 已加载: obs_dim={} n_actions={} policy={}",
                 obs_dim, n_actions,
-                getattr(rl_cfg, "policy_mode", "shadow"),
+                self._phase3_rl_policy_mode,
             )
         except Exception as _exc:
             log.warning("[Phase3] PPOAgent 初始化失败（已忽略）: {}", _exc)
@@ -305,18 +399,552 @@ class LiveTrader:
         except Exception as _exc:
             log.warning("[Phase3] SelfEvolutionEngine 初始化失败（已忽略）: {}", _exc)
 
-        self._phase3_enabled = True
+        self._phase3_enabled = any(
+            component is not None
+            for component in (
+                self._phase3_mm,
+                self._phase3_ppo,
+                self._phase3_evolution,
+            )
+        )
         log.info(
-            "[Phase3] shadow-only 模式已启动: mm={} ppo={} evolution={}",
+            "[Phase3] 运行模式已启动: runtime_mode={} mm={} ppo={} evolution={}",
+            "paper" if self.mode == "paper" else "shadow",
             self._phase3_mm is not None,
             self._phase3_ppo is not None,
             self._phase3_evolution is not None,
         )
 
+    def _init_phase3_realtime_runtime(self, p3_cfg: object) -> None:
+        """初始化 Phase 3 realtime paper runtime。"""
+        try:
+            rt_cfg = getattr(p3_cfg, "realtime_feed", None)
+            self._phase3_depth_registry = DepthCacheRegistry(
+                DepthCacheConfig(
+                    max_depth=int(getattr(rt_cfg, "orderbook_depth_levels", 20)),
+                )
+            )
+            self._phase3_trade_registry = TradeCacheRegistry(TradeCacheConfig())
+            self._phase3_micro_builder = MicroFeatureBuilder()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[Phase3] realtime registry 初始化失败（已忽略）: {}", exc)
+            self._phase3_depth_registry = None
+            self._phase3_trade_registry = None
+            self._phase3_micro_builder = None
+            return
+
+        self._phase3_realtime_enabled = bool(
+            getattr(p3_cfg, "realtime_feed_enabled", False) and self.mode == "paper"
+        )
+        if not self._phase3_realtime_enabled:
+            log.info(
+                "[Phase3] realtime paper runtime 已准备但未启动: enabled={} mode={}",
+                getattr(p3_cfg, "realtime_feed_enabled", False),
+                self.mode,
+            )
+            return
+
+        try:
+            heartbeat_timeout = max(
+                float(getattr(rt_cfg, "heartbeat_timeout_sec", 15.0)),
+                self._poll_interval_s * 2,
+            )
+            ws_cfg = WsClientConfig(
+                exchange=self.sys_config.exchange.exchange_id,
+                reconnect_delay_sec=float(
+                    getattr(rt_cfg, "reconnect_backoff_sec", 2.0)
+                ),
+                heartbeat_timeout_sec=heartbeat_timeout,
+                depth_levels=int(getattr(rt_cfg, "orderbook_depth_levels", 20)),
+                ws_url=getattr(rt_cfg, "ws_url", None),
+            )
+            self._phase3_ws_client = self._create_phase3_ws_client(rt_cfg, ws_cfg)
+            self._phase3_subscription_manager = SubscriptionManager(
+                self._phase3_ws_client,
+                self._phase3_depth_registry,
+                self._phase3_trade_registry,
+                SubscriptionManagerConfig(
+                    health_check_interval_sec=max(self._poll_interval_s / 2, 5.0),
+                    reconnect_backoff_base_sec=float(
+                        getattr(rt_cfg, "reconnect_backoff_sec", 2.0)
+                    ),
+                    heartbeat_timeout_sec=heartbeat_timeout,
+                ),
+            )
+            self._phase3_subscription_manager.set_health_callback(
+                self._on_phase3_feed_health_change
+            )
+            self._phase3_subscription_manager.start(
+                list(self.sys_config.data.default_symbols)
+            )
+            log.info(
+                "[Phase3] realtime paper feed 已启动: symbols={} exchange={}",
+                self.sys_config.data.default_symbols,
+                self.sys_config.exchange.exchange_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._phase3_realtime_enabled = False
+            self._phase3_ws_client = None
+            self._phase3_subscription_manager = None
+            log.warning("[Phase3] realtime paper feed 启动失败（回退到合成快照）: {}", exc)
+
+    def _create_phase3_ws_client(
+        self,
+        rt_cfg: object,
+        ws_cfg: WsClientConfig,
+    ) -> ExchangeWsClient:
+        """按配置构建 Phase 3 realtime ws client。"""
+        return create_exchange_ws_client(
+            str(getattr(rt_cfg, "provider", "mock") or "mock"),
+            ws_cfg,
+            mock_price_drift=0.0008,
+            mock_seed=42,
+        )
+    def _on_phase3_feed_health_change(self, snapshot: object) -> None:
+        """同步 Phase 3 realtime feed 健康状态到 KillSwitch。"""
+        is_healthy = getattr(getattr(snapshot, "health", None), "value", "") == "healthy"
+        if hasattr(self, "_kill_switch"):
+            self._kill_switch.record_data_health("phase3_realtime", is_healthy)
+
+    def _pump_phase3_realtime_feed(self, symbol: str) -> None:
+        """驱动一次 mock realtime feed，产出真实 DepthCache / TradeCache 数据。"""
+        client = getattr(self, "_phase3_ws_client", None)
+        if client is None or not self._phase3_realtime_enabled:
+            return
+
+        if not isinstance(client, MockWsClient):
+            return
+
+        try:
+            depth_delta = client.generate_depth_update(symbol)
+            if depth_delta is not None:
+                client.push_depth(depth_delta)
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_data_health(f"phase3_depth:{symbol}", True)
+
+            trade_tick = client.generate_trade(symbol)
+            if trade_tick is not None:
+                client.push_trade(trade_tick)
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_data_health(f"phase3_trade:{symbol}", True)
+        except Exception as exc:  # noqa: BLE001
+            if hasattr(self, "_kill_switch"):
+                self._kill_switch.record_data_health(f"phase3_depth:{symbol}", False)
+                self._kill_switch.record_data_health(f"phase3_trade:{symbol}", False)
+            log.debug("[Phase3] realtime feed pump 异常（已忽略）: symbol={} error={}", symbol, exc)
+
+    def _get_phase3_orderbook_snapshot(
+        self,
+        symbol: str,
+        mid_price: float,
+        seq: int,
+    ) -> OrderBookSnapshot:
+        """优先读取 realtime registry 中的订单簿快照，失败时回退到合成快照。"""
+        if self._phase3_realtime_enabled and self._phase3_depth_registry is not None:
+            self._pump_phase3_realtime_feed(symbol)
+            cache = self._phase3_depth_registry.get(
+                symbol,
+                self.sys_config.exchange.exchange_id,
+            )
+            if cache is not None:
+                snapshot = cache.get_snapshot()
+                if snapshot is not None:
+                    return snapshot
+
+        return OrderBookSnapshot.create_mock(
+            symbol=symbol,
+            exchange=self.sys_config.exchange.exchange_id,
+            mid_price=mid_price,
+            spread_bps=5.0,
+            sequence_id=seq,
+        )
+
+    def _get_or_create_data_kitchen(self, symbol: str) -> DataKitchen:
+        kitchen = self._phase1_data_kitchens.get(symbol)
+        if kitchen is None:
+            kitchen = DataKitchen()
+            self._phase1_data_kitchens[symbol] = kitchen
+        return kitchen
+
+    def _get_or_create_regime_detector(self, symbol: str) -> MarketRegimeDetector:
+        detector = self._phase1_regime_detectors.get(symbol)
+        if detector is None:
+            detector = MarketRegimeDetector()
+            self._phase1_regime_detectors[symbol] = detector
+        return detector
+
+    def _build_symbol_ohlcv_frame(self, symbol: str) -> Optional[pd.DataFrame]:
+        klines = self._kline_store.get(symbol, [])
+        if not klines:
+            return None
+
+        frame = pd.DataFrame(klines[-600:]).copy()
+        frame["timestamp"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        return frame[["timestamp", "open", "high", "low", "close", "volume"]]
+
+    def _get_phase1_feature_views(
+        self,
+        symbol: str,
+    ) -> Optional[Dict[str, pd.DataFrame]]:
+        ohlcv_df = self._build_symbol_ohlcv_frame(symbol)
+        if ohlcv_df is None or len(ohlcv_df) < 30:
+            return self._phase1_feature_views.get(symbol)
+
+        kitchen = self._get_or_create_data_kitchen(symbol)
+        try:
+            if kitchen.contract is None:
+                views, _ = kitchen.fit(ohlcv_df)
+            else:
+                views = kitchen.transform(ohlcv_df, validate_contract=False)
+            self._phase1_feature_views[symbol] = views
+            return views
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[Phase1] DataKitchen 处理失败: symbol={} error={}", symbol, exc)
+            return self._phase1_feature_views.get(symbol)
+
+    def _extract_feature_value(
+        self,
+        feature_views: Optional[Dict[str, pd.DataFrame]],
+        *columns: str,
+        default: Optional[float] = None,
+    ) -> Optional[float]:
+        if not feature_views:
+            return default
+
+        frames = [
+            feature_views.get("alpha_features"),
+            feature_views.get("regime_features"),
+            feature_views.get("diagnostic_features"),
+        ]
+        for col in columns:
+            for frame in frames:
+                if frame is None or frame.empty or col not in frame.columns:
+                    continue
+                value = frame.iloc[-1][col]
+                if pd.notna(value):
+                    return float(value)
+        return default
+
+    def _estimate_atr_pct(
+        self,
+        symbol: str,
+        feature_views: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> Optional[float]:
+        atr_pct = self._extract_feature_value(feature_views, "atr_pct_14")
+        if atr_pct is not None and atr_pct > 0:
+            return atr_pct
+
+        klines = self._kline_store.get(symbol, [])
+        if len(klines) < 15:
+            return None
+
+        try:
+            from modules.alpha.features import FeatureEngine
+
+            atr_series = FeatureEngine.atr_pct(pd.DataFrame(klines[-50:]), window=14)
+            if not atr_series.empty:
+                value = atr_series.iloc[-1]
+                if pd.notna(value) and float(value) > 0:
+                    return float(value)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[Phase2] ATR% 计算失败: symbol={} error={}", symbol, exc)
+        return None
+
+    def _extract_cooldown_symbols(self) -> dict[str, datetime]:
+        cooldowns: dict[str, datetime] = {}
+        try:
+            active = (
+                self._adaptive_risk.health_snapshot()
+                .get("cooldown", {})
+                .get("active_symbols", {})
+            )
+            for symbol, payload in active.items():
+                expires_at = payload.get("expires_at")
+                if not expires_at:
+                    continue
+                cooldowns[symbol] = datetime.fromisoformat(expires_at)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[Phase2] 冷却期快照提取失败: {}", exc)
+        return cooldowns
+
+    def _build_risk_snapshot(self) -> RiskSnapshot:
+        if not hasattr(self, "risk_manager"):
+            return RiskSnapshot.make_default()
+
+        risk_summary = self.risk_manager.get_state_summary()
+        budget_snapshot = (
+            self._budget_checker.snapshot()
+            if hasattr(self, "_budget_checker")
+            else {"remaining_budget_pct": 1.0, "deployed_pct": 0.0}
+        )
+
+        current_equity = float(getattr(self, "_current_equity", 0.0) or 0.0)
+        peak_equity = float(risk_summary.get("peak_equity") or 0.0)
+        daily_start_equity = float(risk_summary.get("daily_start_equity") or 0.0)
+        daily_pnl = float(risk_summary.get("daily_pnl") or 0.0)
+
+        current_drawdown = (
+            max(0.0, (peak_equity - current_equity) / peak_equity)
+            if peak_equity > 0 and current_equity >= 0
+            else 0.0
+        )
+        daily_loss_pct = (
+            max(0.0, -daily_pnl / daily_start_equity)
+            if daily_start_equity > 0 and daily_pnl < 0
+            else 0.0
+        )
+
+        if hasattr(self, "_kill_switch"):
+            self._kill_switch.try_auto_recover()
+
+        snapshot = RiskSnapshot(
+            current_drawdown=current_drawdown,
+            daily_loss_pct=daily_loss_pct,
+            consecutive_losses=int(risk_summary.get("consecutive_losses") or 0),
+            circuit_broken=bool(risk_summary.get("circuit_broken", False)),
+            kill_switch_active=bool(
+                self._kill_switch.is_active if hasattr(self, "_kill_switch") else False
+            ),
+            budget_remaining_pct=float(
+                budget_snapshot.get("remaining_budget_pct", 1.0)
+            ),
+            cooldown_symbols=self._extract_cooldown_symbols(),
+            metadata={
+                "budget_deployed_pct": float(budget_snapshot.get("deployed_pct", 0.0)),
+                "kill_switch_reason": (
+                    self._kill_switch.health_snapshot().get("reason", "")
+                    if hasattr(self, "_kill_switch")
+                    else ""
+                ),
+                "circuit_reason": str(risk_summary.get("circuit_reason") or ""),
+            },
+        )
+
+        if hasattr(self, "_kill_switch"):
+            kill_active = self._kill_switch.evaluate(snapshot)
+            if kill_active != snapshot.kill_switch_active:
+                snapshot = RiskSnapshot(
+                    current_drawdown=snapshot.current_drawdown,
+                    daily_loss_pct=snapshot.daily_loss_pct,
+                    consecutive_losses=snapshot.consecutive_losses,
+                    circuit_broken=snapshot.circuit_broken,
+                    kill_switch_active=kill_active,
+                    budget_remaining_pct=snapshot.budget_remaining_pct,
+                    cooldown_symbols=snapshot.cooldown_symbols,
+                    metadata=snapshot.metadata,
+                )
+
+        return snapshot
+
+    def _record_order_rejection(
+        self,
+        req: OrderRequestEvent,
+        quantity: Decimal,
+        reason: str,
+        stage: str,
+    ) -> None:
+        log.warning(
+            "[RiskBlock:{}] strategy={} {} {} qty={} 被拒绝: {}",
+            stage,
+            req.strategy_id,
+            req.symbol,
+            req.side,
+            quantity,
+            reason,
+        )
+        self.metrics.record_order_rejected(req.symbol, reason)
+        trade_log(
+            event_type="REJECTED",
+            strategy=req.strategy_id,
+            symbol=req.symbol,
+            side=req.side,
+            quantity=f"{quantity}",
+            reason=reason,
+        )
+
+    def _build_phase3_observation(
+        self,
+        symbol: str,
+        seq: int,
+        snapshot: OrderBookSnapshot,
+        risk_snapshot: RiskSnapshot,
+    ) -> Optional[object]:
+        obs_builder = getattr(self, "_phase3_obs_builder", None)
+        if obs_builder is None:
+            return None
+
+        feature_views = getattr(self, "_phase1_feature_views", {}).get(symbol)
+        regime = getattr(self, "_symbol_regimes", {}).get(symbol, self._current_regime)
+
+        volume_ratio = self._extract_feature_value(feature_views, "volume_ratio", default=1.0)
+        technical = {
+            "regime": regime.dominant_regime,
+            "ma_cross": self._extract_feature_value(
+                feature_views,
+                "sma_10_20_spread",
+                default=0.0,
+            )
+            or 0.0,
+            "rsi": self._extract_feature_value(feature_views, "rsi_14", default=50.0)
+            or 50.0,
+            "macd_norm": self._extract_feature_value(
+                feature_views,
+                "macd_histogram",
+                default=0.0,
+            )
+            or 0.0,
+            "vol_norm": max(0.0, min((volume_ratio or 1.0) / 2.0, 1.0)),
+            "price_mom_5": self._extract_feature_value(
+                feature_views,
+                "ret_roll_mean_5",
+                "close_return_lag5",
+                default=0.0,
+            )
+            or 0.0,
+        }
+
+        bid_qty = sum(level.size for level in snapshot.bids[:5])
+        ask_qty = sum(level.size for level in snapshot.asks[:5])
+        total_qty = bid_qty + ask_qty
+        bid_pressure = bid_qty / total_qty if total_qty > 0 else 0.5
+        ask_pressure = ask_qty / total_qty if total_qty > 0 else 0.5
+        micro_builder = getattr(self, "_phase3_micro_builder", None)
+        trade_registry = getattr(self, "_phase3_trade_registry", None)
+        micro_frame = None
+        if micro_builder is not None:
+            try:
+                trade_stats = (
+                    trade_registry.get_stats(symbol, self.sys_config.exchange.exchange_id)
+                    if trade_registry is not None
+                    else None
+                )
+                micro_frame = micro_builder.build(snapshot, trade_stats)
+                if pd.notna(micro_frame.mb_book_pressure_ratio):
+                    bid_pressure = max(
+                        0.0,
+                        min((micro_frame.mb_book_pressure_ratio + 1.0) / 2.0, 1.0),
+                    )
+                    ask_pressure = 1.0 - bid_pressure
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "[Phase3] micro feature 构建失败，回退原始订单簿特征: symbol={} error={}",
+                    symbol,
+                    exc,
+                )
+
+        microstructure = {
+            "mb_spread_bps": (
+                micro_frame.mb_spread_bps
+                if micro_frame is not None and pd.notna(micro_frame.mb_spread_bps)
+                else snapshot.spread_bps
+            ),
+            "mb_imbalance": (
+                micro_frame.mb_order_imbalance
+                if micro_frame is not None and pd.notna(micro_frame.mb_order_imbalance)
+                else snapshot.imbalance
+            ),
+            "mb_micro_price_dev": (
+                micro_frame.mb_micro_price
+                if micro_frame is not None and pd.notna(micro_frame.mb_micro_price)
+                else 0.0
+            ),
+            "mb_bid_pressure": bid_pressure,
+            "mb_ask_pressure": ask_pressure,
+        }
+
+        inventory_pct = 0.5
+        mm = getattr(self, "_phase3_mm", None)
+        if mm is not None:
+            try:
+                diagnostics = mm.diagnostics()
+                if isinstance(diagnostics, dict):
+                    inventory_pct = float(
+                        diagnostics.get("inventory", {}).get("inventory_pct", inventory_pct)
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        position_pct = 0.0
+        price = snapshot.mid_price
+        equity = float(getattr(self, "_current_equity", 0.0) or 0.0)
+        positions = getattr(self, "_positions", {})
+        current_qty = float(positions.get(symbol, Decimal("0")))
+        if equity > 0 and price > 0:
+            position_pct = max(-1.0, min((current_qty * price) / equity, 1.0))
+
+        trace_id = getattr(self, "_last_trace_ids", {}).get(
+            symbol,
+            f"phase3:{symbol}:{seq}",
+        )
+        return obs_builder.build(
+            symbol=symbol,
+            trace_id=trace_id,
+            risk_snapshot=risk_snapshot,
+            technical=technical,
+            microstructure=microstructure,
+            inventory_pct=inventory_pct,
+            position_pct=position_pct,
+            episode_step=seq,
+        )
+
+    def _build_phase3_order_request(
+        self,
+        symbol: str,
+        policy_decision: object,
+        seq: int,
+    ) -> Optional[OrderRequestEvent]:
+        from modules.alpha.contracts.rl_types import ActionType
+
+        action = policy_decision.effective_action()
+        if action == ActionType.HOLD:
+            return None
+
+        if action in {
+            ActionType.WIDEN_QUOTE,
+            ActionType.NARROW_QUOTE,
+            ActionType.BIAS_BID,
+            ActionType.BIAS_ASK,
+        }:
+            log.debug(
+                "[Phase3/RL] 非方向性动作保留在 paper 观测层: symbol={} action={}",
+                symbol,
+                action.value,
+            )
+            return None
+
+        side = "buy"
+        quantity = Decimal("0")
+        if action in {ActionType.SELL, ActionType.REDUCE}:
+            current_qty = getattr(self, "_positions", {}).get(symbol, Decimal("0"))
+            if current_qty <= 0:
+                return None
+            side = "sell"
+            scale = 1.0 if action == ActionType.SELL else max(
+                0.25,
+                float(policy_decision.action.action_value),
+            )
+            quantity = current_qty * Decimal(str(min(scale, 1.0)))
+            if quantity <= 0:
+                return None
+
+        return OrderRequestEvent(
+            event_type=EventType.ORDER_REQUESTED,
+            timestamp=datetime.now(tz=timezone.utc),
+            source="phase3_rl",
+            symbol=symbol,
+            side=side,
+            order_type="market",
+            quantity=quantity,
+            price=None,
+            strategy_id=f"phase3_rl_{policy_decision.policy_version}",
+            request_id=f"phase3-{seq}-{uuid4().hex[:10]}",
+        )
+
     def _step_phase3_shadow(self, symbol: str, mid_price: float, seq: int) -> None:
         """
-        Phase 3 shadow-only 单步驱动：
-        做市 tick / RL predict / 演进周期检查均只记录 trace，不发真实订单。
+        Phase 3 单步驱动：
+        做市进入 paper 仿真路径，RL 在 paper 模式下可进入真实的 paper 下单链路；
+        live 模式仍保持 shadow-only。
 
         Args:
             symbol:    当前处理的交易对
@@ -326,37 +954,26 @@ class LiveTrader:
         if not self._phase3_enabled:
             return
 
-        # ── 做市 Shadow Tick ────────────────────────────────
+        risk_snapshot = self._build_risk_snapshot()
+        snapshot = self._get_phase3_orderbook_snapshot(symbol, mid_price, seq)
+
+        # ── 做市 Tick（paper/live-shadow）────────────────────
         if (
             self._phase3_mm is not None
             and getattr(self._phase3_mm.config, "symbol", None) == symbol
         ):
             try:
-                from modules.data.realtime.orderbook_types import OrderBookSnapshot
-                from modules.risk.snapshot import RiskSnapshot
-
-                # 用收盘价构造仿真快照（展开 shadow 模式时替换为实时订单簿快照）
-                _snap = OrderBookSnapshot.create_mock(
-                    symbol=symbol,
-                    exchange=self.sys_config.exchange.exchange_id,
-                    mid_price=mid_price,
-                    spread_bps=5.0,
-                    sequence_id=seq,
+                _decision = self._phase3_mm.tick(
+                    snapshot,
+                    risk_snapshot,
+                    elapsed_sec=float(seq),
                 )
-                # 构造最小化风控快照（shadow 模式不经过实际风打检查）
-                _risk = RiskSnapshot(
-                    current_drawdown=0.0,
-                    daily_loss_pct=0.0,
-                    consecutive_losses=0,
-                    circuit_broken=self.risk_manager.is_circuit_broken(),
-                    kill_switch_active=False,
-                    budget_remaining_pct=1.0,
-                )
-                _decision = self._phase3_mm.tick(_snap, _risk, elapsed_sec=float(seq))
                 log.debug(
-                    "[Phase3/MM] shadow tick: symbol={} mid={:.4f} "
+                    "[Phase3/MM] tick: symbol={} mode={} mid={:.4f} "
                     "bid={} ask={} allow_bid={} allow_ask={}",
-                    symbol, mid_price,
+                    symbol,
+                    "paper" if self.mode == "paper" else "shadow",
+                    snapshot.mid_price,
                     f"{_decision.bid_price:.4f}" if _decision.bid_price else "N/A",
                     f"{_decision.ask_price:.4f}" if _decision.ask_price else "N/A",
                     _decision.allow_post_bid,
@@ -365,22 +982,63 @@ class LiveTrader:
             except Exception:  # noqa: BLE001
                 log.debug("[Phase3/MM] shadow tick 异常（已忽略）: symbol={}", symbol)
 
-        # ── RL Shadow Predict ──────────────────────────────
-        if self._phase3_ppo is not None:
+        # ── RL Predict / Paper Execute ─────────────────────
+        if self._phase3_ppo is not None and self._phase3_action_adapter is not None:
             try:
-                # v1 shadow 阶段使用全零观测向量（验证接线。
-                # TODO: 替换为 ObservationBuilder 产出的真实观测）
-                _obs = [0.0] * self._phase3_ppo.config.obs_dim
+                _obs = self._build_phase3_observation(
+                    symbol=symbol,
+                    seq=seq,
+                    snapshot=snapshot,
+                    risk_snapshot=risk_snapshot,
+                )
+                if _obs is None:
+                    return
                 _action_idx, _action_val, _conf, _lp = self._phase3_ppo.predict(
-                    _obs, deterministic=True
+                    _obs.feature_vector,
+                    deterministic=True,
+                )
+                _action = self._phase3_action_adapter.index_to_action(
+                    _action_idx,
+                    action_value=_action_val,
+                    confidence=_conf,
+                )
+                _decision = self._phase3_action_adapter.apply_safety(
+                    _action,
+                    risk_snapshot,
+                    obs=_obs,
+                    policy_id="phase3_rl",
+                    policy_version=getattr(self._phase3_ppo, "_version", "v1"),
                 )
                 log.debug(
-                    "[Phase3/RL] shadow predict: symbol={} action_idx={} "
-                    "confidence={:.3f}",
-                    symbol, _action_idx, _conf,
+                    "[Phase3/RL] predict: symbol={} mode={} action={} confidence={:.3f} override={}",
+                    symbol,
+                    self._phase3_rl_policy_mode,
+                    _decision.effective_action().value,
+                    _conf,
+                    _decision.safety_override,
                 )
+
+                if (
+                    self.mode == "paper"
+                    and self._phase3_rl_policy_mode in {"paper", "active"}
+                    and hasattr(self, "order_manager")
+                ):
+                    order_req = self._build_phase3_order_request(symbol, _decision, seq)
+                    if order_req is not None:
+                        self._process_order_request(
+                            order_req,
+                            self._current_equity,
+                            risk_snapshot=risk_snapshot,
+                            regime=getattr(self, "_symbol_regimes", {}).get(
+                                symbol,
+                                self._current_regime,
+                            ),
+                            signal_confidence=_decision.action.confidence,
+                            strategy_weight=max(_decision.action.action_value, 0.25),
+                            phase_source="phase3_rl",
+                        )
             except Exception:  # noqa: BLE001
-                log.debug("[Phase3/RL] shadow predict 异常（已忽略）: symbol={}", symbol)
+                log.debug("[Phase3/RL] predict 异常（已忽略）: symbol={}", symbol)
 
         # ── 演进周期检查（由调度器决定是否到期）────────────
         if self._phase3_evolution is not None:
@@ -658,7 +1316,7 @@ class LiveTrader:
                     self.rebalancer._bar_count - self.rebalancer._last_rebalance_bar,
                 )
 
-        # Step 4: Phase 3 shadow-only 驱动（地价展示，不发实际订单）
+        # Step 4: Phase 3 运行时驱动（paper 模式进入真实 paper 集成）
         if self._phase3_enabled and kline_events:
             for _ev in kline_events:
                 _price = float(_ev.close)
@@ -730,6 +1388,8 @@ class LiveTrader:
                     is_closed=True,  # 倒数第二根确保是已收线
                 )
                 events.append(event)
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_data_health(f"kline:{symbol}", True)
 
                 # 同时更新最新价格（用最后一根的收盘价）
                 _, _, _, _, last_c, _ = candles[-1]
@@ -740,6 +1400,8 @@ class LiveTrader:
 
             except Exception as exc:  # noqa: BLE001
                 err_str = str(exc)[:200]
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_data_health(f"kline:{symbol}", False)
                 if self.mode == "live":
                     # Live 模式下绝不使用假数据，跳过本次
                     log.error("获取行情失败(Live模式跳过): symbol={} error={}", symbol, err_str)
@@ -781,6 +1443,8 @@ class LiveTrader:
         """
         # 发布到事件总线（其他订阅者可扩展）
         self.bus.publish(event)
+        if hasattr(self, "_kill_switch"):
+            self._kill_switch.record_data_health(f"kline:{event.symbol}", True)
 
         # 更新风控状态（仅当 equity 已被正确计算时才更新，避免注入假值）
         if self._current_equity > 0:
@@ -791,95 +1455,193 @@ class LiveTrader:
             # 准备上下文和最新价格
             latest_prices = dict(self._latest_prices)
             latest_prices[event.symbol] = float(event.close)
+            feature_views = self._get_phase1_feature_views(event.symbol)
+            detector = self._get_or_create_regime_detector(event.symbol)
+            bar_seq = self._alpha_runtime.loop_seq + 1
+            regime = self._symbol_regimes.get(event.symbol, self._current_regime)
+            if feature_views and not feature_views["regime_features"].empty:
+                regime = detector.update_from_frame(
+                    feature_views["regime_features"],
+                    bar_seq=bar_seq,
+                )
+            else:
+                ohlcv_df = self._build_symbol_ohlcv_frame(event.symbol)
+                if ohlcv_df is not None and len(ohlcv_df) >= 30:
+                    regime = detector.update(
+                        ohlcv_df[["open", "high", "low", "close", "volume"]],
+                        bar_seq=bar_seq,
+                    )
+            self._current_regime = regime
+            self._symbol_regimes[event.symbol] = regime
+            risk_snapshot = self._build_risk_snapshot()
             
             # 通过 AlphaRuntime 处理 K 线事件
             context, strategy_results = self._alpha_runtime.process_bar(
                 event=event,
                 latest_prices=latest_prices,
-                regime=self._current_regime,
+                feature_frame=(
+                    feature_views["alpha_features"]
+                    if feature_views is not None
+                    else None
+                ),
+                regime=regime,
                 portfolio_snapshot={
                     "positions": dict(self._positions),
                     "equity": self._current_equity,
                     "entry_prices": dict(self._entry_prices),
                 },
+                risk_snapshot=risk_snapshot,
+            )
+            self._last_trace_ids[event.symbol] = context.trace_id
+            
+            decision = self._phase1_orchestrator.orchestrate(
+                OrchestrationInput(
+                    regime=regime,
+                    strategy_results=strategy_results,
+                    equity=self._current_equity,
+                    current_drawdown=risk_snapshot.current_drawdown,
+                    is_regime_stable=detector.is_stable,
+                    bar_seq=context.loop_seq,
+                )
             )
             
-            # 从结果中提取 OrderRequestEvent 列表
-            order_requests = AlphaRuntime.collect_order_requests(strategy_results)
-            
-            # 处理所有生成的订单请求
-            for req in order_requests:
-                self._process_order_request(req, self._current_equity)
+            for result in decision.selected_results:
+                weight = decision.weights.get(result.strategy_id, 1.0)
+                for req in result.order_requests:
+                    self._process_order_request(
+                        req,
+                        self._current_equity,
+                        regime=regime,
+                        risk_snapshot=risk_snapshot,
+                        signal_confidence=result.confidence,
+                        strategy_weight=weight,
+                        phase_source="phase1",
+                    )
                 
             log.debug(
-                "[AlphaRuntime] symbol={} trace_id={} strategies={} orders={}",
-                event.symbol, context.trace_id, len(strategy_results), len(order_requests)
+                "[AlphaRuntime] symbol={} trace_id={} strategies={} selected={} blocked={} ",
+                event.symbol,
+                context.trace_id,
+                len(strategy_results),
+                len(decision.selected_results),
+                len(decision.block_reasons),
             )
             
         except Exception:  # noqa: BLE001
             log.exception("AlphaRuntime 处理异常: symbol={}", event.symbol)
             
             # 回退：直接调用策略（向后兼容）
+            risk_snapshot = self._build_risk_snapshot()
             for strategy in self._strategies:
                 try:
                     order_requests = strategy.on_kline(event)
                     for req in (order_requests or []):
-                        self._process_order_request(req, self._current_equity)
+                        self._process_order_request(
+                            req,
+                            self._current_equity,
+                            regime=self._symbol_regimes.get(
+                                event.symbol,
+                                self._current_regime,
+                            ),
+                            risk_snapshot=risk_snapshot,
+                            phase_source="legacy_fallback",
+                        )
                 except Exception:  # noqa: BLE001
                     log.exception("策略异常（回退模式）: strategy={}", getattr(strategy, "strategy_id", "unknown"))
 
-    def _process_order_request(self, req: OrderRequestEvent, equity: float) -> None:
+    def _process_order_request(
+        self,
+        req: OrderRequestEvent,
+        equity: float,
+        *,
+        regime: Optional[RegimeState] = None,
+        risk_snapshot: Optional[RiskSnapshot] = None,
+        signal_confidence: float = 0.5,
+        strategy_weight: float = 1.0,
+        phase_source: str = "legacy",
+    ) -> None:
         """
         处理单个订单请求：动态仓位 → 风控审核 → 提交到 OrderManager。
         """
+        risk_snapshot = risk_snapshot or self._build_risk_snapshot()
+
         # 记录信号指标
         self.metrics.record_signal(req.strategy_id, req.side)
         log.debug(
-            "[OrderReq] strategy={} symbol={} side={} qty={} price={}",
-            req.strategy_id, req.symbol, req.side, req.quantity, req.price,
+            "[OrderReq:{}] strategy={} symbol={} side={} qty={} price={} weight={:.3f} conf={:.3f}",
+            phase_source,
+            req.strategy_id,
+            req.symbol,
+            req.side,
+            req.quantity,
+            req.price,
+            strategy_weight,
+            signal_confidence,
         )
 
         # 动态仓位：买单使用波动率目标法替代固定 qty
         quantity = req.quantity
+        price = float(req.price or self._latest_prices.get(req.symbol, 0))
+        risk_plan = None
         if req.side == "buy":
-            price = self._latest_prices.get(req.symbol, 0)
+            if hasattr(self, "_kill_switch") and self._kill_switch.evaluate(risk_snapshot):
+                reason = self._kill_switch.health_snapshot().get("reason") or "Kill Switch 已激活"
+                self._kill_switch.record_order_rejection(reason)
+                self._record_order_rejection(req, quantity, reason, "kill-switch")
+                return
+
+            risk_plan = self._adaptive_risk.evaluate(
+                symbol=req.symbol,
+                risk_snapshot=risk_snapshot,
+                regime=regime,
+                signal_confidence=signal_confidence,
+                atr_pct=self._estimate_atr_pct(
+                    req.symbol,
+                    self._phase1_feature_views.get(req.symbol),
+                ),
+            )
+            if risk_plan.is_blocked:
+                reason = "; ".join(risk_plan.block_reasons) or "AdaptiveRiskMatrix 阻断"
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_order_rejection(reason)
+                self._record_order_rejection(req, quantity, reason, "adaptive-risk")
+                return
+
             if price > 0 and equity > 0:
-                klines = self._kline_store.get(req.symbol, [])
-                if len(klines) >= 15:
-                    import pandas as _pd
-                    from modules.alpha.features import FeatureEngine as _FE
-                    _df = _pd.DataFrame(klines[-50:])
-                    atr_pct_series = _FE.atr_pct(_df, window=14)
-                    atr_pct = atr_pct_series.iloc[-1]
-                    if _pd.notna(atr_pct) and atr_pct > 0:
-                        dynamic_qty = self.position_sizer.volatility_target(
-                            equity=equity,
-                            atr_pct=float(atr_pct),
-                            target_vol=0.02,
-                            price=price,
+                atr_pct = self._estimate_atr_pct(
+                    req.symbol,
+                    self._phase1_feature_views.get(req.symbol),
+                )
+                if atr_pct is not None and atr_pct > 0:
+                    dynamic_qty = self.position_sizer.volatility_target(
+                        equity=equity,
+                        atr_pct=float(atr_pct),
+                        target_vol=0.02,
+                        price=price,
+                    )
+                    if dynamic_qty > 0:
+                        log.info(
+                            "[DynPos] {} 策略建议qty={} → 波动率目标qty={} "
+                            "(equity={:.2f} price={:.4f} atr%={:.4f} target_vol=2%)",
+                            req.symbol,
+                            req.quantity,
+                            dynamic_qty,
+                            equity,
+                            price,
+                            atr_pct,
                         )
-                        if dynamic_qty > 0:
-                            log.info(
-                                "[DynPos] {} 策略建议qty={} → 波动率目标qty={} "
-                                "(equity={:.2f} price={:.4f} atr%={:.4f} target_vol=2%)",
-                                req.symbol, req.quantity, dynamic_qty,
-                                equity, price, atr_pct,
-                            )
-                            quantity = dynamic_qty
-                        else:
-                            log.debug(
-                                "[DynPos] {} volatility_target 返回 0，使用策略建议 qty={}",
-                                req.symbol, req.quantity,
-                            )
+                        quantity = dynamic_qty
                     else:
                         log.debug(
-                            "[DynPos] {} ATR% 无效({})，回退到策略建议 qty={}",
-                            req.symbol, atr_pct, req.quantity,
+                            "[DynPos] {} volatility_target 返回 0，使用策略建议 qty={}",
+                            req.symbol,
+                            req.quantity,
                         )
                 else:
                     log.debug(
-                        "[DynPos] {} klines 不足({}<15)，回退到策略建议 qty={}",
-                        req.symbol, len(klines), req.quantity,
+                        "[DynPos] {} ATR% 无法计算，回退到策略建议 qty={}",
+                        req.symbol,
+                        req.quantity,
                     )
             else:
                 log.debug(
@@ -887,49 +1649,84 @@ class LiveTrader:
                     req.symbol, price, equity, req.quantity,
                 )
 
+            scale = max(strategy_weight, 0.0)
+            if risk_plan is not None:
+                scale *= max(risk_plan.position_scalar, 0.0)
+            if scale <= 0:
+                self._record_order_rejection(
+                    req,
+                    quantity,
+                    "策略权重或风险乘数收缩为 0",
+                    "position-scaling",
+                )
+                return
+
+            quantity = self.position_sizer._round_qty(
+                quantity * Decimal(str(min(scale, 1.0)))
+            )
+            if quantity <= 0:
+                self._record_order_rejection(
+                    req,
+                    quantity,
+                    "缩放后的下单数量低于最小下单量",
+                    "position-scaling",
+                )
+                return
+
+            order_value_pct = (
+                float(quantity) * price / equity
+                if equity > 0 and price > 0
+                else 0.0
+            )
+            budget_allowed, budget_reason, _ = self._budget_checker.check(order_value_pct)
+            if not budget_allowed:
+                if hasattr(self, "_kill_switch"):
+                    self._kill_switch.record_order_rejection(budget_reason)
+                self._record_order_rejection(req, quantity, budget_reason, "budget")
+                return
+
         # 风控审核
         allowed, reason = self.risk_manager.check(
             side=req.side,
             symbol=req.symbol,
             quantity=quantity,
-            price=float(req.price or self._latest_prices.get(req.symbol, 0)),
+            price=price,
             current_equity=equity,
             positions=dict(self._positions),
         )
 
         if not allowed:
-            log.warning(
-                "[RiskBlock] strategy={} {} {} qty={} 被拒绝: {}",
-                req.strategy_id, req.symbol, req.side, quantity, reason,
-            )
-            self.metrics.record_order_rejected(req.symbol, reason)
-            trade_log(
-                event_type="REJECTED",
-                strategy=req.strategy_id,
-                symbol=req.symbol,
-                side=req.side,
-                quantity=f"{quantity}",
-                reason=reason,
-            )
+            if hasattr(self, "_kill_switch"):
+                self._kill_switch.record_order_rejection(reason)
+            self._record_order_rejection(req, quantity, reason, "risk-manager")
             return
 
         log.info(
-            "[OrderSubmit] strategy={} {} {} qty={} 通过风控，提交下单",
-            req.strategy_id, req.symbol, req.side, quantity,
+            "[OrderSubmit:{}] strategy={} {} {} qty={} 通过风控，提交下单",
+            phase_source,
+            req.strategy_id,
+            req.symbol,
+            req.side,
+            quantity,
         )
         # 通过风控，提交订单
         try:
             self.metrics.record_order_submitted(req.symbol, req.side, req.order_type)
+            submit_req = replace(req, quantity=quantity)
             self.order_manager.submit(
-                symbol=req.symbol,
-                side=req.side,
-                order_type=req.order_type,
+                symbol=submit_req.symbol,
+                side=submit_req.side,
+                order_type=submit_req.order_type,
                 quantity=quantity,
-                price=req.price,
-                strategy_id=req.strategy_id,
-                request_id=req.request_id,
+                price=submit_req.price,
+                strategy_id=submit_req.strategy_id,
+                request_id=submit_req.request_id,
             )
+            if req.side == "buy" and risk_plan is not None:
+                self._symbol_risk_plans[req.symbol] = risk_plan
         except Exception as exc:
+            if hasattr(self, "_kill_switch"):
+                self._kill_switch.record_order_failure(str(exc))
             log.error("订单提交失败: {} {} 原因={}", req.symbol, req.side, exc)
 
     def _process_rebalance_orders(self, rebal_orders: List[RebalanceOrder]) -> None:
@@ -1051,6 +1848,13 @@ class LiveTrader:
                 "[Fill] 入场价更新: {} entry={:.4f} (old_qty={} new_qty={} total_qty={})",
                 rec.symbol, self._entry_prices[rec.symbol], old_qty, new_qty, total_qty,
             )
+            if self._current_equity > 0:
+                self._budget_checker.record_order(notional / self._current_equity)
+            if rec.symbol in self._symbol_risk_plans:
+                self._adaptive_risk.record_entry(
+                    rec.symbol,
+                    self._symbol_risk_plans[rec.symbol].cooldown_minutes,
+                )
         elif rec.side == "sell":
             current = self._positions.get(rec.symbol, Decimal("0"))
             self._positions[rec.symbol] = max(
@@ -1066,11 +1870,17 @@ class LiveTrader:
             )
             # 记录盈亏结果到风控（用于连续亏损熔断）
             self.risk_manager.record_trade_outcome(won=(pnl > 0))
+            if self._current_equity > 0:
+                self._budget_checker.record_close(notional / self._current_equity)
             # 清仓时移除入场价，并清除止损待处理标记
             if self._positions[rec.symbol] <= 0:
                 self._entry_prices.pop(rec.symbol, None)
                 self._stop_loss_pending.discard(rec.symbol)
+                self._symbol_risk_plans.pop(rec.symbol, None)
                 log.info("[Fill] {} 已清仓，移除入场价和止损待处理标记", rec.symbol)
+
+        if hasattr(self, "_kill_switch"):
+            self._kill_switch.record_order_success()
 
         self.metrics.record_order_filled(
             rec.symbol, rec.side, fill_qty, notional, fee=fee
@@ -1148,6 +1958,7 @@ class LiveTrader:
             self._last_daily_reset_date = None
         if self._last_daily_reset_date != today and now.hour == 0 and now.minute < 5:
             self.risk_manager.reset_daily(self._current_equity)
+            self._budget_checker.reset_daily()
             self._last_daily_reset_date = today
             log.info("每日风控重置完成")
 
@@ -1549,7 +2360,7 @@ class LiveTrader:
     # 硬止损检查（保护资金底线）
     # ────────────────────────────────────────────────────────────
 
-    _STOP_LOSS_PCT = 0.05  # 单笔持仓亏损超过 5% 强制平仓
+    _STOP_LOSS_PCT = 0.05  # 回退止损；优先使用 AdaptiveRiskMatrix 产出的 stop_loss_pct
 
     def _check_stop_loss(self) -> None:
         """
@@ -1588,11 +2399,22 @@ class LiveTrader:
             # ① 入场价止损
             entry_price = self._entry_prices.get(sym)
             if entry_price and entry_price > 0:
-                stop_price = entry_price * (1 - self._STOP_LOSS_PCT)
+                risk_plan = self._symbol_risk_plans.get(sym)
+                stop_loss_pct = (
+                    risk_plan.stop_loss_pct
+                    if risk_plan is not None and risk_plan.stop_loss_pct is not None
+                    else self._STOP_LOSS_PCT
+                )
+                stop_price = entry_price * (1 - stop_loss_pct)
                 loss_pct = (entry_price - current_price) / entry_price * 100
                 log.debug(
-                    "[StopLoss] {} entry={:.4f} stop={:.4f} current={:.4f} loss={:.2f}%",
-                    sym, entry_price, stop_price, current_price, loss_pct,
+                    "[StopLoss] {} entry={:.4f} stop={:.4f} current={:.4f} loss={:.2f}% stop_pct={:.2%}",
+                    sym,
+                    entry_price,
+                    stop_price,
+                    current_price,
+                    loss_pct,
+                    stop_loss_pct,
                 )
                 if current_price <= stop_price:
                     reason = (
@@ -1601,6 +2423,7 @@ class LiveTrader:
                         f"loss={loss_pct:.2f}%"
                     )
                     should_stop = True
+                    self._adaptive_risk.record_stop_loss(sym)
             else:
                 log.debug("[StopLoss] {} 无入场价记录，跳过价格止损检查", sym)
 
@@ -1683,10 +2506,21 @@ class LiveTrader:
 
         # Phase 3 shadow 组件清理
         if self._phase3_enabled:
+            if self._phase3_subscription_manager is not None:
+                try:
+                    self._phase3_subscription_manager.stop()
+                except Exception:  # noqa: BLE001
+                    log.debug("[Phase3] realtime subscription manager 停止异常（已忽略）")
             log.info("[Phase3] shadow 组件已随主进程退出")
             self._phase3_mm = None
             self._phase3_ppo = None
             self._phase3_evolution = None
+            self._phase3_ws_client = None
+            self._phase3_subscription_manager = None
+            self._phase3_depth_registry = None
+            self._phase3_trade_registry = None
+            self._phase3_micro_builder = None
+            self._phase3_realtime_enabled = False
             self._phase3_enabled = False
 
 

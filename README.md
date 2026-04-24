@@ -55,6 +55,22 @@ pytest tests/
 TRADING_MODE=paper python -m apps.trader.main
 ```
 
+## Phase 3 Realtime Feed
+
+- `phase3.realtime_feed.provider` 现在默认是 `htx`，paper 模式会优先消费 HTX public market feed。
+- 如需在离线环境或 CI 中保持稳定，可将 [configs/system.yaml](configs/system.yaml) 中的 provider 切回 `mock`。
+- 可先用下面的 smoke 命令验证 realtime feed：
+
+```bash
+python scripts/verify_phase3_realtime_feed.py --provider htx --exchange htx --symbol BTC/USDT --timeout 20
+```
+
+- 若只想做本地离线验证，可改用：
+
+```bash
+python scripts/verify_phase3_realtime_feed.py --provider mock --exchange mock --symbol BTC/USDT --timeout 1
+```
+
 ## 目录结构
 
 ```

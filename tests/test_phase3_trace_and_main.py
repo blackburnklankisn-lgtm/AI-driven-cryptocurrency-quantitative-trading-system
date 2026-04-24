@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -533,8 +535,7 @@ class TestPhase3MainWiring:
         from modules.monitoring.trace import get_recorder
         get_recorder().disable()
 
-        from core.config import load_config
-        p3_cfg = load_config().phase3
+        p3_cfg = _load_p3_cfg()
 
         # 构造最小 trader mock（不需要真实 CCXT）
         trader = _make_minimal_trader()
@@ -548,6 +549,59 @@ class TestPhase3MainWiring:
             or trader._phase3_evolution is not None
         )
         get_recorder().enable()
+
+    def test_init_phase3_components_enables_realtime_feed_by_default_in_paper_mode(self):
+        """paper 模式下默认应启动 realtime paper feed。"""
+        trader = _make_minimal_trader()
+        trader._init_phase3_components(_load_p3_cfg())
+
+        assert trader._phase3_realtime_enabled is True
+        assert trader._phase3_ws_client is not None
+        assert trader._phase3_subscription_manager is not None
+        assert trader._phase3_depth_registry is not None
+        assert trader._phase3_trade_registry is not None
+        trader._phase3_subscription_manager.stop()
+
+    def test_init_phase3_components_respects_explicit_realtime_disable(self):
+        """即使 paper 模式默认开启，显式关闭配置仍应生效。"""
+        p3_cfg = _load_p3_cfg().model_copy(update={"realtime_feed_enabled": False})
+
+        trader = _make_minimal_trader()
+        trader._init_phase3_components(p3_cfg)
+
+        assert trader._phase3_realtime_enabled is False
+        assert trader._phase3_ws_client is None
+        assert trader._phase3_subscription_manager is None
+
+    def test_create_phase3_ws_client_uses_htx_provider(self):
+        """provider=htx 时，应构建真实 HTX WebSocket client。"""
+        from apps.trader.main import LiveTrader
+        from core.config import Phase3RealtimeFeedConfig
+        from modules.data.realtime.ws_client import HtxMarketWsClient, WsClientConfig
+
+        trader = _make_minimal_trader()
+        client = LiveTrader._create_phase3_ws_client(
+            trader,
+            Phase3RealtimeFeedConfig(provider="htx"),
+            WsClientConfig(exchange="htx"),
+        )
+
+        assert isinstance(client, HtxMarketWsClient)
+
+    def test_create_phase3_ws_client_unknown_provider_falls_back_to_mock(self):
+        """未知 provider 时，应回退 MockWsClient。"""
+        from apps.trader.main import LiveTrader
+        from core.config import Phase3RealtimeFeedConfig
+        from modules.data.realtime.ws_client import MockWsClient, WsClientConfig
+
+        trader = _make_minimal_trader()
+        client = LiveTrader._create_phase3_ws_client(
+            trader,
+            Phase3RealtimeFeedConfig(provider="unknown"),
+            WsClientConfig(exchange="htx"),
+        )
+
+        assert isinstance(client, MockWsClient)
 
     def test_step_phase3_shadow_disabled_is_noop(self):
         """_phase3_enabled=False 时 shadow step 应该什么都不做（无异常）。"""
@@ -626,6 +680,90 @@ class TestPhase3MainWiring:
         # 不抛异常
         trader._step_phase3_shadow("BTC/USDT", 50000.0, seq=1)
 
+    def test_pump_phase3_realtime_feed_populates_registries(self):
+        """mock realtime feed pump 后，DepthCache 和 TradeCache 都应有真实数据。"""
+        from apps.trader.main import LiveTrader
+        from modules.data.realtime.depth_cache import DepthCacheRegistry
+        from modules.data.realtime.subscription_manager import (
+            SubscriptionManager,
+            SubscriptionManagerConfig,
+        )
+        from modules.data.realtime.trade_cache import TradeCacheRegistry
+        from modules.data.realtime.ws_client import (
+            MockWsClient,
+            MockWsClientConfig,
+            WsClientConfig,
+        )
+
+        trader = _make_minimal_trader()
+        trader._phase3_realtime_enabled = True
+        trader._phase3_depth_registry = DepthCacheRegistry()
+        trader._phase3_trade_registry = TradeCacheRegistry()
+        trader._phase3_ws_client = MockWsClient(
+            MockWsClientConfig(
+                base_config=WsClientConfig(exchange=trader.sys_config.exchange.exchange_id),
+                seed=7,
+            )
+        )
+        trader._phase3_subscription_manager = SubscriptionManager(
+            trader._phase3_ws_client,
+            trader._phase3_depth_registry,
+            trader._phase3_trade_registry,
+            SubscriptionManagerConfig(health_check_interval_sec=60.0),
+        )
+        trader._phase3_subscription_manager.start(["BTC/USDT"])
+
+        LiveTrader._pump_phase3_realtime_feed(trader, "BTC/USDT")
+
+        cache = trader._phase3_depth_registry.get(
+            "BTC/USDT",
+            trader.sys_config.exchange.exchange_id,
+        )
+        stats = trader._phase3_trade_registry.get_stats(
+            "BTC/USDT",
+            trader.sys_config.exchange.exchange_id,
+        )
+
+        assert cache is not None
+        assert cache.get_snapshot() is not None
+        assert stats is not None
+        assert stats.trade_count == 1
+        trader._phase3_subscription_manager.stop()
+
+    def test_step_phase3_shadow_prefers_registry_snapshot(self):
+        """存在 realtime registry 快照时，_step_phase3_shadow() 应优先消费该快照。"""
+        from modules.data.realtime.depth_cache import DepthCacheRegistry
+        from modules.data.realtime.orderbook_types import DepthLevel, OrderBookDelta
+
+        trader = _make_minimal_trader()
+        trader._phase3_enabled = True
+        trader._phase3_realtime_enabled = True
+        trader._phase3_depth_registry = DepthCacheRegistry()
+
+        delta = OrderBookDelta(
+            symbol="BTC/USDT",
+            exchange=trader.sys_config.exchange.exchange_id,
+            sequence_id=11,
+            prev_sequence_id=10,
+            bid_updates=[DepthLevel(price=50999.0, size=1.2)],
+            ask_updates=[DepthLevel(price=51001.0, size=1.1)],
+            received_at=datetime.now(tz=timezone.utc),
+            is_snapshot=True,
+        )
+        trader._phase3_depth_registry.apply_delta(delta)
+
+        mm_mock = MagicMock()
+        mm_mock.config.symbol = "BTC/USDT"
+        trader._phase3_mm = mm_mock
+        trader._phase3_ppo = None
+        trader._phase3_evolution = None
+
+        trader._step_phase3_shadow("BTC/USDT", 50000.0, seq=7)
+
+        used_snapshot = mm_mock.tick.call_args.args[0]
+        assert used_snapshot.sequence_id == 11
+        assert used_snapshot.mid_price == pytest.approx(51000.0)
+
     def test_shutdown_clears_phase3_state(self):
         """_shutdown() 后 Phase 3 组件引用应被清空。"""
         from modules.monitoring.trace import get_recorder
@@ -652,6 +790,181 @@ class TestPhase3MainWiring:
         get_recorder().enable()
 
 
+class TestMainPhaseIntegration:
+    """验证 main.py 中 Phase 1/2 真实接线。"""
+
+    def test_build_risk_snapshot_merges_runtime_guards(self):
+        from apps.trader.main import LiveTrader
+
+        trader = _make_minimal_trader()
+        trader._current_equity = 900.0
+        trader.risk_manager.get_state_summary.return_value = {
+            "circuit_broken": False,
+            "circuit_reason": "",
+            "daily_pnl": -45.0,
+            "consecutive_losses": 2,
+            "peak_equity": 1000.0,
+            "daily_start_equity": 1000.0,
+        }
+        trader._budget_checker.snapshot.return_value = {
+            "remaining_budget_pct": 0.35,
+            "deployed_pct": 0.55,
+        }
+        expiry = datetime.now(tz=timezone.utc) + timedelta(minutes=15)
+        trader._adaptive_risk.health_snapshot.return_value = {
+            "cooldown": {
+                "active_symbols": {
+                    "BTC/USDT": {
+                        "expires_at": expiry.isoformat(),
+                        "remaining_min": 15.0,
+                    }
+                }
+            }
+        }
+
+        snapshot = LiveTrader._build_risk_snapshot(trader)
+
+        assert snapshot.current_drawdown == pytest.approx(0.10)
+        assert snapshot.daily_loss_pct == pytest.approx(0.045)
+        assert snapshot.budget_remaining_pct == pytest.approx(0.35)
+        assert snapshot.consecutive_losses == 2
+        assert snapshot.symbol_in_cooldown("BTC/USDT") is True
+
+    def test_process_order_request_budget_blocks_before_submit(self):
+        from apps.trader.main import LiveTrader
+        from core.event import EventType, OrderRequestEvent
+        from modules.risk.snapshot import RiskPlan, RiskSnapshot
+
+        trader = _make_minimal_trader()
+        trader._current_equity = 10000.0
+        trader._latest_prices = {"BTC/USDT": 50000.0}
+        trader._phase1_feature_views = {
+            "BTC/USDT": {
+                "alpha_features": __import__("pandas").DataFrame(
+                    [{"atr_pct_14": 0.02}]
+                ),
+                "regime_features": __import__("pandas").DataFrame(),
+                "diagnostic_features": __import__("pandas").DataFrame(),
+            }
+        }
+        trader._adaptive_risk.evaluate.return_value = RiskPlan(
+            allow_entry=True,
+            position_scalar=0.5,
+            stop_loss_pct=0.03,
+            trailing_trigger_pct=0.04,
+            trailing_callback_pct=0.015,
+            take_profit_ladder=[0.03],
+            dca_levels=[],
+            cooldown_minutes=30,
+            block_reasons=[],
+        )
+        trader._budget_checker.check.return_value = (False, "budget blocked", 0.95)
+        trader.risk_manager.check.return_value = (True, "通过")
+
+        req = OrderRequestEvent(
+            event_type=EventType.ORDER_REQUESTED,
+            timestamp=datetime.now(tz=timezone.utc),
+            source="test",
+            symbol="BTC/USDT",
+            side="buy",
+            order_type="market",
+            quantity=Decimal("0.01"),
+            price=None,
+            strategy_id="test_strategy",
+            request_id="req-1",
+        )
+
+        LiveTrader._process_order_request(
+            trader,
+            req,
+            trader._current_equity,
+            risk_snapshot=RiskSnapshot.make_default(),
+            signal_confidence=0.8,
+            strategy_weight=1.0,
+            phase_source="test",
+        )
+
+        trader._budget_checker.check.assert_called_once()
+        trader.order_manager.submit.assert_not_called()
+        trader.metrics.record_order_rejected.assert_called_once()
+
+    def test_process_kline_event_routes_through_orchestrator(self):
+        from apps.trader.main import LiveTrader
+        from core.event import EventType, KlineEvent, OrderRequestEvent
+        from modules.alpha.contracts.strategy_result import StrategyResult
+        from modules.alpha.contracts import RegimeState
+        from modules.alpha.orchestration.strategy_orchestrator import OrchestrationDecision
+        from modules.alpha.orchestration.gating import GatingAction, GatingDecision
+        from modules.risk.snapshot import RiskSnapshot
+
+        trader = _make_minimal_trader()
+        trader._current_equity = 10000.0
+        trader._latest_prices = {"BTC/USDT": 50000.0}
+        trader._get_phase1_feature_views = MagicMock(return_value=None)
+        detector = MagicMock()
+        detector.update.return_value = trader._current_regime
+        detector.is_stable = True
+        trader._get_or_create_regime_detector = MagicMock(return_value=detector)
+        trader._build_symbol_ohlcv_frame = MagicMock(return_value=None)
+        trader._build_risk_snapshot = MagicMock(return_value=RiskSnapshot.make_default())
+
+        order_req = OrderRequestEvent(
+            event_type=EventType.ORDER_REQUESTED,
+            timestamp=datetime.now(tz=timezone.utc),
+            source="test",
+            symbol="BTC/USDT",
+            side="buy",
+            order_type="market",
+            quantity=Decimal("0.01"),
+            price=None,
+            strategy_id="alpha_a",
+            request_id="req-alpha",
+        )
+        strategy_result = StrategyResult(
+            strategy_id="alpha_a",
+            symbol="BTC/USDT",
+            action="BUY",
+            confidence=0.72,
+            order_requests=[order_req],
+        )
+        trader._alpha_runtime.loop_seq = 0
+        trader._alpha_runtime.process_bar.return_value = (
+            MagicMock(trace_id="trace-1", loop_seq=1),
+            [strategy_result],
+        )
+        trader._phase1_orchestrator.orchestrate.return_value = OrchestrationDecision(
+            selected_results=[strategy_result],
+            weights={"alpha_a": 1.0},
+            block_reasons=[],
+            gating=GatingDecision(action=GatingAction.ALLOW, reduce_factor=1.0, triggered_rules=[]),
+            debug_payload={},
+        )
+        trader._process_order_request = MagicMock()
+
+        event = KlineEvent(
+            event_type=EventType.KLINE_UPDATED,
+            timestamp=datetime.now(tz=timezone.utc),
+            source="live_feed",
+            symbol="BTC/USDT",
+            timeframe="1h",
+            open=Decimal("50000"),
+            high=Decimal("50500"),
+            low=Decimal("49500"),
+            close=Decimal("50200"),
+            volume=Decimal("12"),
+            is_closed=True,
+        )
+
+        LiveTrader._process_kline_event(trader, event)
+
+        trader._phase1_orchestrator.orchestrate.assert_called_once()
+        trader._process_order_request.assert_called_once()
+        _, kwargs = trader._process_order_request.call_args
+        assert kwargs["phase_source"] == "phase1"
+        assert kwargs["strategy_weight"] == pytest.approx(1.0)
+        assert kwargs["signal_confidence"] == pytest.approx(0.72)
+
+
 # ─────────────────────────────────────────────────────────────
 # 辅助工厂函数
 # ─────────────────────────────────────────────────────────────
@@ -661,6 +974,8 @@ def _make_minimal_trader():
     构造一个仅有 Phase 3 相关属性的极简 LiveTrader 实例（无真实 CCXT）。
     """
     from apps.trader.main import LiveTrader
+    from modules.alpha.contracts import RegimeState
+    from modules.risk.position_sizer import PositionSizer
 
     obj = object.__new__(LiveTrader)
 
@@ -668,19 +983,88 @@ def _make_minimal_trader():
     from core.config import load_config
     obj.sys_config = load_config()
     obj.mode = "paper"
+    obj._poll_interval_s = 60.0
 
     obj._phase3_enabled = False
     obj._phase3_mm = None
     obj._phase3_ppo = None
     obj._phase3_evolution = None
+    obj._phase3_obs_builder = None
+    obj._phase3_action_adapter = None
+    obj._phase3_rl_policy_mode = "shadow"
+    obj._phase3_realtime_enabled = False
+    obj._phase3_ws_client = None
+    obj._phase3_subscription_manager = None
+    obj._phase3_depth_registry = None
+    obj._phase3_trade_registry = None
+    obj._phase3_micro_builder = None
+
+    obj._phase1_feature_views = {}
+    obj._phase1_data_kitchens = {}
+    obj._phase1_regime_detectors = {}
+    obj._phase1_orchestrator = MagicMock()
+    obj._symbol_regimes = {}
+    obj._last_trace_ids = {}
+    obj._symbol_risk_plans = {}
+
+    obj._positions = {}
+    obj._entry_prices = {}
+    obj._latest_prices = {}
+    obj._kline_store = {}
+    obj._current_equity = 0.0
+    obj._stop_loss_pending = set()
+    obj._current_regime = RegimeState(
+        bull_prob=0.33,
+        bear_prob=0.33,
+        sideways_prob=0.34,
+        high_vol_prob=0.0,
+        confidence=0.5,
+        dominant_regime="sideways",
+    )
+
+    obj.bus = MagicMock()
+    obj.metrics = MagicMock()
+    obj.position_sizer = PositionSizer(max_position_pct=0.2)
+    obj.order_manager = MagicMock()
+    obj.order_manager.get_open_orders.return_value = []
+    obj._strategies = []
+    obj._alpha_runtime = MagicMock()
 
     # risk_manager mock
     obj.risk_manager = MagicMock()
     obj.risk_manager.is_circuit_broken.return_value = False
+    obj.risk_manager.get_state_summary.return_value = {
+        "circuit_broken": False,
+        "circuit_reason": "",
+        "daily_pnl": 0.0,
+        "consecutive_losses": 0,
+        "peak_equity": 0.0,
+        "daily_start_equity": 0.0,
+    }
+    obj.risk_manager.check.return_value = (True, "通过")
+
+    obj._budget_checker = MagicMock()
+    obj._budget_checker.snapshot.return_value = {
+        "remaining_budget_pct": 1.0,
+        "deployed_pct": 0.0,
+    }
+    obj._budget_checker.check.return_value = (True, "通过", 0.0)
+
+    obj._kill_switch = MagicMock()
+    obj._kill_switch.is_active = False
+    obj._kill_switch.evaluate.return_value = False
+    obj._kill_switch.health_snapshot.return_value = {"reason": ""}
+
+    obj._adaptive_risk = MagicMock()
+    obj._adaptive_risk.health_snapshot.return_value = {
+        "cooldown": {"active_symbols": {}}
+    }
 
     return obj
 
 
 def _load_p3_cfg():
     from core.config import load_config
-    return load_config().phase3
+    p3_cfg = load_config().phase3
+    rt_cfg = p3_cfg.realtime_feed.model_copy(update={"provider": "mock"})
+    return p3_cfg.model_copy(update={"realtime_feed": rt_cfg})

@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 import yaml
 from pydantic import Field, field_validator
@@ -149,6 +149,8 @@ class Phase3RealtimeFeedConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
+    provider: str = "htx"
+    ws_url: Optional[str] = None
     reconnect_backoff_sec: float = 2.0
     heartbeat_timeout_sec: float = 15.0
     orderbook_depth_levels: int = 20
@@ -212,14 +214,15 @@ class Phase3Config(BaseSettings):
     """
     Phase 3 高级策略与自进化功能开关 + 子模块配置。
 
-    所有高级能力默认关闭，必须显式在 system.yaml 或环境变量中开启，
-    以确保 Phase 1 / Phase 2 运行时不受影响。
+    其中 realtime feed 在 paper 模式下默认开启，方便直接进行
+    registry-backed Phase 3 演练；其余高级能力默认关闭，避免影响
+    Phase 1 / Phase 2 主路径。
     """
 
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
     enabled: bool = True
-    realtime_feed_enabled: bool = False
+    realtime_feed_enabled: bool = True
     market_making_enabled: bool = False
     rl_agent_enabled: bool = False
     self_evolution_enabled: bool = False

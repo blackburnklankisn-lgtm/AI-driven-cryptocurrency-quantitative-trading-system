@@ -33,11 +33,14 @@ from modules.data.realtime.orderbook_types import (
     TradeTick,
 )
 from modules.data.realtime.ws_client import (
+    HtxMarketWsClient,
     MockWsClient,
     MockWsClientConfig,
     WsClientConfig,
     WsConnectionState,
+    create_exchange_ws_client,
 )
+from modules.data.realtime.verification import verify_realtime_feed
 from modules.data.realtime.depth_cache import (
     DepthCache,
     DepthCacheConfig,
@@ -286,6 +289,130 @@ class TestMockWsClient:
         diag = client.diagnostics()
         assert diag["exchange"] == "mock"
         assert diag["state"] == "connected"
+
+
+class TestHtxMarketWsClient:
+    def _make_client(self, **kwargs) -> HtxMarketWsClient:
+        return HtxMarketWsClient(WsClientConfig(exchange="htx", depth_levels=5, **kwargs))
+
+    def test_parse_depth_message_builds_snapshot_delta(self):
+        client = self._make_client()
+        payload = {
+            "ch": "market.btcusdt.depth.step0",
+            "ts": 1710000001000,
+            "tick": {
+                "seqNum": 321,
+                "bids": [[50000.0, 1.2], [49999.5, 0.8]],
+                "asks": [[50001.0, 1.1], [50001.5, 0.7]],
+            },
+        }
+
+        delta = client._parse_depth_message(payload)
+
+        assert delta is not None
+        assert delta.symbol == "BTC/USDT"
+        assert delta.exchange == "htx"
+        assert delta.sequence_id == 321
+        assert delta.is_snapshot is True
+        assert delta.bid_updates[0].price == pytest.approx(50000.0)
+        assert delta.ask_updates[0].size == pytest.approx(1.1)
+
+    def test_parse_trade_message_builds_ticks(self):
+        client = self._make_client()
+        payload = {
+            "ch": "market.ethusdt.trade.detail",
+            "ts": 1710000002000,
+            "tick": {
+                "id": 99,
+                "data": [
+                    {
+                        "tradeId": 123,
+                        "amount": 0.25,
+                        "price": 3000.5,
+                        "direction": "buy",
+                        "ts": 1710000002001,
+                    },
+                    {
+                        "tradeId": 124,
+                        "amount": 0.10,
+                        "price": 3000.0,
+                        "direction": "sell",
+                        "ts": 1710000002002,
+                    },
+                ],
+            },
+        }
+
+        ticks = client._parse_trade_message(payload)
+
+        assert len(ticks) == 2
+        assert ticks[0].symbol == "ETH/USDT"
+        assert ticks[0].side == TradeSide.BUY
+        assert ticks[1].side == TradeSide.SELL
+        assert ticks[0].trade_id == "123"
+        assert ticks[1].notional == pytest.approx(300.0)
+
+    def test_request_snapshot_uses_ccxt_rest(self, monkeypatch):
+        from modules.data.realtime import ws_client as ws_mod
+
+        class FakeExchange:
+            def __init__(self, config):
+                self.config = config
+
+            def fetch_order_book(self, symbol, limit=None):
+                assert symbol == "BTC/USDT"
+                assert limit == 5
+                return {
+                    "nonce": 777,
+                    "timestamp": 1710000003000,
+                    "bids": [[50000.0, 1.5], [49999.5, 1.0]],
+                    "asks": [[50001.0, 1.4], [50001.5, 0.9]],
+                }
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(ws_mod.ccxt, "htx", FakeExchange)
+        client = self._make_client()
+
+        delta = client.request_snapshot("BTC/USDT")
+
+        assert delta is not None
+        assert delta.is_snapshot is True
+        assert delta.sequence_id == 777
+        assert delta.bid_updates[0].price == pytest.approx(50000.0)
+        assert delta.ask_updates[1].size == pytest.approx(0.9)
+
+
+class TestWsClientFactory:
+    def test_create_exchange_ws_client_uses_htx_provider(self):
+        client = create_exchange_ws_client("htx", WsClientConfig(exchange="htx"))
+        assert isinstance(client, HtxMarketWsClient)
+
+    def test_create_exchange_ws_client_unknown_provider_falls_back_to_mock(self):
+        client = create_exchange_ws_client("unknown", WsClientConfig(exchange="htx"))
+        assert isinstance(client, MockWsClient)
+
+
+class TestRealtimeFeedVerification:
+    def test_verify_realtime_feed_mock_provider(self):
+        result = verify_realtime_feed(
+            provider="mock",
+            exchange="mock",
+            symbols=["BTC/USDT"],
+            timeout_sec=1.0,
+            depth_levels=5,
+            heartbeat_timeout_sec=5.0,
+            health_check_interval_sec=1.0,
+            poll_interval_sec=0.01,
+        )
+
+        assert result.success is True
+        assert result.health == "healthy"
+        assert len(result.statuses) == 1
+        assert result.statuses[0].symbol == "BTC/USDT"
+        assert result.statuses[0].has_snapshot is True
+        assert result.statuses[0].trade_count > 0
 
 
 # ══════════════════════════════════════════════════════════════

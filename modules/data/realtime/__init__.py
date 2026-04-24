@@ -5,7 +5,7 @@ Phase 3 W15-W16 实现：订单簿 + 成交流 + 微观结构特征
 
 公开接口：
     orderbook_types   → OrderBookSnapshot, TradeTick, OrderBookDelta, DepthLevel, GapStatus, TradeSide
-    ws_client         → ExchangeWsClient, MockWsClient, WsClientConfig, MockWsClientConfig, WsConnectionState
+    ws_client         → ExchangeWsClient, MockWsClient, HtxMarketWsClient, create_exchange_ws_client, WsClientConfig, MockWsClientConfig, WsConnectionState
     depth_cache       → DepthCache, DepthCacheRegistry, DepthCacheConfig
     trade_cache       → TradeCache, TradeCacheRegistry, TradeCacheConfig, TradeFlowStats
     feature_builder   → MicroFeatureBuilder, MicroFeatureFrame, MicroFeatureBuilderConfig, MICRO_FEATURE_COLS
@@ -23,10 +23,12 @@ from modules.data.realtime.orderbook_types import (
 )
 from modules.data.realtime.ws_client import (
     ExchangeWsClient,
+    HtxMarketWsClient,
     MockWsClient,
     MockWsClientConfig,
     WsClientConfig,
     WsConnectionState,
+    create_exchange_ws_client,
 )
 from modules.data.realtime.depth_cache import (
     DepthCache,
@@ -67,10 +69,12 @@ __all__ = [
     "TradeTick",
     # ws_client
     "ExchangeWsClient",
+    "HtxMarketWsClient",
     "MockWsClient",
     "MockWsClientConfig",
     "WsClientConfig",
     "WsConnectionState",
+    "create_exchange_ws_client",
     # depth_cache
     "DepthCache",
     "DepthCacheConfig",
