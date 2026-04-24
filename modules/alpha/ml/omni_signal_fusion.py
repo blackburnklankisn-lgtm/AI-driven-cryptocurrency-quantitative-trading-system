@@ -1,9 +1,11 @@
 """
-modules/alpha/ml/omni_signal_fusion.py — 多维 Alpha 融合中枢（Phase 2 W14）
+modules/alpha/ml/omni_signal_fusion.py — 多维 Alpha 融合中枢（Phase 2 W14 + Phase 3 扩展）
 
 设计说明：
-- 消费三类独立 Alpha 源（technical / onchain / sentiment）的 SourceSignal
-- 第一版使用"可解释的加权融合"，不引入复杂 stacking
+- 消费五类独立 Alpha 源（technical / onchain / sentiment / microstructure / rl）的 SourceSignal
+- Phase 2 W14：支持 technical / onchain / sentiment
+- Phase 3 W19-W21 扩展：新增 microstructure（订单簿微观结构）和 rl（RL policy 置信度信号）
+- 使用"可解释的加权融合"，不引入复杂 stacking
 - 融合规则（按优先级）：
     1. freshness 过滤：freshness_ok=False 的 source 权重强制为 0
     2. 风险状态压制：risk_snapshot 中风险偏高时，自动降低外部 source 权重
@@ -11,6 +13,9 @@ modules/alpha/ml/omni_signal_fusion.py — 多维 Alpha 融合中枢（Phase 2 W
     4. 阈值判断：aggregate_score → BUY / SELL / HOLD
     5. 降级：所有外部 source 均不可用时，fallback 到 technical-only
 - dominant_source：有效权重最大的那个 source
+- 新 source 权重设计：
+    microstructure：高更新频率（tick 级），捕获即时订单流信息，默认权重 0.6
+    rl：policy confidence 信号，只有 RL 通过 paper/shadow 晋升后才应传入，默认权重 0.4
 
 接口：
     OmniSignalFusionConfig(...)
@@ -35,8 +40,8 @@ from modules.alpha.contracts.alpha_source_types import (
 
 log = get_logger(__name__)
 
-# 有效 source 名称集合
-_VALID_SOURCES = {"technical", "onchain", "sentiment"}
+# 有效 source 名称集合（Phase 2 W14 + Phase 3 W19-W21 扩展）
+_VALID_SOURCES = {"technical", "onchain", "sentiment", "microstructure", "rl"}
 
 
 @dataclass
@@ -45,17 +50,19 @@ class OmniSignalFusionConfig:
     OmniSignalFusion 配置项。
 
     Attributes:
-        buy_threshold:              aggregate_score 超过此值 → BUY
-        sell_threshold:             aggregate_score 低于此值 → SELL（应为负值）
-        technical_base_weight:      技术面基础权重
-        onchain_base_weight:        链上基础权重
-        sentiment_base_weight:      情绪基础权重
-        risk_penalty_threshold:     风险状态触发外部 source 降权的 drawdown 阈值
-        risk_penalty_factor:        高风险时外部 source 权重乘以此系数 [0, 1]
-        min_active_sources:         最少需要几个 freshness_ok=True 的 source
-                                    （低于此数时打 WARNING，但仍运行）
-        technical_only_fallback:    True 时当所有外部 source 均 stale 时
-                                    强制降级为 technical-only
+        buy_threshold:                aggregate_score 超过此值 → BUY
+        sell_threshold:               aggregate_score 低于此值 → SELL（应为负值）
+        technical_base_weight:        技术面基础权重
+        onchain_base_weight:          链上基础权重
+        sentiment_base_weight:        情绪基础权重
+        microstructure_base_weight:   订单簿微观结构基础权重（Phase 3 新增）
+        rl_base_weight:               RL policy 信号基础权重（Phase 3 新增）
+        risk_penalty_threshold:       风险状态触发外部 source 降权的 drawdown 阈值
+        risk_penalty_factor:          高风险时外部 source 权重乘以此系数 [0, 1]
+        min_active_sources:           最少需要几个 freshness_ok=True 的 source
+                                      （低于此数时打 WARNING，但仍运行）
+        technical_only_fallback:      True 时当所有外部 source 均 stale 时
+                                      强制降级为 technical-only
     """
 
     buy_threshold: float = 0.15
@@ -63,8 +70,10 @@ class OmniSignalFusionConfig:
     technical_base_weight: float = 1.0
     onchain_base_weight: float = 0.5
     sentiment_base_weight: float = 0.5
-    risk_penalty_threshold: float = 0.05   # drawdown > 5% 时触发外部 source 降权
-    risk_penalty_factor: float = 0.3       # 高风险时外部权重 × 0.3
+    microstructure_base_weight: float = 0.6  # Phase 3: tick 级微观结构信号
+    rl_base_weight: float = 0.4              # Phase 3: RL policy 置信度信号
+    risk_penalty_threshold: float = 0.05     # drawdown > 5% 时触发外部 source 降权
+    risk_penalty_factor: float = 0.3         # 高风险时外部权重 × 0.3
     min_active_sources: int = 1
     technical_only_fallback: bool = True
 
@@ -81,15 +90,27 @@ class OmniSignalFusionConfig:
             raise ValueError(
                 f"risk_penalty_factor 应在 [0, 1]，实际: {self.risk_penalty_factor}"
             )
+        if self.microstructure_base_weight < 0:
+            raise ValueError(
+                f"microstructure_base_weight 应 >= 0，实际: {self.microstructure_base_weight}"
+            )
+        if self.rl_base_weight < 0:
+            raise ValueError(
+                f"rl_base_weight 应 >= 0，实际: {self.rl_base_weight}"
+            )
 
     def base_weight(self, source_name: str) -> float:
-        """返回指定 source 的基础权重。"""
+        """返回指定 source 的基础权重。未知 source 默认权重 1.0。"""
         if source_name == "technical":
             return self.technical_base_weight
         if source_name == "onchain":
             return self.onchain_base_weight
         if source_name == "sentiment":
             return self.sentiment_base_weight
+        if source_name == "microstructure":
+            return self.microstructure_base_weight
+        if source_name == "rl":
+            return self.rl_base_weight
         return 1.0
 
 
@@ -117,12 +138,14 @@ class OmniSignalFusion:
         self._n_degraded = 0
         log.info(
             "[OmniFusion] 初始化: buy_thr={} sell_thr={} "
-            "weights=tech:{}/onchain:{}/sentiment:{} risk_penalty={}@{}",
+            "weights=tech:{}/onchain:{}/sentiment:{}/micro:{}/rl:{} risk_penalty={}@{}",
             self.config.buy_threshold,
             self.config.sell_threshold,
             self.config.technical_base_weight,
             self.config.onchain_base_weight,
             self.config.sentiment_base_weight,
+            self.config.microstructure_base_weight,
+            self.config.rl_base_weight,
             self.config.risk_penalty_factor,
             self.config.risk_penalty_threshold,
         )

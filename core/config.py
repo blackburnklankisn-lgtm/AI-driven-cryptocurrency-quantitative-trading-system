@@ -144,6 +144,97 @@ class ContinuousLearningConfig(BaseSettings):
     min_bars_for_retrain: int = 400
 
 
+class Phase3RealtimeFeedConfig(BaseSettings):
+    """Phase 3 实时订单簿数据层配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    reconnect_backoff_sec: float = 2.0
+    heartbeat_timeout_sec: float = 15.0
+    orderbook_depth_levels: int = 20
+    snapshot_recovery_enabled: bool = True
+    max_gap_tolerance: int = 1
+
+
+class Phase3MarketMakingConfig(BaseSettings):
+    """Phase 3 Avellaneda 做市策略配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    risk_aversion_gamma: float = 0.12
+    max_inventory_pct: float = 0.20
+    quote_refresh_ms: int = 1500
+    cancel_on_gap: bool = True
+    max_quote_age_sec: float = 10.0
+    maker_only: bool = True
+
+
+class Phase3RLConfig(BaseSettings):
+    """Phase 3 RL 交易代理配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    training_enabled: bool = False
+    policy_mode: str = "shadow"          # shadow / paper / active
+    reward_drawdown_penalty: float = 2.0
+    reward_turnover_penalty: float = 0.2
+    action_confidence_floor: float = 0.55
+    max_episode_steps: int = 1000
+
+
+class Phase3EvolutionConfig(BaseSettings):
+    """Phase 3 Self-Evolution Engine 配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    weekly_optimization_cron: str = "0 3 * * 0"  # 每周日凌晨 3 点
+    shadow_days: int = 7
+    paper_days: int = 7
+    ab_min_samples: int = 100
+    promote_min_sharpe: float = 0.8
+    retire_max_drawdown: float = 0.10
+    auto_rollback_enabled: bool = True
+
+
+class Phase3LoggingConfig(BaseSettings):
+    """Phase 3 模块可观测性配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    realtime_debug: bool = True
+    market_making_debug: bool = True
+    rl_debug: bool = True
+    evolution_debug: bool = True
+    trace_sample_rate: float = 1.0
+
+
+class Phase3Config(BaseSettings):
+    """
+    Phase 3 高级策略与自进化功能开关 + 子模块配置。
+
+    所有高级能力默认关闭，必须显式在 system.yaml 或环境变量中开启，
+    以确保 Phase 1 / Phase 2 运行时不受影响。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    enabled: bool = True
+    realtime_feed_enabled: bool = False
+    market_making_enabled: bool = False
+    rl_agent_enabled: bool = False
+    self_evolution_enabled: bool = False
+
+    realtime_feed: Phase3RealtimeFeedConfig = Field(
+        default_factory=Phase3RealtimeFeedConfig
+    )
+    market_making: Phase3MarketMakingConfig = Field(
+        default_factory=Phase3MarketMakingConfig
+    )
+    rl: Phase3RLConfig = Field(default_factory=Phase3RLConfig)
+    evolution: Phase3EvolutionConfig = Field(default_factory=Phase3EvolutionConfig)
+    logging: Phase3LoggingConfig = Field(default_factory=Phase3LoggingConfig)
+
+
 class LoggingConfig(BaseSettings):
     """日志配置。"""
 
@@ -199,6 +290,7 @@ class SystemConfig(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     continuous_learning: ContinuousLearningConfig = Field(default_factory=ContinuousLearningConfig)
+    phase3: Phase3Config = Field(default_factory=Phase3Config)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -206,6 +298,38 @@ class SystemConfig(BaseSettings):
 # ══════════════════════════════════════════════════════════════
 
 _config: SystemConfig | None = None
+
+
+def _build_phase3_config(phase3_yaml: dict) -> Phase3Config:
+    """
+    从 YAML phase3 块构建 Phase3Config，保持各子块的嵌套结构。
+
+    子块（realtime_feed / market_making / rl / evolution / logging）
+    各自用对应子配置类的 model_validate 解析；
+    顶层开关字段直接透传。
+    """
+    top_level = {
+        k: v for k, v in phase3_yaml.items()
+        if k not in ("realtime_feed", "market_making", "rl", "evolution", "logging")
+    }
+    return Phase3Config.model_validate({
+        **top_level,
+        "realtime_feed": Phase3RealtimeFeedConfig.model_validate(
+            phase3_yaml.get("realtime_feed", {}) or {}
+        ),
+        "market_making": Phase3MarketMakingConfig.model_validate(
+            phase3_yaml.get("market_making", {}) or {}
+        ),
+        "rl": Phase3RLConfig.model_validate(
+            phase3_yaml.get("rl", {}) or {}
+        ),
+        "evolution": Phase3EvolutionConfig.model_validate(
+            phase3_yaml.get("evolution", {}) or {}
+        ),
+        "logging": Phase3LoggingConfig.model_validate(
+            phase3_yaml.get("logging", {}) or {}
+        ),
+    })
 
 
 def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
@@ -253,6 +377,7 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
         portfolio_yaml = yaml_data.pop("portfolio", {}) or {}
         cl_yaml = yaml_data.pop("continuous_learning", {}) or {}
         exchange_yaml = yaml_data.pop("exchange", {}) or {}
+        phase3_yaml = yaml_data.pop("phase3", {}) or {}
         yaml_data.pop("risk", None)       # 由 RiskConfig()    从 env 读取
         yaml_data.pop("logging", None)    # 由 LoggingConfig() 从 env 读取
 
@@ -271,6 +396,7 @@ def load_config(yaml_path: str | Path = "configs/system.yaml") -> SystemConfig:
             "logging": LoggingConfig(),                    # env 优先：LOG_LEVEL 等
             "portfolio": PortfolioConfig.model_validate(portfolio_yaml),
             "continuous_learning": ContinuousLearningConfig.model_validate(cl_yaml),
+            "phase3": _build_phase3_config(phase3_yaml),
         })
     except Exception as exc:
         raise ConfigError(f"系统配置验证失败: {exc}") from exc

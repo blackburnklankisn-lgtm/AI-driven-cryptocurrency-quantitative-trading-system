@@ -209,12 +209,190 @@ class LiveTrader:
         # ── 10. ContinuousLearner 实例表 {strategy_id: learner} ──
         self._continuous_learners: Dict[str, object] = {}
 
+        # ── 11. Phase 3 组件（shadow-only 模式）──────────────────────
+        # shadow-only：接收真实行情数据、产出决策、记录 trace，但不提交实际订单
+        # 只有当 phase3.enabled=true 时初始化，第一个失败不阻断其他组件
+        self._phase3_enabled: bool = False
+        self._phase3_mm: Optional[object] = None       # MarketMakingStrategy (shadow)
+        self._phase3_ppo: Optional[object] = None      # PPOAgent (shadow)
+        self._phase3_evolution: Optional[object] = None  # SelfEvolutionEngine
+
+        p3_cfg = getattr(self.sys_config, "phase3", None)
+        if p3_cfg is not None and getattr(p3_cfg, "enabled", False):
+            self._init_phase3_components(p3_cfg)
+
         log.info(
             "LiveTrader 初始化完成: exchange={} mode={} symbols={}",
             exc_cfg.exchange_id,
             self.mode,
             self.sys_config.data.default_symbols,
         )
+
+    # ────────────────────────────────────────────────────────────
+    # Phase 3 生命周期
+    # ────────────────────────────────────────────────────────────
+
+    def _init_phase3_components(self, p3_cfg: object) -> None:
+        """
+        初始化 Phase 3 组件（shadow-only 模式）。
+
+        每个组件独立初始化，失败不阻断其他组件。
+        初始化完成后设置 self._phase3_enabled = True。
+        """
+        from modules.monitoring.trace import init_recorder
+
+        # 初始化全局 Phase3TraceRecorder
+        init_recorder()
+
+        # ── 做市策略 (shadow / paper_mode=True) ────────────────
+        try:
+            from modules.alpha.market_making.strategy import (
+                MarketMakingStrategy,
+                MarketMakingStrategyConfig,
+            )
+
+            _symbol = (
+                self.sys_config.data.default_symbols[0]
+                if self.sys_config.data.default_symbols
+                else "BTC/USDT"
+            )
+            mm_cfg = MarketMakingStrategyConfig(
+                symbol=_symbol,
+                exchange=self.sys_config.exchange.exchange_id,
+                paper_mode=True,  # shadow 模式永远不发真实订单
+                save_every_n=0,   # shadow 模式禁用持久化
+            )
+            self._phase3_mm = MarketMakingStrategy(mm_cfg)
+            log.info(
+                "[Phase3] MarketMakingStrategy 已加载 (shadow): symbol={} exchange={}",
+                _symbol, self.sys_config.exchange.exchange_id,
+            )
+        except Exception as _exc:
+            log.warning("[Phase3] MarketMakingStrategy 初始化失败（已忽略）: {}", _exc)
+
+        # ── RL Agent (shadow / predict-only) ───────────────────
+        try:
+            from modules.alpha.rl.ppo_agent import PPOAgent, PPOConfig
+
+            rl_cfg = getattr(p3_cfg, "rl", None)
+            obs_dim = 24   # ObservationBuilder.OBS_DIM
+            n_actions = 8  # ActionAdapter 的离散动作数
+            ppo_cfg = PPOConfig(obs_dim=obs_dim, n_actions=n_actions)
+            self._phase3_ppo = PPOAgent(ppo_cfg)
+            log.info(
+                "[Phase3] PPOAgent 已加载 (shadow): obs_dim={} n_actions={} policy={}",
+                obs_dim, n_actions,
+                getattr(rl_cfg, "policy_mode", "shadow"),
+            )
+        except Exception as _exc:
+            log.warning("[Phase3] PPOAgent 初始化失败（已忽略）: {}", _exc)
+
+        # ── 自进化引擎 ──────────────────────────────
+        try:
+            from modules.evolution.self_evolution_engine import (
+                SelfEvolutionEngine,
+                SelfEvolutionConfig,
+            )
+
+            ev_cfg = SelfEvolutionConfig(
+                state_dir="storage/phase3_evolution",
+                auto_run=False,  # 手动调用 run_cycle()
+            )
+            self._phase3_evolution = SelfEvolutionEngine(ev_cfg)
+            log.info(
+                "[Phase3] SelfEvolutionEngine 已加载: state_dir=storage/phase3_evolution"
+            )
+        except Exception as _exc:
+            log.warning("[Phase3] SelfEvolutionEngine 初始化失败（已忽略）: {}", _exc)
+
+        self._phase3_enabled = True
+        log.info(
+            "[Phase3] shadow-only 模式已启动: mm={} ppo={} evolution={}",
+            self._phase3_mm is not None,
+            self._phase3_ppo is not None,
+            self._phase3_evolution is not None,
+        )
+
+    def _step_phase3_shadow(self, symbol: str, mid_price: float, seq: int) -> None:
+        """
+        Phase 3 shadow-only 单步驱动：
+        做市 tick / RL predict / 演进周期检查均只记录 trace，不发真实订单。
+
+        Args:
+            symbol:    当前处理的交易对
+            mid_price: K线收盘价（作为 mid 价格代理）
+            seq:       主循环心跳序号（用于日志关联性）
+        """
+        if not self._phase3_enabled:
+            return
+
+        # ── 做市 Shadow Tick ────────────────────────────────
+        if (
+            self._phase3_mm is not None
+            and getattr(self._phase3_mm.config, "symbol", None) == symbol
+        ):
+            try:
+                from modules.data.realtime.orderbook_types import OrderBookSnapshot
+                from modules.risk.snapshot import RiskSnapshot
+
+                # 用收盘价构造仿真快照（展开 shadow 模式时替换为实时订单簿快照）
+                _snap = OrderBookSnapshot.create_mock(
+                    symbol=symbol,
+                    exchange=self.sys_config.exchange.exchange_id,
+                    mid_price=mid_price,
+                    spread_bps=5.0,
+                    sequence_id=seq,
+                )
+                # 构造最小化风控快照（shadow 模式不经过实际风打检查）
+                _risk = RiskSnapshot(
+                    current_drawdown=0.0,
+                    daily_loss_pct=0.0,
+                    consecutive_losses=0,
+                    circuit_broken=self.risk_manager.is_circuit_broken(),
+                    kill_switch_active=False,
+                    budget_remaining_pct=1.0,
+                )
+                _decision = self._phase3_mm.tick(_snap, _risk, elapsed_sec=float(seq))
+                log.debug(
+                    "[Phase3/MM] shadow tick: symbol={} mid={:.4f} "
+                    "bid={} ask={} allow_bid={} allow_ask={}",
+                    symbol, mid_price,
+                    f"{_decision.bid_price:.4f}" if _decision.bid_price else "N/A",
+                    f"{_decision.ask_price:.4f}" if _decision.ask_price else "N/A",
+                    _decision.allow_post_bid,
+                    _decision.allow_post_ask,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("[Phase3/MM] shadow tick 异常（已忽略）: symbol={}", symbol)
+
+        # ── RL Shadow Predict ──────────────────────────────
+        if self._phase3_ppo is not None:
+            try:
+                # v1 shadow 阶段使用全零观测向量（验证接线。
+                # TODO: 替换为 ObservationBuilder 产出的真实观测）
+                _obs = [0.0] * self._phase3_ppo.config.obs_dim
+                _action_idx, _action_val, _conf, _lp = self._phase3_ppo.predict(
+                    _obs, deterministic=True
+                )
+                log.debug(
+                    "[Phase3/RL] shadow predict: symbol={} action_idx={} "
+                    "confidence={:.3f}",
+                    symbol, _action_idx, _conf,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("[Phase3/RL] shadow predict 异常（已忽略）: symbol={}", symbol)
+
+        # ── 演进周期检查（由调度器决定是否到期）────────────
+        if self._phase3_evolution is not None:
+            try:
+                _report = self._phase3_evolution.run_cycle(force=False)
+                if _report is not None:
+                    log.info(
+                        "[Phase3/EV] shadow 演进周期完成: {}",
+                        _report.summary(),
+                    )
+            except Exception:  # noqa: BLE001
+                log.debug("[Phase3/EV] 演进周期检查异常（已忽略）")
 
     # ────────────────────────────────────────────────────────────
     # 策略注册接口
@@ -480,22 +658,28 @@ class LiveTrader:
                     self.rebalancer._bar_count - self.rebalancer._last_rebalance_bar,
                 )
 
-        # Step 4: 周期性 AI 深度分析 (如每小时一次)
+        # Step 4: Phase 3 shadow-only 驱动（地价展示，不发实际订单）
+        if self._phase3_enabled and kline_events:
+            for _ev in kline_events:
+                _price = float(_ev.close)
+                self._step_phase3_shadow(_ev.symbol, _price, seq)
+
+        # Step 5: 周期性 AI 深度分析 (如每小时一次)
         if now.minute == 0 and now.second < 10:
              self._run_ai_analysis()
 
-        # Step 5: 轮询成交回报
+        # Step 6: 轮询成交回报
         fills = self.order_manager.poll_fills()
         log.debug("[Loop#{0}] 成交回报: {1}笔", seq, len(fills))
         for fill in fills:
             self._on_fill(fill)
 
-        # Step 5b: 撤销超时订单
+        # Step 6b: 撤销超时订单
         cancelled = self.order_manager.cancel_timed_out_orders()
         if cancelled > 0:
             log.warning("超时撤单 {} 笔", cancelled)
 
-        # Step 6: 更新账户快照与指标
+        # Step 7: 更新账户快照与指标
         self._update_account_snapshot()
         log.debug(
             "[Loop#{0}] 账户快照: equity={1:.2f} positions={2} entry_prices={3}",
@@ -504,10 +688,10 @@ class LiveTrader:
             {s: f"{p:.4f}" for s, p in self._entry_prices.items()},
         )
 
-        # Step 7: 硬止损检查（熔断时强制平仓）
+        # Step 8: 硬止损检查（熔断时强制平仓）
         self._check_stop_loss()
 
-        # Step 8: 每日重置检测（UTC 00:00 后的第一次循环）
+        # Step 9: 每日重置检测（UTC 00:00 后的第一次循环）
         self._check_daily_reset(now)
 
 
@@ -1496,6 +1680,14 @@ class LiveTrader:
             final_equity=self._current_equity,
         )
         log.info("系统已安全退出。最终净值: {:.2f} USDT", self._current_equity)
+
+        # Phase 3 shadow 组件清理
+        if self._phase3_enabled:
+            log.info("[Phase3] shadow 组件已随主进程退出")
+            self._phase3_mm = None
+            self._phase3_ppo = None
+            self._phase3_evolution = None
+            self._phase3_enabled = False
 
 
 

@@ -1,22 +1,30 @@
 """
-modules/alpha/ml/meta_learner_v2.py — source-aware MetaLearner v2（Phase 2 W14）
+modules/alpha/ml/meta_learner_v2.py — source-aware MetaLearner v2（Phase 2 W14 + Phase 3 扩展）
 
 设计说明：
 - Phase 1 MetaLearner 保持不变（仅负责技术面模型投票融合）
 - MetaLearnerV2 是一个薄包装层，负责：
     1. 调用 Phase 1 MetaLearner 得到技术面 MetaSignal
     2. 将 MetaSignal 转换为 SourceSignal（technical）
-    3. 接受可选的外部 SourceSignal（onchain / sentiment）
+    3. 接受可选的外部 SourceSignal（onchain / sentiment / microstructure / rl）
     4. 委托 OmniSignalFusion 做多源融合
     5. 返回 FusionDecision（可直接传给策略层）
 - 完全向后兼容：不传外部 source 时，退化为 technical-only 融合
   （等价于 Phase 1 MetaLearner 输出）
+
+Phase 3 新增 source（W19-W21）：
+    microstructure：来自 MicroFeatureBuilder + 规则评分器的订单簿 Alpha 信号
+                    source_name="microstructure"，高更新频率（tick 级）
+    rl：            来自 RL policy 推理的置信度信号（只有通过 paper/shadow 晋升的
+                    policy 才应传入），source_name="rl"
 
 接口：
     MetaLearnerV2Config(meta_config, fusion_config)
     MetaLearnerV2(config)
         .fuse(votes, external_signals=None, risk_snapshot=None) -> FusionDecision
         .fuse_from_meta_signal(meta_signal, external_signals=None, risk_snapshot=None) -> FusionDecision
+        .fuse_with_phase3_sources(votes, microstructure_signal=None, rl_signal=None,
+                                   other_signals=None, risk_snapshot=None) -> FusionDecision
         .diagnostics() -> dict
 
 日志标签：[MetaV2]
@@ -158,6 +166,7 @@ class MetaLearnerV2:
         Args:
             meta_signal:      Phase 1 MetaLearner.fuse() 的输出
             external_signals: 可选的外部 SourceSignal 列表
+                              （onchain / sentiment / microstructure / rl）
             risk_snapshot:    可选的风险状态字典
 
         Returns:
@@ -173,6 +182,54 @@ class MetaLearnerV2:
             all_signals.extend(external_signals)
 
         return self._fusion.fuse(all_signals, risk_snapshot=risk_snapshot)
+
+    def fuse_with_phase3_sources(
+        self,
+        votes: List[ModelVote],
+        microstructure_signal: Optional[SourceSignal] = None,
+        rl_signal: Optional[SourceSignal] = None,
+        other_signals: Optional[List[SourceSignal]] = None,
+        risk_snapshot: Optional[Mapping[str, Any]] = None,
+    ) -> FusionDecision:
+        """
+        Phase 3 便捷融合入口：明确接受 microstructure 和 rl 源。
+
+        设计意图：
+        - microstructure_signal 来自 MicroFeatureBuilder + 规则评分器，
+          应在 tick 级别以 source_name="microstructure" 传入。
+        - rl_signal 来自 RL policy 推理的置信度输出，
+          只有已通过 paper/shadow 晋升的 policy 才应传入，
+          以 source_name="rl" 传入。
+        - 两者均为可选：未传入时自动跳过，不影响融合结果。
+        - other_signals 可继续传入 onchain / sentiment 等 Phase 2 信号。
+
+        Args:
+            votes:                 Phase 1 ModelEnsemble.predict() 的 ModelVote 列表
+            microstructure_signal: 订单簿微观结构 Alpha 信号（可选）
+            rl_signal:             RL policy 置信度信号（可选）
+            other_signals:         其他外部 SourceSignal（onchain / sentiment 等，可选）
+            risk_snapshot:         可选的风险状态字典
+
+        Returns:
+            FusionDecision
+        """
+        external: list[SourceSignal] = []
+        if other_signals:
+            external.extend(other_signals)
+        if microstructure_signal is not None:
+            external.append(microstructure_signal)
+        if rl_signal is not None:
+            external.append(rl_signal)
+
+        log.debug(
+            "[MetaV2] fuse_with_phase3_sources: n_votes={} has_micro={} has_rl={} "
+            "n_other={}",
+            len(votes),
+            microstructure_signal is not None,
+            rl_signal is not None,
+            len(other_signals) if other_signals else 0,
+        )
+        return self.fuse(votes, external_signals=external or None, risk_snapshot=risk_snapshot)
 
     # ──────────────────────────────────────────────────────────────
     # 诊断

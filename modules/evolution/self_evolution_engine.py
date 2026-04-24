@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from core.logger import get_logger
+from modules.monitoring.trace import generate_trace_id, get_recorder
 from modules.alpha.contracts.evolution_types import (
     CandidateStatus,
     CandidateType,
@@ -229,8 +230,16 @@ class SelfEvolutionEngine:
         if not self._scheduler.should_run(force=force):
             return None
 
+        _trace_id = generate_trace_id("ev")
         period_start = datetime.now(tz=timezone.utc)
-        log.info("[Evolution] 演进周期开始: period_start={}", period_start.isoformat())
+        log.info(
+            "[Evolution] 演进周期开始: trace_id={} period_start={}",
+            _trace_id, period_start.isoformat(),
+        )
+        get_recorder().record(_trace_id, "ev", "CYCLE_START", {
+            "period_start": period_start.isoformat(),
+            "force": force,
+        })
 
         all_decisions: list[PromotionDecision] = []
         promotions = 0
@@ -273,7 +282,16 @@ class SelfEvolutionEngine:
                 retirements=retirements,
             )
 
-            log.info("[Evolution] 演进周期完成: {}", report.summary())
+            log.info(
+                "[Evolution] 演进周期完成: trace_id={} {}",
+                _trace_id, report.summary(),
+            )
+            get_recorder().record(_trace_id, "ev", "CYCLE_END", {
+                "period_start": period_start.isoformat(),
+                "promotions": promotions,
+                "retirements": retirements,
+                "decisions": len(all_decisions),
+            })
             return report
 
         except Exception as e:

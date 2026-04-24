@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from core.logger import get_logger
+from modules.monitoring.trace import generate_trace_id, get_recorder
 from modules.alpha.contracts.mm_types import (
     ActiveQuote,
     FillRecord,
@@ -109,6 +110,7 @@ class MarketMakingStrategy:
             or f"storage/quote_state_{self.config.symbol.replace('/', '_')}.json"
         )
         self._store = QuoteStateStore(store_path)
+        self._last_trace_id: str = ""  # 最近一次 tick 的 trace_id（供 _halt_decision 使用）
 
         log.info(
             "[MarketMaking] 策略初始化: symbol={} exchange={} paper_mode={}",
@@ -140,6 +142,8 @@ class MarketMakingStrategy:
         """
         with self._lock:
             self._tick_count += 1
+            _trace_id = generate_trace_id("mm", self.config.symbol)
+            self._last_trace_id = _trace_id  # 供 halt 路径使用
 
             # 步骤 1：风险拦截
             if not risk_snapshot.is_safe_to_trade():
@@ -183,9 +187,10 @@ class MarketMakingStrategy:
             )
 
             log.debug(
-                "[MarketMaking] tick#{}: symbol={} mid={:.4f} reservation={:.4f} "
-                "spread_bps={:.2f} bid={} ask={}",
+                "[MarketMaking] tick#{}: trace_id={} symbol={} mid={:.4f} "
+                "reservation={:.4f} spread_bps={:.2f} bid={} ask={}",
                 self._tick_count,
+                _trace_id,
                 self.config.symbol,
                 mid,
                 intent.reservation_price,
@@ -193,6 +198,19 @@ class MarketMakingStrategy:
                 f"{decision.bid_price:.4f}" if decision.bid_price else "N/A",
                 f"{decision.ask_price:.4f}" if decision.ask_price else "N/A",
             )
+
+            # trace 记录决策结果
+            get_recorder().record(_trace_id, "mm", "TICK_END", {
+                "symbol": self.config.symbol,
+                "tick": self._tick_count,
+                "mid": mid,
+                "reservation": intent.reservation_price,
+                "bid": decision.bid_price,
+                "ask": decision.ask_price,
+                "allow_bid": decision.allow_post_bid,
+                "allow_ask": decision.allow_post_ask,
+                "spread_bps": decision.optimal_spread_bps,
+            })
 
             # 步骤 6：paper 模式 fill 仿真
             if self.config.paper_mode:
@@ -286,7 +304,7 @@ class MarketMakingStrategy:
     def _halt_decision(
         self, reason: str, risk_snapshot: RiskSnapshot
     ) -> QuoteDecision:
-        """生成一个 HALT（全面禁止）的空 QuoteDecision。"""
+        """生成一个 HALT（全面禁止）的空 QuoteDecision，并写入 trace 事件。"""
         log.warning(
             "[MarketMaking] HALT: symbol={} reason={} circuit_broken={} kill_switch={}",
             self.config.symbol,
@@ -294,6 +312,13 @@ class MarketMakingStrategy:
             risk_snapshot.circuit_broken,
             risk_snapshot.kill_switch_active,
         )
+        # trace 注入（halt 路径也记录，以保证可观测性完整）
+        if self._last_trace_id:
+            get_recorder().record(self._last_trace_id, "mm", "TICK_HALT", {
+                "symbol": self.config.symbol,
+                "tick": self._tick_count,
+                "reason": reason,
+            })
         return QuoteDecision(
             symbol=self.config.symbol,
             bid_price=None,

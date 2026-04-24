@@ -450,3 +450,279 @@ class TestMetaLearnerV2:
         assert decision.final_action == "BUY"
         source_names = {s.source_name for s in decision.source_signals}
         assert source_names == {"technical", "onchain", "sentiment"}
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 3 扩展测试：microstructure / rl source + Phase3Config
+# ─────────────────────────────────────────────────────────────
+
+class TestOmniSignalFusionPhase3:
+    """验证 OmniSignalFusion 对 microstructure / rl source 的支持。"""
+
+    def test_microstructure_base_weight_default(self):
+        cfg = OmniSignalFusionConfig()
+        assert cfg.microstructure_base_weight == pytest.approx(0.6)
+
+    def test_rl_base_weight_default(self):
+        cfg = OmniSignalFusionConfig()
+        assert cfg.rl_base_weight == pytest.approx(0.4)
+
+    def test_base_weight_microstructure(self):
+        cfg = OmniSignalFusionConfig(microstructure_base_weight=0.7)
+        assert cfg.base_weight("microstructure") == pytest.approx(0.7)
+
+    def test_base_weight_rl(self):
+        cfg = OmniSignalFusionConfig(rl_base_weight=0.5)
+        assert cfg.base_weight("rl") == pytest.approx(0.5)
+
+    def test_microstructure_signal_participates_in_fusion(self):
+        """microstructure source 参与融合，且影响 aggregate_score。"""
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.10,
+            technical_base_weight=1.0,
+            microstructure_base_weight=0.6,
+        )
+        fusion = OmniSignalFusion(cfg)
+        tech = make_source_signal("technical", "BUY", score=0.15)   # 勉强过 threshold
+        micro = make_source_signal("microstructure", "BUY", score=0.5)
+        decision = fusion.fuse([tech, micro])
+        assert decision.final_action == "BUY"
+        source_names = {s.source_name for s in decision.source_signals}
+        assert "microstructure" in source_names
+
+    def test_rl_signal_participates_in_fusion(self):
+        """rl source 参与融合，且影响 aggregate_score。"""
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.10,
+            technical_base_weight=1.0,
+            rl_base_weight=0.4,
+        )
+        fusion = OmniSignalFusion(cfg)
+        tech = make_source_signal("technical", "BUY", score=0.15)
+        rl = make_source_signal("rl", "BUY", score=0.6)
+        decision = fusion.fuse([tech, rl])
+        assert decision.final_action == "BUY"
+        source_names = {s.source_name for s in decision.source_signals}
+        assert "rl" in source_names
+
+    def test_stale_microstructure_zeroed_out(self):
+        """stale microstructure 不影响结果，融合仍由 technical 主导。"""
+        fusion = OmniSignalFusion()
+        tech = make_source_signal("technical", "BUY", score=0.6)
+        micro_stale = make_source_signal("microstructure", "SELL", score=-0.9,
+                                          freshness_ok=False)
+        decision = fusion.fuse([tech, micro_stale])
+        assert decision.final_action == "BUY"
+
+    def test_stale_rl_zeroed_out(self):
+        """stale rl source 不影响结果。"""
+        fusion = OmniSignalFusion()
+        tech = make_source_signal("technical", "SELL", score=-0.6)
+        rl_stale = make_source_signal("rl", "BUY", score=0.9, freshness_ok=False)
+        decision = fusion.fuse([tech, rl_stale])
+        assert decision.final_action == "SELL"
+
+    def test_high_risk_reduces_microstructure_weight(self):
+        """高风险状态下 microstructure source 被压制（与 onchain/sentiment 同规则）。"""
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.15,
+            sell_threshold=-0.15,
+            technical_base_weight=1.0,
+            microstructure_base_weight=1.0,
+            risk_penalty_factor=0.0,  # 完全压制非 technical source
+        )
+        fusion = OmniSignalFusion(cfg)
+        tech = make_source_signal("technical", "BUY", score=0.5)
+        micro = make_source_signal("microstructure", "SELL", score=-0.9)
+        risk = {"current_drawdown": 0.10, "kill_switch_active": False}
+        decision = fusion.fuse([tech, micro], risk_snapshot=risk)
+        assert decision.final_action == "BUY"
+
+    def test_five_source_fusion(self):
+        """所有五个 source 同时参与融合无崩溃。"""
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.12,
+            technical_base_weight=1.0,
+            onchain_base_weight=0.5,
+            sentiment_base_weight=0.5,
+            microstructure_base_weight=0.6,
+            rl_base_weight=0.4,
+        )
+        fusion = OmniSignalFusion(cfg)
+        signals = [
+            make_source_signal("technical", "BUY", score=0.4),
+            make_source_signal("onchain", "BUY", score=0.3),
+            make_source_signal("sentiment", "BUY", score=0.2),
+            make_source_signal("microstructure", "BUY", score=0.5),
+            make_source_signal("rl", "BUY", score=0.4),
+        ]
+        decision = fusion.fuse(signals)
+        assert decision.final_action == "BUY"
+        assert len(decision.source_signals) == 5
+
+    def test_config_negative_microstructure_weight_raises(self):
+        with pytest.raises(ValueError):
+            OmniSignalFusionConfig(microstructure_base_weight=-0.1)
+
+    def test_config_negative_rl_weight_raises(self):
+        with pytest.raises(ValueError):
+            OmniSignalFusionConfig(rl_base_weight=-0.1)
+
+    def test_diagnostics_after_phase3_fusion(self):
+        fusion = OmniSignalFusion()
+        fusion.fuse([
+            make_source_signal("technical", score=0.4),
+            make_source_signal("microstructure", score=0.3),
+            make_source_signal("rl", score=0.2),
+        ])
+        diag = fusion.diagnostics()
+        assert diag["n_fuse_calls"] == 1
+
+
+class TestMetaLearnerV2Phase3:
+    """验证 MetaLearnerV2 的 Phase 3 新接口 fuse_with_phase3_sources。"""
+
+    def _make_v2(self) -> MetaLearnerV2:
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.12,
+            technical_base_weight=1.0,
+            microstructure_base_weight=0.6,
+            rl_base_weight=0.4,
+        )
+        return MetaLearnerV2(MetaLearnerV2Config(fusion_config=cfg))
+
+    def test_fuse_with_microstructure_only(self):
+        v2 = self._make_v2()
+        votes = make_votes(n=2, action="BUY", prob=0.75)
+        micro = SourceSignal.from_score("microstructure", score=0.5, freshness_ok=True)
+        decision = v2.fuse_with_phase3_sources(votes, microstructure_signal=micro)
+        assert decision.final_action == "BUY"
+        assert "microstructure" in {s.source_name for s in decision.source_signals}
+
+    def test_fuse_with_rl_only(self):
+        v2 = self._make_v2()
+        votes = make_votes(n=2, action="BUY", prob=0.75)
+        rl = SourceSignal.from_score("rl", score=0.4, freshness_ok=True)
+        decision = v2.fuse_with_phase3_sources(votes, rl_signal=rl)
+        assert decision.final_action == "BUY"
+        assert "rl" in {s.source_name for s in decision.source_signals}
+
+    def test_fuse_with_all_phase3_sources(self):
+        """microstructure + rl + other_signals 同时传入。"""
+        cfg = OmniSignalFusionConfig(
+            buy_threshold=0.12,
+            technical_base_weight=1.0,
+            onchain_base_weight=0.5,
+            microstructure_base_weight=0.6,
+            rl_base_weight=0.4,
+        )
+        v2 = MetaLearnerV2(MetaLearnerV2Config(fusion_config=cfg))
+        votes = make_votes(n=2, action="BUY", prob=0.75)
+        micro = SourceSignal.from_score("microstructure", score=0.5)
+        rl = SourceSignal.from_score("rl", score=0.3)
+        oc = SourceSignal.from_score("onchain", score=0.3)
+        decision = v2.fuse_with_phase3_sources(
+            votes,
+            microstructure_signal=micro,
+            rl_signal=rl,
+            other_signals=[oc],
+        )
+        assert decision.final_action == "BUY"
+        source_names = {s.source_name for s in decision.source_signals}
+        assert "microstructure" in source_names
+        assert "rl" in source_names
+        assert "onchain" in source_names
+
+    def test_fuse_with_no_phase3_sources_backward_compat(self):
+        """不传任何 Phase 3 source 时行为与 fuse() 一致。"""
+        v2 = self._make_v2()
+        votes = make_votes(n=2, action="BUY", prob=0.75)
+        decision = v2.fuse_with_phase3_sources(votes)
+        # 只有 technical source 参与
+        assert decision.final_action == "BUY"
+        assert "technical" in {s.source_name for s in decision.source_signals}
+
+    def test_stale_phase3_sources_ignored(self):
+        """stale microstructure 和 rl 不干扰融合结果。"""
+        v2 = self._make_v2()
+        votes = make_votes(n=2, action="BUY", prob=0.75)
+        micro_stale = SourceSignal.from_score("microstructure", score=-0.9,
+                                               freshness_ok=False)
+        rl_stale = SourceSignal.from_score("rl", score=-0.9, freshness_ok=False)
+        decision = v2.fuse_with_phase3_sources(
+            votes,
+            microstructure_signal=micro_stale,
+            rl_signal=rl_stale,
+        )
+        assert decision.final_action == "BUY"
+
+    def test_diagnostics_after_phase3_fuse(self):
+        v2 = self._make_v2()
+        votes = make_votes(n=2)
+        micro = SourceSignal.from_score("microstructure", score=0.3)
+        v2.fuse_with_phase3_sources(votes, microstructure_signal=micro)
+        diag = v2.diagnostics()
+        assert diag["n_calls"] == 1
+
+
+class TestPhase3Config:
+    """验证 Phase3Config 从 YAML 加载正确。"""
+
+    def test_load_config_has_phase3(self):
+        from core.config import load_config
+        cfg = load_config()
+        assert hasattr(cfg, "phase3")
+
+    def test_phase3_defaults(self):
+        from core.config import Phase3Config
+        p3 = Phase3Config()
+        assert p3.enabled is True
+        assert p3.realtime_feed_enabled is False
+        assert p3.market_making_enabled is False
+        assert p3.rl_agent_enabled is False
+        assert p3.self_evolution_enabled is False
+
+    def test_phase3_subconfig_realtime_feed(self):
+        from core.config import Phase3RealtimeFeedConfig
+        rtf = Phase3RealtimeFeedConfig()
+        assert rtf.reconnect_backoff_sec > 0
+        assert rtf.orderbook_depth_levels > 0
+        assert rtf.snapshot_recovery_enabled is True
+
+    def test_phase3_subconfig_market_making(self):
+        from core.config import Phase3MarketMakingConfig
+        mm = Phase3MarketMakingConfig()
+        assert 0 < mm.risk_aversion_gamma < 1
+        assert 0 < mm.max_inventory_pct < 1
+        assert mm.maker_only is True
+
+    def test_phase3_subconfig_rl(self):
+        from core.config import Phase3RLConfig
+        rl = Phase3RLConfig()
+        assert rl.training_enabled is False
+        assert rl.policy_mode == "shadow"
+        assert 0 < rl.action_confidence_floor < 1
+
+    def test_phase3_subconfig_evolution(self):
+        from core.config import Phase3EvolutionConfig
+        ev = Phase3EvolutionConfig()
+        assert ev.shadow_days >= 1
+        assert ev.paper_days >= 1
+        assert ev.promote_min_sharpe > 0
+        assert ev.auto_rollback_enabled is True
+
+    def test_phase3_subconfig_logging(self):
+        from core.config import Phase3LoggingConfig
+        lg = Phase3LoggingConfig()
+        assert lg.trace_sample_rate == pytest.approx(1.0)
+
+    def test_yaml_phase3_values_loaded(self):
+        """验证 YAML 中的 phase3 块值被正确读取。"""
+        from core.config import load_config
+        cfg = load_config()
+        # YAML 设置的值
+        assert cfg.phase3.market_making.risk_aversion_gamma == pytest.approx(0.12)
+        assert cfg.phase3.rl.policy_mode == "shadow"
+        assert cfg.phase3.evolution.promote_min_sharpe == pytest.approx(0.8)
+        assert cfg.phase3.realtime_feed.orderbook_depth_levels == 20
+

@@ -29,6 +29,7 @@ from typing import Any, Optional
 import numpy as np
 
 from core.logger import get_logger
+from modules.monitoring.trace import generate_trace_id, get_recorder
 
 log = get_logger(__name__)
 
@@ -238,6 +239,22 @@ class PPOAgent:
         confidence = float(probs[idx])
         log_prob = float(np.log(max(probs[idx], 1e-10)))
         action_value = confidence  # v1 中 action_value = confidence
+
+        # trace 注入：记录每次 predict 的决策摘要
+        _trace_id = generate_trace_id("rl")
+        log.debug(
+            "[RLPolicy] predict: trace_id={} action_idx={} confidence={:.3f} "
+            "log_prob={:.4f} deterministic={}",
+            _trace_id, idx, confidence, log_prob, deterministic,
+        )
+        get_recorder().record(_trace_id, "rl", "RL_PREDICT", {
+            "action_idx": idx,
+            "action_value": action_value,
+            "confidence": confidence,
+            "log_prob": log_prob,
+            "deterministic": deterministic,
+            "version": self._version,
+        })
 
         return idx, action_value, confidence, log_prob
 

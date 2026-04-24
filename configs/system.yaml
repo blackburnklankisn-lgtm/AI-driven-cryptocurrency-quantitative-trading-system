@@ -84,3 +84,54 @@ continuous_learning:
 logging:
   log_level: INFO
   log_dir: "./logs"
+
+# ---------------------------
+# Phase 3 高级策略 + 自进化配置
+# 所有 *_enabled 开关默认关闭，确保 Phase 1/2 路径不受影响。
+# 在 replay/paper 验证通过后再逐步开启。
+# ---------------------------
+phase3:
+  enabled: true
+  realtime_feed_enabled: false
+  market_making_enabled: false
+  rl_agent_enabled: false
+  self_evolution_enabled: false
+
+  realtime_feed:
+    reconnect_backoff_sec: 2
+    heartbeat_timeout_sec: 15
+    orderbook_depth_levels: 20
+    snapshot_recovery_enabled: true
+    max_gap_tolerance: 1
+
+  market_making:
+    risk_aversion_gamma: 0.12
+    max_inventory_pct: 0.20
+    quote_refresh_ms: 1500
+    cancel_on_gap: true
+    max_quote_age_sec: 10
+    maker_only: true
+
+  rl:
+    training_enabled: false
+    policy_mode: shadow
+    reward_drawdown_penalty: 2.0
+    reward_turnover_penalty: 0.2
+    action_confidence_floor: 0.55
+    max_episode_steps: 1000
+
+  evolution:
+    weekly_optimization_cron: "0 3 * * 0"
+    shadow_days: 7
+    paper_days: 7
+    ab_min_samples: 100
+    promote_min_sharpe: 0.8
+    retire_max_drawdown: 0.10
+    auto_rollback_enabled: true
+
+  logging:
+    realtime_debug: true
+    market_making_debug: true
+    rl_debug: true
+    evolution_debug: true
+    trace_sample_rate: 1.0
