@@ -66,6 +66,12 @@ class EventType(Enum):
     SYSTEM_SHUTDOWN = auto()        # 系统关机
     HEARTBEAT = auto()              # 心跳（定时触发）
 
+    # Phase 3 实时数据层事件
+    ORDER_BOOK_SNAPSHOT = auto()    # 订单簿快照（序列一致后发布）
+    TRADE_TICK = auto()             # 单笔成交记录
+    FEED_HEALTH_CHANGED = auto()    # 数据流健康状态变化（HEALTHY / DEGRADED）
+    MICRO_FEATURE_COMPUTED = auto() # 微观结构特征计算完成
+
 
 # ══════════════════════════════════════════════════════════════
 # 二、事件基类与具体事件数据类
@@ -147,6 +153,80 @@ class RiskBreachedEvent(BaseEvent):
 class HeartbeatEvent(BaseEvent):
     """系统心跳事件，由调度器定期发出。"""
     sequence: int
+
+
+# ── Phase 3 实时数据层事件 ──────────────────────────────────
+
+@dataclass(frozen=True)
+class OrderBookSnapshotEvent(BaseEvent):
+    """
+    订单簿快照事件（序列一致性保证后发布）。
+
+    策略层消费此事件时，gap_status 保证为 OK 或 RECOVERED。
+    """
+    symbol: str
+    exchange: str
+    sequence_id: int
+    best_bid: float
+    best_ask: float
+    spread_bps: float
+    mid_price: float
+    imbalance: float            # ∈ [-1, 1]，正值偏买
+    depth_levels: int           # 有效档位数量（bid + ask 合计）
+    is_gap_recovered: bool = False
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TradeTickEvent(BaseEvent):
+    """
+    单笔成交记录事件（taker 成交方向）。
+    """
+    symbol: str
+    exchange: str
+    trade_id: str
+    side: str               # "buy" | "sell" | "unknown"
+    price: float
+    size: float
+    notional: float         # price × size
+    is_liquidation: bool = False
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeedHealthChangedEvent(BaseEvent):
+    """
+    数据流健康状态变化事件。
+
+    由 SubscriptionManager 在 HEALTHY ↔ DEGRADED 切换时发出。
+    上层可据此降级到低频数据，避免使用脏快照。
+    """
+    exchange: str
+    health: str             # "healthy" | "degraded" | "stopped"
+    subscribed_symbols: list[str]
+    reconnect_count: int
+    detail: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MicroFeatureComputedEvent(BaseEvent):
+    """
+    微观结构特征计算完成事件。
+
+    feature_vector 与 feature_names 一一对应，NaN 表示特征缺失。
+    """
+    symbol: str
+    mb_spread_bps: float
+    mb_order_imbalance: float
+    mb_micro_price: float
+    mb_book_pressure_ratio: float
+    mb_trade_flow_imbalance: float
+    mb_vwap_vs_mid: float
+    mb_liq_ratio: float
+    mb_spread_tightness: float
+    is_book_healthy: bool
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════

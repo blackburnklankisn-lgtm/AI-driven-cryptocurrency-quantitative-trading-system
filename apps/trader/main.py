@@ -48,6 +48,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from core.config import load_config
 from core.event import EventBus, EventType, KlineEvent, OrderRequestEvent
 from core.logger import audit_log, get_logger, setup_logging, trade_log
+from modules.alpha.runtime import AlphaRuntime, StrategyRegistry, BaseAlphaAdapter
+from modules.alpha.contracts import RegimeState
 from modules.execution.gateway import CCXTGateway
 from modules.execution.order_manager import OrderManager
 from modules.monitoring.metrics import SystemMetrics
@@ -128,6 +130,18 @@ class LiveTrader:
 
         # ── 6. 策略列表（外部注入） ───────────────────────────────
         self._strategies = []
+        
+        # ── 6b. Phase 1 AlphaRuntime 及 StrategyRegistry ────────
+        self._strategy_registry = StrategyRegistry()
+        self._alpha_runtime = AlphaRuntime(
+            registry=self._strategy_registry,
+            debug_enabled=bool(os.getenv("DEBUG_ALPHA_RUNTIME", False)),
+        )
+        # 默认 regime（初始状态）
+        self._current_regime = RegimeState(
+            bull_prob=0.33, bear_prob=0.33, sideways_prob=0.34,
+            high_vol_prob=0.0, confidence=0.5, dominant_regime="sideways"
+        )
 
         # 运行状态
         self._positions: Dict[str, Decimal] = {}
@@ -209,9 +223,29 @@ class LiveTrader:
     def add_strategy(self, strategy_obj) -> None:
         """
         注册策略对象（需实现 on_kline(event) → List[OrderRequestEvent]）。
+        
+        新增（Phase 1）：策略会自动包装为 BaseAlphaAdapter 并注册到 AlphaRuntime，
+        同时仍保留在 self._strategies 列表中以保持向后兼容性。
         """
+        # 向后兼容：保留在旧列表中
         self._strategies.append(strategy_obj)
-        log.info("注册实盘策略: {}", getattr(strategy_obj, "strategy_id", type(strategy_obj).__name__))
+        
+        # Phase 1 新增：包装为 StrategyProtocol 并注册到 AlphaRuntime
+        strategy_id = getattr(strategy_obj, "strategy_id", type(strategy_obj).__name__)
+        wrapped_strategy = BaseAlphaAdapter(strategy=strategy_obj)
+        
+        # 获取策略适用的交易品种
+        target_symbols = getattr(strategy_obj, "symbols", [])
+        if not target_symbols:
+            target_symbols = self.sys_config.data.default_symbols
+        
+        # 注册到 AlphaRuntime
+        self._strategy_registry.register(wrapped_strategy)
+        
+        log.info(
+            "注册实盘策略: strategy_id={} symbols={} (已包装为 StrategyProtocol)",
+            strategy_id, target_symbols
+        )
 
     # ────────────────────────────────────────────────────────────
     # 主控流程
@@ -558,6 +592,8 @@ class LiveTrader:
     def _process_kline_event(self, event: KlineEvent) -> None:
         """
         处理 KlineEvent：通知策略 → 风控审核 → 提交订单。
+        
+        新增（Phase 1）：使用 AlphaRuntime 处理所有策略，而不是直接循环。
         """
         # 发布到事件总线（其他订阅者可扩展）
         self.bus.publish(event)
@@ -566,14 +602,47 @@ class LiveTrader:
         if self._current_equity > 0:
             self.risk_manager.update_equity(self._current_equity)
 
-        # 驱动所有策略
-        for strategy in self._strategies:
-            try:
-                order_requests = strategy.on_kline(event)
-                for req in (order_requests or []):
-                    self._process_order_request(req, self._current_equity)
-            except Exception:  # noqa: BLE001
-                log.exception("策略异常: strategy={}", getattr(strategy, "strategy_id", "unknown"))
+        # Phase 1: 驱动所有策略通过 AlphaRuntime
+        try:
+            # 准备上下文和最新价格
+            latest_prices = dict(self._latest_prices)
+            latest_prices[event.symbol] = float(event.close)
+            
+            # 通过 AlphaRuntime 处理 K 线事件
+            context, strategy_results = self._alpha_runtime.process_bar(
+                event=event,
+                latest_prices=latest_prices,
+                regime=self._current_regime,
+                portfolio_snapshot={
+                    "positions": dict(self._positions),
+                    "equity": self._current_equity,
+                    "entry_prices": dict(self._entry_prices),
+                },
+            )
+            
+            # 从结果中提取 OrderRequestEvent 列表
+            order_requests = AlphaRuntime.collect_order_requests(strategy_results)
+            
+            # 处理所有生成的订单请求
+            for req in order_requests:
+                self._process_order_request(req, self._current_equity)
+                
+            log.debug(
+                "[AlphaRuntime] symbol={} trace_id={} strategies={} orders={}",
+                event.symbol, context.trace_id, len(strategy_results), len(order_requests)
+            )
+            
+        except Exception:  # noqa: BLE001
+            log.exception("AlphaRuntime 处理异常: symbol={}", event.symbol)
+            
+            # 回退：直接调用策略（向后兼容）
+            for strategy in self._strategies:
+                try:
+                    order_requests = strategy.on_kline(event)
+                    for req in (order_requests or []):
+                        self._process_order_request(req, self._current_equity)
+                except Exception:  # noqa: BLE001
+                    log.exception("策略异常（回退模式）: strategy={}", getattr(strategy, "strategy_id", "unknown"))
 
     def _process_order_request(self, req: OrderRequestEvent, equity: float) -> None:
         """
@@ -1019,11 +1088,25 @@ class LiveTrader:
                             learner._bars_since_retrain += 1
 
                     # 只驱动策略内部状态更新，不触发下单
-                    for strategy in self._strategies:
-                        try:
-                            strategy.on_kline(event)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    # Phase 1: 使用 AlphaRuntime 驱动（但预加载期不处理订单）
+                    try:
+                        _, _ = self._alpha_runtime.process_bar(
+                            event=event,
+                            latest_prices=dict(self._latest_prices),
+                            regime=self._current_regime,
+                            portfolio_snapshot={
+                                "positions": dict(self._positions),
+                                "equity": self._current_equity,
+                                "entry_prices": dict(self._entry_prices),
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        # 回退：直接调用策略进行预加载状态初始化
+                        for strategy in self._strategies:
+                            try:
+                                strategy.on_kline(event)
+                            except Exception:  # noqa: BLE001
+                                pass
 
                 # 更新最新价格和 prev_closes
                 _, _, _, _, last_c, _ = candles[-1]
