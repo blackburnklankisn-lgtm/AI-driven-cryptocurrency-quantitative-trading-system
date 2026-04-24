@@ -37,6 +37,7 @@ dependencies = [
     "scikit-learn>=1.4",
     "xgboost>=2.0",
     "lightgbm>=4.3",
+    "optuna>=3.6",
 ]
 
 [project.optional-dependencies]

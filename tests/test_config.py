@@ -87,6 +87,14 @@ class TestLoadConfig:
         cfg2 = get_config()
         assert cfg1 is cfg2
 
+    def test_external_source_defaults_load(self, minimal_yaml: Path) -> None:
+        """Phase 2 外部源默认配置应可正常加载。"""
+        config = load_config(minimal_yaml)
+        assert config.data.onchain_enabled is True
+        assert config.data.onchain_provider == "public"
+        assert config.data.sentiment_enabled is True
+        assert config.data.sentiment_provider == "htx"
+
 
 class TestRiskConfig:
     def test_valid_risk_params(self) -> None:

@@ -110,6 +110,13 @@ class DataConfig(BaseSettings):
     default_symbols: list[str] = ["BTC/USDT", "ETH/USDT"]
     # 历史数据存储根目录（相对路径）
     storage_dir: str = "./storage"
+    onchain_enabled: bool = True
+    onchain_provider: str = "public"
+    onchain_ttl_sec: int = 43_200
+    sentiment_enabled: bool = True
+    sentiment_provider: str = "htx"
+    sentiment_ttl_sec: int = 3_600
+    external_feature_max_fill_periods: int = 72
 
 
 class PortfolioConfig(BaseSettings):

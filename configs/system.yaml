@@ -33,6 +33,14 @@ data:
     - "ETH/USDT"
     - "SOL/USDT"
   storage_dir: "./storage"
+  # Phase 2 外部源：默认开启真实 public onchain + HTX sentiment
+  onchain_enabled: true
+  onchain_provider: public     # public | glassnode | cryptoquant | mock
+  onchain_ttl_sec: 43200       # public onchain 以日频/低频为主，12h 内复用缓存
+  sentiment_enabled: true
+  sentiment_provider: htx      # htx | alternative_me | cryptocompare | mock
+  sentiment_ttl_sec: 3600      # HTX public derivatives 情绪数据按小时刷新
+  external_feature_max_fill_periods: 72
 
 # ---------------------------
 # 风控硬约束 (此处为默认值，可被 .env 覆盖)

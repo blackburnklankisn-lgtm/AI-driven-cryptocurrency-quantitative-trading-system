@@ -9,6 +9,8 @@ modules/evolution/state_store.py — 演进状态原子持久化
     * 淘汰记录（retirements.jsonl — append-only）
     * 最新演进报告（latest_report.json）
     * 调度器状态（scheduler_state.json）
+    * 周级参数优化状态（weekly_params_optimizer_state.json）
+    * 周级参数优化运行审计（weekly_params_optimizer_runs.jsonl）
 - 线程安全（RLock）
 
 日志标签：[Evolution]
@@ -138,6 +140,37 @@ class EvolutionStateStore:
             return {}
 
     # ─────────────────────────────────────────────
+    # 周级参数优化状态与审计
+    # ─────────────────────────────────────────────
+
+    def save_weekly_params_optimizer_state(self, state: dict[str, Any]) -> None:
+        path = os.path.join(self._dir, "weekly_params_optimizer_state.json")
+        self._atomic_write(path, state)
+
+    def load_weekly_params_optimizer_state(self) -> dict[str, Any]:
+        path = os.path.join(self._dir, "weekly_params_optimizer_state.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            log.exception("[Evolution] 周级参数优化状态加载失败")
+            return {}
+
+    def append_weekly_params_optimizer_run(self, record: dict[str, Any]) -> None:
+        path = os.path.join(self._dir, "weekly_params_optimizer_runs.jsonl")
+        line = json.dumps(record, default=_json_default, ensure_ascii=False)
+        self._append_line(path, line)
+
+    def load_weekly_params_optimizer_runs(
+        self,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        path = os.path.join(self._dir, "weekly_params_optimizer_runs.jsonl")
+        return self._load_jsonl_tail(path, limit)
+
+    # ─────────────────────────────────────────────
     # 通用辅助
     # ─────────────────────────────────────────────
 
@@ -187,6 +220,14 @@ class EvolutionStateStore:
         decisions_path = os.path.join(self._dir, "decisions.jsonl")
         retirements_path = os.path.join(self._dir, "retirements.jsonl")
         report_path = os.path.join(self._dir, "latest_report.json")
+        weekly_params_state_path = os.path.join(
+            self._dir,
+            "weekly_params_optimizer_state.json",
+        )
+        weekly_params_runs_path = os.path.join(
+            self._dir,
+            "weekly_params_optimizer_runs.jsonl",
+        )
 
         def _line_count(p: str) -> int:
             if not os.path.exists(p):
@@ -202,4 +243,10 @@ class EvolutionStateStore:
             "total_decisions": _line_count(decisions_path),
             "total_retirements": _line_count(retirements_path),
             "has_latest_report": os.path.exists(report_path),
+            "has_weekly_params_optimizer_state": os.path.exists(
+                weekly_params_state_path
+            ),
+            "total_weekly_params_optimizer_runs": _line_count(
+                weekly_params_runs_path
+            ),
         }

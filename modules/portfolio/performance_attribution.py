@@ -194,6 +194,71 @@ class PerformanceAttributor:
             df = df.sort_values("total_pnl_usdt", ascending=False).reset_index(drop=True)
         return df
 
+    def get_strategy_evolution_metrics(
+        self,
+        strategy_id: str,
+        min_sell_trades: int = 5,
+    ) -> Dict[str, float]:
+        """
+        生成供 SelfEvolutionEngine 消费的保守策略指标快照。
+
+        指标基于已实现卖出成交计算；卖出样本过少时返回空，避免稀疏样本误触发晋升。
+        """
+        trades = self._strategy_trades.get(strategy_id, [])
+        sell_trades = [t for t in trades if t.side == "sell"]
+        if len(sell_trades) < min_sell_trades:
+            return {}
+
+        pnl_series = np.array([float(t.pnl) for t in sell_trades], dtype=float)
+        notional_series = np.array(
+            [max(float(t.notional), 1.0) for t in sell_trades],
+            dtype=float,
+        )
+        return_series = pnl_series / notional_series
+
+        mean_ret = float(np.mean(return_series))
+        std_ret = float(np.std(return_series, ddof=1)) if len(return_series) > 1 else 0.0
+        if std_ret > 1e-12:
+            sharpe_proxy = mean_ret / std_ret * float(np.sqrt(len(return_series)))
+        elif abs(mean_ret) > 1e-12:
+            sharpe_proxy = float(np.sign(mean_ret) * min(np.sqrt(len(return_series)), 3.0))
+        else:
+            sharpe_proxy = 0.0
+
+        base_equity = max(float(np.sum(notional_series)), 1.0)
+        equity_curve = base_equity + np.cumsum(pnl_series)
+        rolling_peak = np.maximum.accumulate(np.concatenate(([base_equity], equity_curve)))
+        drawdown = (rolling_peak[1:] - equity_curve) / np.maximum(rolling_peak[1:], 1.0)
+        max_drawdown = float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
+
+        winning = sum(1 for t in sell_trades if t.pnl > 0)
+        win_rate = winning / len(sell_trades)
+
+        return {
+            "strategy_id": strategy_id,
+            "sell_trades": float(len(sell_trades)),
+            "sharpe_30d": round(sharpe_proxy, 6),
+            "max_drawdown_30d": round(max_drawdown, 6),
+            "win_rate_30d": round(win_rate, 6),
+            "total_realized_pnl_usdt": round(float(np.sum(pnl_series)), 4),
+        }
+
+    def get_strategy_realized_trade_pnls(
+        self,
+        strategy_id: str,
+        *,
+        limit: Optional[int] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[float]:
+        """返回策略历史卖出成交的已实现 PnL 序列。"""
+        trades = self._strategy_trades.get(strategy_id, [])
+        sell_trades = [t for t in trades if t.side == "sell"]
+        if end_time is not None:
+            sell_trades = [t for t in sell_trades if t.timestamp <= end_time]
+        if limit is not None and limit > 0:
+            sell_trades = sell_trades[-limit:]
+        return [float(t.pnl) for t in sell_trades]
+
     def get_asset_attribution(self) -> pd.DataFrame:
         """
         资产维度的绩效归因报告（含未实现盈亏）。

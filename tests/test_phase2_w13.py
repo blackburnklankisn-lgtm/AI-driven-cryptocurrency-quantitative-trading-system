@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -26,6 +27,8 @@ from modules.data.sentiment.feature_builder import (
     SentimentFeatureBuilderConfig,
 )
 from modules.data.sentiment.providers import (
+    AlternativeMeProvider,
+    HtxSentimentProvider,
     MockSentimentProvider,
     SentimentFetchError,
     SentimentRecord,
@@ -132,6 +135,95 @@ class TestMockSentimentProvider:
             record = provider.fetch()
             ema = record.fields["sentiment_score_ema"]
             assert 0.0 <= ema <= 1.0
+
+
+class TestRealSentimentProviders:
+    def test_alternative_me_fetch_parses_payload(self):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "value": "39",
+                            "value_classification": "Fear",
+                            "timestamp": "1776988800",
+                        }
+                    ]
+                }
+
+        provider = AlternativeMeProvider(timeout_sec=1.0)
+        with patch("modules.data.sentiment.providers.requests.get", return_value=_Resp()):
+            record = provider.fetch("BTC")
+
+        assert record.source_name == "alternative_me"
+        assert record.fields["fear_greed_index"] == pytest.approx(39.0)
+        assert record.metadata["classification"] == "Fear"
+
+    def test_htx_provider_builds_sentiment_bundle(self):
+        class _StubFearGreed:
+            provider_name = "alternative_me"
+
+            def fetch(self, symbol: str = "BTC") -> SentimentRecord:
+                return SentimentRecord(
+                    fetched_at=now_utc(),
+                    fields={
+                        "fear_greed_index": 60.0,
+                        "funding_rate_zscore": None,
+                        "long_short_ratio_change": None,
+                        "open_interest_change": None,
+                        "liquidation_imbalance": None,
+                        "sentiment_score_ema": None,
+                    },
+                    source_name="alternative_me",
+                )
+
+        class _StubExchange:
+            def fetch_funding_rate(self, symbol: str):
+                assert symbol == "BTC/USDT:USDT"
+                return {"fundingRate": 0.00012}
+
+            def fetch_funding_rate_history(self, symbol: str, limit: int = 0):
+                return [
+                    {"fundingRate": 0.00005},
+                    {"fundingRate": 0.00008},
+                    {"fundingRate": 0.00010},
+                ]
+
+            def fetch_open_interest(self, symbol: str):
+                return {"openInterestValue": 1200.0}
+
+            def fetch_open_interest_history(self, symbol: str, timeframe: str = "1h", limit: int = 0):
+                return [
+                    {"openInterestValue": 1000.0},
+                    {"openInterestValue": 1100.0},
+                ]
+
+            def fetch_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 0):
+                return [
+                    [1, 0, 0, 0, 100.0, 0],
+                    [2, 0, 0, 0, 101.0, 0],
+                    [3, 0, 0, 0, 102.0, 0],
+                ]
+
+        provider = HtxSentimentProvider(
+            exchange=_StubExchange(),
+            fear_greed_provider=_StubFearGreed(),
+            history_limit=3,
+        )
+        record = provider.fetch("BTC/USDT")
+
+        assert record.source_name == "htx"
+        assert record.fields["fear_greed_index"] == pytest.approx(60.0)
+        assert record.fields["funding_rate_zscore"] is not None
+        assert record.fields["open_interest_change"] is not None
+        assert record.fields["long_short_ratio_change"] is not None
+        assert record.fields["liquidation_imbalance"] is not None
+        assert record.fields["sentiment_score_ema"] is not None
+        assert record.metadata["long_short_ratio_proxy"] is True
+        assert record.metadata["liquidation_proxy"] is True
 
 
 # ─────────────────────────────────────────────────────────────

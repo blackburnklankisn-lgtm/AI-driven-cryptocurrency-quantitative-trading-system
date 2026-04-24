@@ -65,6 +65,11 @@ class FeatureConfig:
     # 是否使用时间特征（日内季节性）
     use_time_features: bool = False
 
+    # 低频外部源透传特征前缀（作为原始特征直接进入 DataKitchen）
+    passthrough_feature_prefixes: List[str] = field(
+        default_factory=lambda: ["oc_", "st_"]
+    )
+
 
 class MLFeatureBuilder:
     """
@@ -174,8 +179,16 @@ class MLFeatureBuilder:
             result["dow_sin"] = np.sin(2 * np.pi * ts.dt.dayofweek / 7)
             result["dow_cos"] = np.cos(2 * np.pi * ts.dt.dayofweek / 7)
 
-        # 记录特征列名
-        non_feature_cols = set(df.columns)  # 原始输入列不是特征
+        # 记录特征列名。外部源特征采用前缀透传，不再视为原始输入列。
+        passthrough_feature_cols = {
+            col
+            for col in df.columns
+            if any(
+                col.startswith(prefix)
+                for prefix in cfg.passthrough_feature_prefixes
+            )
+        }
+        non_feature_cols = set(df.columns) - passthrough_feature_cols
         self._feature_names = [
             c for c in result.columns
             if c not in non_feature_cols and c not in {"timestamp", "symbol"}

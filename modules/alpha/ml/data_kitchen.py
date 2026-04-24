@@ -84,13 +84,13 @@ class DataKitchenConfig:
     regime_feature_prefixes: list[str] = field(default_factory=lambda: [
         "close_return", "rsi_", "macd_", "atr_", "adx",
         "ret_roll_mean", "ret_roll_std", "bb_pctb",
-        "price_vs_sma", "volume_ratio",
+        "price_vs_sma", "volume_ratio", "oc_", "st_",
     ])
 
     # diagnostic_features: 哪些列列入诊断视图
     diagnostic_feature_prefixes: list[str] = field(default_factory=lambda: [
         "close_return", "close_to_high", "close_to_low",
-        "hl_range", "volume_ratio",
+        "hl_range", "volume_ratio", "oc_", "st_",
     ])
 
     # 是否打印诊断日志（输入/输出维度变化、NaN 比例等）

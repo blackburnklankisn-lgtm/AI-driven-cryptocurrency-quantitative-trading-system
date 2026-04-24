@@ -70,6 +70,7 @@ class SelfEvolutionConfig:
     registry_path: Optional[str] = None
     auto_run: bool = False
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    weekly_params_optimizer_cron: str = ""
     promotion_gate: PromotionGateConfig = field(default_factory=PromotionGateConfig)
     retirement: RetirementConfig = field(default_factory=RetirementConfig)
     ab_test: ABExperimentConfig = field(default_factory=ABExperimentConfig)
@@ -115,7 +116,7 @@ class SelfEvolutionEngine:
         self._consecutive_low_sharpe: dict[str, int] = {}
         # 运行时追踪：风险违规次数（candidate_id → count）
         self._risk_violations: dict[str, int] = {}
-        # 运行时追踪：历史 active 版本（candidate_id → prev_version）
+        # 运行时追踪：历史 active 候选（candidate_id → previous_active_candidate_id）
         self._prev_active: dict[str, str] = {}
 
         log.info("[Evolution] SelfEvolutionEngine 初始化: state_dir={}",
@@ -401,6 +402,9 @@ class SelfEvolutionEngine:
             log.info("[ABTest] 实验结束: {}", result.summary())
         return result
 
+    def ab_experiment_status(self, experiment_id: str) -> Optional[dict[str, Any]]:
+        return self._ab_manager.get_experiment_status(experiment_id)
+
     # ─────────────────────────────────────────────
     # 查询接口
     # ─────────────────────────────────────────────
@@ -427,11 +431,168 @@ class SelfEvolutionEngine:
     def scheduler_should_run(self, force: bool = False) -> bool:
         return self._scheduler.should_run(force=force)
 
+    @staticmethod
+    def _cron_field_matches(
+        expression: str,
+        value: int,
+        *,
+        minimum: int,
+        maximum: int,
+        sunday_is_zero: bool = False,
+    ) -> bool:
+        expression = (expression or "").strip()
+        if not expression:
+            return False
+        if expression == "*":
+            return True
+
+        def _normalize(raw: int) -> int:
+            if sunday_is_zero and raw == 7:
+                return 0
+            return raw
+
+        try:
+            for token in expression.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+
+                step = 1
+                if "/" in token:
+                    token, step_text = token.split("/", 1)
+                    step = max(1, int(step_text))
+
+                if token == "*":
+                    start, end = minimum, maximum
+                    if start <= value <= end and (value - start) % step == 0:
+                        return True
+                    continue
+
+                if "-" in token:
+                    start_text, end_text = token.split("-", 1)
+                    start = _normalize(int(start_text))
+                    end = _normalize(int(end_text))
+                    if start <= value <= end and (value - start) % step == 0:
+                        return True
+                    continue
+
+                candidate = _normalize(int(token))
+                if minimum <= candidate <= maximum and candidate == value:
+                    return True
+        except ValueError:
+            return False
+
+        return False
+
+    def weekly_params_optimizer_state(self) -> dict[str, Any]:
+        return self._state_store.load_weekly_params_optimizer_state()
+
+    def weekly_params_optimizer_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._state_store.load_weekly_params_optimizer_runs(limit=limit)
+
+    def save_weekly_params_optimizer_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        self._state_store.save_weekly_params_optimizer_state(state)
+        return self.weekly_params_optimizer_state()
+
+    def get_due_weekly_params_optimizer_slot(
+        self,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        cron_expr = self.config.weekly_params_optimizer_cron
+        if not isinstance(cron_expr, str) or not cron_expr.strip():
+            return None
+
+        fields = cron_expr.split()
+        if len(fields) != 5:
+            log.warning("[Evolution] 非法 weekly_params_optimizer_cron: {}", cron_expr)
+            return None
+
+        now = now or datetime.now(timezone.utc)
+        minute_expr, hour_expr, day_expr, month_expr, weekday_expr = fields
+        weekday_value = now.isoweekday() % 7
+        if not self._cron_field_matches(minute_expr, now.minute, minimum=0, maximum=59):
+            return None
+        if not self._cron_field_matches(hour_expr, now.hour, minimum=0, maximum=23):
+            return None
+        if not self._cron_field_matches(day_expr, now.day, minimum=1, maximum=31):
+            return None
+        if not self._cron_field_matches(month_expr, now.month, minimum=1, maximum=12):
+            return None
+        if not self._cron_field_matches(
+            weekday_expr,
+            weekday_value,
+            minimum=0,
+            maximum=6,
+            sunday_is_zero=True,
+        ):
+            return None
+
+        slot_id = now.replace(second=0, microsecond=0).isoformat()
+        state = self.weekly_params_optimizer_state()
+        if state.get("last_successful_slot") == slot_id:
+            return None
+        return slot_id
+
+    def record_weekly_params_optimizer_start(
+        self,
+        slot_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        state = dict(self.weekly_params_optimizer_state() or {})
+        started_at = (now or datetime.now(timezone.utc)).isoformat()
+        state.update(
+            {
+                "last_attempted_slot": slot_id,
+                "last_attempted_at": started_at,
+                "status": "running",
+            }
+        )
+        return self.save_weekly_params_optimizer_state(state)
+
+    def record_weekly_params_optimizer_finish(
+        self,
+        slot_id: str,
+        *,
+        status: str,
+        optimized_symbols: Optional[list[dict[str, Any]]] = None,
+        errors: Optional[dict[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        finished_at = (now or datetime.now(timezone.utc)).isoformat()
+        state = dict(self.weekly_params_optimizer_state() or {})
+        state.update(
+            {
+                "status": status,
+                "last_finished_at": finished_at,
+                "optimized_symbols": list(optimized_symbols or []),
+                "last_error": errors or None,
+            }
+        )
+        if status in {"success", "partial_success"}:
+            state["last_successful_slot"] = slot_id
+            state["last_successful_run_at"] = finished_at
+
+        self._state_store.append_weekly_params_optimizer_run(
+            {
+                "slot_id": slot_id,
+                "status": status,
+                "finished_at": finished_at,
+                "optimized_symbols": list(optimized_symbols or []),
+                "errors": errors or None,
+            }
+        )
+        return self.save_weekly_params_optimizer_state(state)
+
     def diagnostics(self) -> dict[str, Any]:
         return {
             "registry": self._registry.diagnostics(),
             "state_store": self._state_store.diagnostics(),
             "scheduler": self._scheduler.diagnostics(),
+            "weekly_params_optimizer": {
+                "cron": self.config.weekly_params_optimizer_cron,
+                "state": self.weekly_params_optimizer_state(),
+            },
             "ab_manager": self._ab_manager.diagnostics(),
             "risk_violations": dict(self._risk_violations),
             "consecutive_low_sharpe": dict(self._consecutive_low_sharpe),
@@ -462,12 +623,19 @@ class SelfEvolutionEngine:
                 target = CandidateStatus(decision.to_status)
                 # 若晋升到 ACTIVE，记录上一版本
                 if target == CandidateStatus.ACTIVE:
-                    prev_active = self._registry.list_by_status(
-                        CandidateStatus.ACTIVE
+                    current_snap = self._registry.get(decision.candidate_id)
+                    previous_active = self._find_active_family_members(
+                        current_snap,
+                        exclude_candidate_id=decision.candidate_id,
                     )
-                    for prev in prev_active:
-                        if prev.candidate_id != decision.candidate_id:
-                            self._prev_active[decision.candidate_id] = prev.version
+                    if previous_active:
+                        self._prev_active[decision.candidate_id] = previous_active[0].candidate_id
+                    for prev in previous_active:
+                        self._registry.transition(
+                            candidate_id=prev.candidate_id,
+                            new_status=CandidateStatus.PAUSED,
+                            reason=f"SUPERSEDED_BY:{decision.candidate_id}",
+                        )
 
                 self._registry.transition(
                     candidate_id=decision.candidate_id,
@@ -500,6 +668,14 @@ class SelfEvolutionEngine:
                     new_status=target,
                     reason="; ".join(decision.reason_codes),
                 )
+                if decision.action == PromotionAction.ROLLBACK.value:
+                    rollback_candidate_id = self._prev_active.get(decision.candidate_id)
+                    if rollback_candidate_id is not None:
+                        self._registry.transition(
+                            candidate_id=rollback_candidate_id,
+                            new_status=CandidateStatus.ACTIVE,
+                            reason=f"ROLLBACK_FROM:{decision.candidate_id}",
+                        )
                 # 记录淘汰
                 if decision.action in (
                     PromotionAction.RETIRE.value, PromotionAction.ROLLBACK.value
@@ -513,3 +689,35 @@ class SelfEvolutionEngine:
                         self._state_store.append_retirement(record)
 
         return decisions
+
+    def _find_active_family_members(
+        self,
+        snapshot: Optional[CandidateSnapshot],
+        *,
+        exclude_candidate_id: Optional[str] = None,
+    ) -> list[CandidateSnapshot]:
+        """查找与给定候选属于同一 family 的 active 候选。"""
+        if snapshot is None:
+            return []
+
+        family_key = self._candidate_family_key(snapshot)
+        if not family_key:
+            return []
+
+        active = self._registry.list_by_status(CandidateStatus.ACTIVE)
+        family_members = [
+            candidate
+            for candidate in active
+            if candidate.candidate_id != exclude_candidate_id
+            and self._candidate_family_key(candidate) == family_key
+        ]
+        family_members.sort(
+            key=lambda candidate: candidate.promoted_at or candidate.created_at,
+            reverse=True,
+        )
+        return family_members
+
+    @staticmethod
+    def _candidate_family_key(snapshot: CandidateSnapshot) -> str:
+        metadata = snapshot.metadata or {}
+        return str(metadata.get("family_key") or snapshot.owner)

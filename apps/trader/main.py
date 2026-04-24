@@ -32,6 +32,8 @@ apps/trader/main.py — 实盘/模拟盘主控程序
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import signal
 import sys
@@ -46,6 +48,7 @@ import uvicorn
 import asyncio
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -60,6 +63,17 @@ from modules.alpha.orchestration.strategy_orchestrator import (
 )
 from modules.alpha.runtime import AlphaRuntime, StrategyRegistry, BaseAlphaAdapter
 from modules.alpha.regime.detector import MarketRegimeDetector
+from modules.data.fusion.alignment import AlignmentConfig, SourceAligner
+from modules.data.fusion.freshness import FreshnessConfig
+from modules.data.onchain.cache import OnChainCache
+from modules.data.onchain.collector import CollectorConfig, OnChainCollector
+from modules.data.onchain.feature_builder import FeatureBuilderConfig, OnChainFeatureBuilder
+from modules.data.onchain.providers import (
+    CryptoQuantProvider,
+    GlassnodeProvider,
+    MockOnChainProvider,
+    PublicOnChainProvider,
+)
 from modules.data.realtime.depth_cache import DepthCacheConfig, DepthCacheRegistry
 from modules.data.realtime.feature_builder import MicroFeatureBuilder
 from modules.data.realtime.orderbook_types import OrderBookSnapshot
@@ -70,6 +84,18 @@ from modules.data.realtime.ws_client import (
     MockWsClient,
     WsClientConfig,
     create_exchange_ws_client,
+)
+from modules.data.sentiment.cache import SentimentCache
+from modules.data.sentiment.collector import SentimentCollector, SentimentCollectorConfig
+from modules.data.sentiment.feature_builder import (
+    SentimentFeatureBuilder,
+    SentimentFeatureBuilderConfig,
+)
+from modules.data.sentiment.providers import (
+    AlternativeMeProvider,
+    CryptoCompareProvider,
+    HtxSentimentProvider,
+    MockSentimentProvider,
 )
 from modules.execution.gateway import CCXTGateway
 from modules.execution.order_manager import OrderManager
@@ -194,6 +220,19 @@ class LiveTrader:
         self._symbol_regimes: Dict[str, RegimeState] = {}
         self._last_trace_ids: Dict[str, str] = {}
         self._symbol_risk_plans: Dict[str, object] = {}
+        self._phase2_source_aligner = SourceAligner(
+            AlignmentConfig(
+                max_fill_periods=max(
+                    int(getattr(self.sys_config.data, "external_feature_max_fill_periods", 72)),
+                    1,
+                )
+            )
+        )
+        self._phase2_external_enabled: bool = False
+        self._onchain_collector: Optional[OnChainCollector] = None
+        self._onchain_feature_builder: Optional[OnChainFeatureBuilder] = None
+        self._sentiment_collector: Optional[SentimentCollector] = None
+        self._sentiment_feature_builder: Optional[SentimentFeatureBuilder] = None
 
         # 运行状态
         self._positions: Dict[str, Decimal] = {}
@@ -277,10 +316,25 @@ class LiveTrader:
         self._phase3_depth_registry: Optional[DepthCacheRegistry] = None
         self._phase3_trade_registry: Optional[TradeCacheRegistry] = None
         self._phase3_micro_builder: Optional[MicroFeatureBuilder] = None
+        self._phase3_strategy_candidates: Dict[str, str] = {}
+        self._phase3_strategy_candidate_bindings: Dict[str, Dict[str, str]] = {}
+        self._phase3_strategy_metric_bindings: Dict[str, str] = {}
+        self._phase3_params_artifact_signatures: Dict[str, str] = {}
+        self._phase3_params_optimizer_state_store: Optional[object] = None
+        self._phase3_params_optimizer_state: Dict[str, Any] = {}
+        self._phase3_params_optimizer_thread: Optional[threading.Thread] = None
+        self._phase3_params_optimizer_running: bool = False
+        self._phase3_candidate_experiments: Dict[str, str] = {}
+        self._phase3_candidate_runtime_state: Dict[str, Dict[str, Any]] = {}
+        self._phase3_mm_realized_trade_records: Dict[str, List[Dict[str, Any]]] = {}
+        self._phase3_mm_last_realized_pnl: Dict[str, float] = {}
+        self._phase3_mm_last_halt_reason: Dict[str, str] = {}
 
         p3_cfg = getattr(self.sys_config, "phase3", None)
         if p3_cfg is not None and getattr(p3_cfg, "enabled", False):
             self._init_phase3_components(p3_cfg)
+
+        self._init_phase2_external_sources()
 
         log.info(
             "LiveTrader 初始化完成: exchange={} mode={} symbols={}",
@@ -391,6 +445,11 @@ class LiveTrader:
             ev_cfg = SelfEvolutionConfig(
                 state_dir="storage/phase3_evolution",
                 auto_run=False,  # 手动调用 run_cycle()
+                weekly_params_optimizer_cron=getattr(
+                    getattr(p3_cfg, "evolution", None),
+                    "weekly_optimization_cron",
+                    "",
+                ),
             )
             self._phase3_evolution = SelfEvolutionEngine(ev_cfg)
             log.info(
@@ -398,6 +457,31 @@ class LiveTrader:
             )
         except Exception as _exc:
             log.warning("[Phase3] SelfEvolutionEngine 初始化失败（已忽略）: {}", _exc)
+
+        if self._phase3_evolution is not None:
+            try:
+                self._phase3_params_optimizer_state = (
+                    self._phase3_evolution.weekly_params_optimizer_state()
+                )
+                self._phase3_params_optimizer_state_store = None
+                log.info("[Phase3] 周级参数优化状态已挂接到 SelfEvolutionEngine")
+            except Exception as _exc:
+                log.warning("[Phase3] 周级参数优化状态挂接失败（已忽略）: {}", _exc)
+                self._phase3_params_optimizer_state_store = None
+                self._phase3_params_optimizer_state = {}
+
+        if self._phase3_evolution is not None:
+            self._register_evolution_risk_params_candidate(source="phase3_init")
+            if self._phase3_mm is not None:
+                self._register_evolution_market_making_candidate(
+                    self._phase3_mm,
+                    source="phase3_init",
+                )
+            if self._phase3_ppo is not None:
+                self._register_evolution_policy_candidate(
+                    self._phase3_ppo,
+                    source="phase3_init",
+                )
 
         self._phase3_enabled = any(
             component is not None
@@ -573,6 +657,198 @@ class LiveTrader:
             self._phase1_regime_detectors[symbol] = detector
         return detector
 
+    def _init_phase2_external_sources(self) -> None:
+        data_cfg = self.sys_config.data
+        onchain_enabled = bool(getattr(data_cfg, "onchain_enabled", False))
+        sentiment_enabled = bool(getattr(data_cfg, "sentiment_enabled", False))
+
+        if onchain_enabled:
+            try:
+                onchain_ttl_sec = int(getattr(data_cfg, "onchain_ttl_sec", 43_200))
+                onchain_cache = OnChainCache()
+                onchain_freshness = FreshnessConfig(default_ttl_sec=onchain_ttl_sec)
+                self._onchain_collector = OnChainCollector(
+                    provider=self._create_onchain_provider(
+                        str(getattr(data_cfg, "onchain_provider", "public"))
+                    ),
+                    cache=onchain_cache,
+                    config=CollectorConfig(
+                        max_retries=1,
+                        retry_backoff_sec=1.0,
+                        skip_if_fresh=True,
+                        freshness_config=onchain_freshness,
+                    ),
+                )
+                self._onchain_feature_builder = OnChainFeatureBuilder(
+                    cache=onchain_cache,
+                    config=FeatureBuilderConfig(
+                        freshness_config=onchain_freshness,
+                        ttl_sec=onchain_ttl_sec,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._onchain_collector = None
+                self._onchain_feature_builder = None
+                log.warning("[Phase2] OnChain external source 初始化失败（已忽略）: {}", exc)
+
+        if sentiment_enabled:
+            try:
+                sentiment_ttl_sec = int(getattr(data_cfg, "sentiment_ttl_sec", 3_600))
+                sentiment_cache = SentimentCache()
+                sentiment_freshness = FreshnessConfig(default_ttl_sec=sentiment_ttl_sec)
+                self._sentiment_collector = SentimentCollector(
+                    provider=self._create_sentiment_provider(
+                        str(getattr(data_cfg, "sentiment_provider", "htx"))
+                    ),
+                    cache=sentiment_cache,
+                    config=SentimentCollectorConfig(
+                        max_retries=1,
+                        retry_backoff_sec=1.0,
+                        skip_if_fresh=True,
+                        freshness_config=sentiment_freshness,
+                    ),
+                )
+                self._sentiment_feature_builder = SentimentFeatureBuilder(
+                    cache=sentiment_cache,
+                    config=SentimentFeatureBuilderConfig(
+                        freshness_config=sentiment_freshness,
+                        ttl_sec=sentiment_ttl_sec,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._sentiment_collector = None
+                self._sentiment_feature_builder = None
+                log.warning("[Phase2] Sentiment external source 初始化失败（已忽略）: {}", exc)
+
+        self._phase2_external_enabled = any(
+            component is not None
+            for component in (
+                self._onchain_collector,
+                self._onchain_feature_builder,
+                self._sentiment_collector,
+                self._sentiment_feature_builder,
+            )
+        )
+        log.info(
+            "[Phase2] external sources ready: onchain={} sentiment={} enabled={}",
+            self._onchain_collector is not None,
+            self._sentiment_collector is not None,
+            self._phase2_external_enabled,
+        )
+
+    def _create_onchain_provider(self, provider_name: str):
+        normalized = (provider_name or "public").strip().lower()
+        if normalized == "public":
+            return PublicOnChainProvider()
+        if normalized == "glassnode":
+            return GlassnodeProvider(api_key=os.getenv("GLASSNODE_API_KEY", ""))
+        if normalized == "cryptoquant":
+            return CryptoQuantProvider(api_key=os.getenv("CRYPTOQUANT_API_KEY", ""))
+        if normalized == "mock":
+            return MockOnChainProvider(seed=42)
+        raise ValueError(f"未知 onchain provider: {provider_name}")
+
+    def _create_sentiment_provider(self, provider_name: str):
+        normalized = (provider_name or "htx").strip().lower()
+        if normalized == "htx":
+            return HtxSentimentProvider(fear_greed_provider=AlternativeMeProvider())
+        if normalized == "alternative_me":
+            return AlternativeMeProvider()
+        if normalized == "cryptocompare":
+            return CryptoCompareProvider(api_key=os.getenv("CRYPTOCOMPARE_API_KEY", ""))
+        if normalized == "mock":
+            return MockSentimentProvider(seed=42)
+        raise ValueError(f"未知 sentiment provider: {provider_name}")
+
+    def _collect_external_source_frame(
+        self,
+        symbol: str,
+        collector: object,
+        builder: object,
+        source_label: str,
+        kline_index: pd.DatetimeIndex,
+    ) -> Optional[pd.DataFrame]:
+        if collector is None or builder is None or len(kline_index) == 0:
+            return None
+
+        try:
+            record = collector.collect(symbol)
+            source_frame = (
+                builder.build(symbol, record)
+                if record is not None
+                else builder.build_from_cache(symbol)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "[Phase2] {} collect/build 失败，尝试缓存降级: symbol={} error={}",
+                source_label,
+                symbol,
+                exc,
+            )
+            try:
+                source_frame = builder.build_from_cache(symbol)
+            except Exception as cache_exc:  # noqa: BLE001
+                log.debug(
+                    "[Phase2] {} cache fallback 失败: symbol={} error={}",
+                    source_label,
+                    symbol,
+                    cache_exc,
+                )
+                return None
+
+        if source_frame is None or source_frame.is_empty:
+            return None
+
+        try:
+            aligned = self._phase2_source_aligner.align(source_frame, kline_index)
+            if not aligned.is_usable or aligned.aligned_frame.empty:
+                return None
+            return aligned.aligned_frame
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "[Phase2] {} align 失败: symbol={} error={}",
+                source_label,
+                symbol,
+                exc,
+            )
+            return None
+
+    def _build_external_feature_frame(
+        self,
+        symbol: str,
+        kline_index: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        if not self._phase2_external_enabled or len(kline_index) == 0:
+            return pd.DataFrame(index=kline_index)
+
+        frames: list[pd.DataFrame] = []
+        onchain_frame = self._collect_external_source_frame(
+            symbol,
+            self._onchain_collector,
+            self._onchain_feature_builder,
+            "onchain",
+            kline_index,
+        )
+        if onchain_frame is not None and not onchain_frame.empty:
+            frames.append(onchain_frame)
+
+        sentiment_frame = self._collect_external_source_frame(
+            symbol,
+            self._sentiment_collector,
+            self._sentiment_feature_builder,
+            "sentiment",
+            kline_index,
+        )
+        if sentiment_frame is not None and not sentiment_frame.empty:
+            frames.append(sentiment_frame)
+
+        if not frames:
+            return pd.DataFrame(index=kline_index)
+
+        merged = pd.concat(frames, axis=1)
+        merged = merged.loc[:, ~merged.columns.duplicated()]
+        return merged
+
     def _build_symbol_ohlcv_frame(self, symbol: str) -> Optional[pd.DataFrame]:
         klines = self._kline_store.get(symbol, [])
         if not klines:
@@ -590,12 +866,22 @@ class LiveTrader:
         if ohlcv_df is None or len(ohlcv_df) < 30:
             return self._phase1_feature_views.get(symbol)
 
+        enriched_df = ohlcv_df
+        kline_index = pd.DatetimeIndex(ohlcv_df["timestamp"])
+        external_frame = self._build_external_feature_frame(symbol, kline_index)
+        if not external_frame.empty:
+            enriched_df = (
+                ohlcv_df.set_index("timestamp")
+                .join(external_frame, how="left")
+                .reset_index()
+            )
+
         kitchen = self._get_or_create_data_kitchen(symbol)
         try:
             if kitchen.contract is None:
-                views, _ = kitchen.fit(ohlcv_df)
+                views, _ = kitchen.fit(enriched_df)
             else:
-                views = kitchen.transform(ohlcv_df, validate_contract=False)
+                views = kitchen.transform(enriched_df, validate_contract=False)
             self._phase1_feature_views[symbol] = views
             return views
         except Exception as exc:  # noqa: BLE001
@@ -979,6 +1265,10 @@ class LiveTrader:
                     _decision.allow_post_bid,
                     _decision.allow_post_ask,
                 )
+                self._record_market_making_evolution_feedback(
+                    f"phase3_mm_{_normalize_symbol_key(symbol)}",
+                    _decision,
+                )
             except Exception:  # noqa: BLE001
                 log.debug("[Phase3/MM] shadow tick 异常（已忽略）: symbol={}", symbol)
 
@@ -1045,6 +1335,7 @@ class LiveTrader:
             try:
                 _report = self._phase3_evolution.run_cycle(force=False)
                 if _report is not None:
+                    self._apply_evolution_runtime_state(_report)
                     log.info(
                         "[Phase3/EV] shadow 演进周期完成: {}",
                         _report.summary(),
@@ -1077,6 +1368,12 @@ class LiveTrader:
         
         # 注册到 AlphaRuntime
         self._strategy_registry.register(wrapped_strategy)
+
+        if self._phase3_evolution is not None and not hasattr(strategy_obj, "model"):
+            self._register_evolution_strategy_params_candidate(
+                strategy_obj,
+                source="initial_load",
+            )
         
         log.info(
             "注册实盘策略: strategy_id={} symbols={} (已包装为 StrategyProtocol)",
@@ -1288,6 +1585,11 @@ class LiveTrader:
                 seq, event.symbol, close_f, prev_price, period_return,
             )
             self._process_kline_event(event)
+
+        if kline_events:
+            self._maybe_rollout_updated_ml_params_candidates()
+
+        self._maybe_start_weekly_ml_params_optimization(now)
 
         # Step 3: 组合再平衡检查（再平衡优先于策略信号冲突）
         if self._portfolio_enabled and self.rebalancer and kline_events:
@@ -1587,6 +1889,7 @@ class LiveTrader:
             if hasattr(self, "_kill_switch") and self._kill_switch.evaluate(risk_snapshot):
                 reason = self._kill_switch.health_snapshot().get("reason") or "Kill Switch 已激活"
                 self._kill_switch.record_order_rejection(reason)
+                self._record_evolution_risk_violation(req.strategy_id, stage="kill-switch")
                 self._record_order_rejection(req, quantity, reason, "kill-switch")
                 return
 
@@ -1604,6 +1907,7 @@ class LiveTrader:
                 reason = "; ".join(risk_plan.block_reasons) or "AdaptiveRiskMatrix 阻断"
                 if hasattr(self, "_kill_switch"):
                     self._kill_switch.record_order_rejection(reason)
+                self._record_evolution_risk_violation(req.strategy_id, stage="adaptive-risk")
                 self._record_order_rejection(req, quantity, reason, "adaptive-risk")
                 return
 
@@ -1682,6 +1986,7 @@ class LiveTrader:
             if not budget_allowed:
                 if hasattr(self, "_kill_switch"):
                     self._kill_switch.record_order_rejection(budget_reason)
+                self._record_evolution_risk_violation(req.strategy_id, stage="budget")
                 self._record_order_rejection(req, quantity, budget_reason, "budget")
                 return
 
@@ -1698,6 +2003,7 @@ class LiveTrader:
         if not allowed:
             if hasattr(self, "_kill_switch"):
                 self._kill_switch.record_order_rejection(reason)
+            self._record_evolution_risk_violation(req.strategy_id, stage="risk-manager")
             self._record_order_rejection(req, quantity, reason, "risk-manager")
             return
 
@@ -1794,26 +2100,2174 @@ class LiveTrader:
         """ContinuousLearner 产出新模型时的热替换回调。"""
         log.info("[CL] 新模型产出，开始热替换: strategy_id={}", strategy_id)
         replaced = False
-        for s in self._strategies:
-            sid = getattr(s, 'strategy_id', '')
-            if sid == strategy_id:
-                # 热替换模型
-                if hasattr(s, 'model'):
-                    old_type = getattr(s.model, 'model_type', '?')
-                    s.model = new_model
-                    log.info(
-                        "[CL] 模型热替换成功: {} old={} → new={}",
-                        sid, old_type, getattr(new_model, 'model_type', '?'),
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is not None:
+            if hasattr(strategy, 'model'):
+                old_type = getattr(strategy.model, 'model_type', '?')
+                strategy.model = new_model
+                log.info(
+                    "[CL] 模型热替换成功: {} old={} → new={}",
+                    strategy_id, old_type, getattr(new_model, 'model_type', '?'),
+                )
+                replaced = True
+            if hasattr(strategy, 'set_thresholds') and hasattr(learner, 'get_optimal_thresholds'):
+                buy_t, sell_t = learner.get_optimal_thresholds()
+                strategy.set_thresholds(buy_t, sell_t)
+                log.info("[CL] 自适应阈值注入: {} buy={:.3f} sell={:.3f}", strategy_id, buy_t, sell_t)
+                current_params_candidate_id = self._get_evolution_candidate_id(
+                    strategy_id,
+                    slot="params",
+                )
+                if current_params_candidate_id is not None:
+                    self._store_ml_params_candidate_runtime_state(
+                        strategy_id,
+                        current_params_candidate_id,
+                        learner=learner,
                     )
-                    replaced = True
-                # 注入自适应阈值
-                if hasattr(s, 'set_thresholds') and hasattr(learner, 'get_optimal_thresholds'):
-                    buy_t, sell_t = learner.get_optimal_thresholds()
-                    s.set_thresholds(buy_t, sell_t)
-                    log.info("[CL] 自适应阈值注入: {} buy={:.3f} sell={:.3f}", sid, buy_t, sell_t)
-                break
+        if replaced:
+            self._register_evolution_model_candidate(
+                strategy_id,
+                learner,
+                new_model,
+                source="continuous_learner",
+            )
         if not replaced:
             log.warning("[CL] 未找到对应策略进行热替换: {}", strategy_id)
+
+    def _register_evolution_model_candidate(
+        self,
+        strategy_id: str,
+        learner,
+        model,
+        *,
+        source: str,
+        model_path: Optional[str] = None,
+    ) -> Optional[str]:
+        """将当前运行中的模型版本注册为自进化候选。"""
+        if self._phase3_evolution is None:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        metadata: Dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "family_key": strategy_id,
+            "binding_slot": "model",
+            "source": source,
+        }
+        if model_path:
+            metadata["model_path"] = model_path
+
+        version_id = None
+        active_version = getattr(learner, "_active_version", None)
+        if active_version is not None:
+            version_id = getattr(active_version, "version_id", None)
+            if getattr(active_version, "trained_at", None) is not None:
+                metadata["trained_at"] = active_version.trained_at.isoformat()
+            if getattr(active_version, "train_bars", None) is not None:
+                metadata["train_bars"] = active_version.train_bars
+            if getattr(active_version, "oos_accuracy", None) is not None:
+                metadata["oos_accuracy"] = active_version.oos_accuracy
+            if getattr(active_version, "oos_f1", None) is not None:
+                metadata["oos_f1"] = active_version.oos_f1
+            if getattr(active_version, "model_path", None):
+                metadata["artifact_model_path"] = active_version.model_path
+
+        if version_id is None and learner is not None and hasattr(learner, "get_model_version_info"):
+            try:
+                versions = learner.get_model_version_info()
+            except Exception:  # noqa: BLE001
+                versions = []
+            if isinstance(versions, list) and versions:
+                info = next((item for item in versions if item.get("is_active")), versions[-1])
+                version_id = info.get("version_id")
+                metadata.update({
+                    key: info[key]
+                    for key in ("trained_at", "train_bars", "oos_accuracy", "oos_f1", "model_path")
+                    if key in info and info[key] is not None
+                })
+
+        if version_id is None and model_path:
+            version_id = Path(model_path).stem
+        if version_id is None:
+            version_id = f"{_normalize_symbol_key(strategy_id)}_{int(datetime.now(tz=timezone.utc).timestamp())}"
+
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="model")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:  # noqa: BLE001
+                current = None
+            if current is not None and current.version == version_id:
+                self._store_ml_candidate_runtime_state(strategy_id, current_candidate_id)
+                return current_candidate_id
+
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.MODEL,
+            owner=f"ml/{getattr(model, 'model_type', 'unknown')}",
+            version=version_id,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="model",
+            set_metric_owner=True,
+        )
+        self._store_ml_candidate_runtime_state(strategy_id, snap.candidate_id)
+        log.info(
+            "[Phase3/EV] 模型候选已注册: strategy_id={} candidate_id={} version={} source={}",
+            strategy_id,
+            snap.candidate_id,
+            version_id,
+            source,
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        self._sync_evolution_strategy_metrics(strategy_id)
+        return snap.candidate_id
+
+    def _register_evolution_params_candidate(
+        self,
+        strategy_id: str,
+        learner,
+        runtime_artifacts: Dict[str, Any],
+        *,
+        source: str,
+        set_metric_owner: bool = False,
+    ) -> Optional[str]:
+        """将当前运行中的阈值/训练参数注册为自进化参数候选。"""
+        if self._phase3_evolution is None:
+            return None
+
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        cfg = getattr(strategy, "cfg", None)
+        buy_threshold = runtime_artifacts.get("buy_threshold")
+        sell_threshold = runtime_artifacts.get("sell_threshold")
+        if cfg is not None:
+            if buy_threshold is None:
+                buy_threshold = getattr(cfg, "buy_threshold", None)
+            if sell_threshold is None:
+                sell_threshold = getattr(cfg, "sell_threshold", None)
+
+        trainer_model_type = runtime_artifacts.get("trainer_model_type")
+        trainer_model_params = dict(runtime_artifacts.get("trainer_model_params") or {})
+        trainer = getattr(learner, "trainer", None)
+        if trainer is not None:
+            if trainer_model_type is None:
+                trainer_model_type = getattr(trainer, "model_type", None)
+            if not trainer_model_params:
+                trainer_model_params = dict(getattr(trainer, "model_params", {}) or {})
+
+        version_payload = {
+            "buy_threshold": buy_threshold,
+            "sell_threshold": sell_threshold,
+            "trainer_model_type": trainer_model_type,
+            "trainer_model_params": trainer_model_params,
+            "params_source": runtime_artifacts.get("params_source"),
+            "threshold_source": runtime_artifacts.get("threshold_source"),
+        }
+        artifact_signature = self._ml_params_artifact_signature(version_payload)
+        version_digest = artifact_signature[:10]
+        version = (
+            f"bt{float(buy_threshold or 0.0):.3f}_st{float(sell_threshold or 0.0):.3f}_{version_digest}"
+            .replace(".", "p")
+        )
+
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="params")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:  # noqa: BLE001
+                current = None
+            if current is not None and current.version == version:
+                self._store_ml_params_candidate_runtime_state(
+                    strategy_id,
+                    current_candidate_id,
+                    learner=learner,
+                    runtime_artifacts=runtime_artifacts,
+                )
+                self._phase3_params_artifact_signatures[strategy_id] = artifact_signature
+                if set_metric_owner:
+                    restored = self._restore_ml_params_candidate_runtime_state(
+                        strategy_id,
+                        current_candidate_id,
+                    )
+                    if restored:
+                        self._set_metric_owner_binding(strategy_id, "params")
+                        self._sync_evolution_strategy_metrics(strategy_id)
+                return current_candidate_id
+
+        metadata = {
+            "strategy_id": strategy_id,
+            "family_key": f"{strategy_id}/params",
+            "binding_slot": "params",
+            "source": source,
+            "buy_threshold": buy_threshold,
+            "sell_threshold": sell_threshold,
+            "trainer_model_type": trainer_model_type,
+            "trainer_model_params": trainer_model_params,
+            "params_source": runtime_artifacts.get("params_source"),
+            "threshold_source": runtime_artifacts.get("threshold_source"),
+        }
+
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.PARAMS,
+            owner="ml/params",
+            version=version,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="params",
+            set_metric_owner=set_metric_owner,
+        )
+        self._store_ml_params_candidate_runtime_state(
+            strategy_id,
+            snap.candidate_id,
+            learner=learner,
+            runtime_artifacts=runtime_artifacts,
+        )
+        self._phase3_params_artifact_signatures[strategy_id] = artifact_signature
+        log.info(
+            "[Phase3/EV] 参数候选已注册: strategy_id={} candidate_id={} version={} source={} owner={}",
+            strategy_id,
+            snap.candidate_id,
+            version,
+            source,
+            "params" if set_metric_owner else self._phase3_strategy_metric_bindings.get(strategy_id, "model"),
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        if set_metric_owner:
+            restored = self._restore_ml_params_candidate_runtime_state(
+                strategy_id,
+                snap.candidate_id,
+            )
+            if restored:
+                self._set_metric_owner_binding(strategy_id, "params")
+                self._sync_evolution_strategy_metrics(strategy_id)
+        return snap.candidate_id
+
+    @staticmethod
+    def _params_payload_signature(payload: Dict[str, Any]) -> str:
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _apply_marshaled_param_payload(target: Any, payload: Dict[str, Any]) -> None:
+        for key, value in payload.items():
+            current = getattr(target, key, None)
+            if isinstance(current, Decimal):
+                setattr(target, key, Decimal(str(value)))
+            else:
+                setattr(target, key, value)
+
+    def _extract_strategy_params_payload(self, strategy) -> Optional[Dict[str, Any]]:
+        if strategy is None or hasattr(strategy, "model"):
+            return None
+
+        if all(
+            hasattr(strategy, attr)
+            for attr in (
+                "fast_window",
+                "slow_window",
+                "order_qty",
+                "use_ema",
+                "adx_filter",
+                "adx_entry_threshold",
+                "adx_close_threshold",
+                "volume_filter",
+                "vol_ma_window",
+                "vol_multiplier",
+                "timeframe",
+            )
+        ):
+            return {
+                "fast_window": int(strategy.fast_window),
+                "slow_window": int(strategy.slow_window),
+                "order_qty": float(strategy.order_qty),
+                "use_ema": bool(strategy.use_ema),
+                "adx_filter": bool(strategy.adx_filter),
+                "adx_entry_threshold": float(strategy.adx_entry_threshold),
+                "adx_close_threshold": float(strategy.adx_close_threshold),
+                "volume_filter": bool(strategy.volume_filter),
+                "vol_ma_window": int(strategy.vol_ma_window),
+                "vol_multiplier": float(strategy.vol_multiplier),
+                "timeframe": str(strategy.timeframe),
+            }
+
+        if all(
+            hasattr(strategy, attr)
+            for attr in (
+                "roc_window",
+                "roc_entry_pct",
+                "rsi_window",
+                "rsi_upper",
+                "rsi_lower",
+                "atr_window",
+                "order_qty",
+                "timeframe",
+            )
+        ):
+            return {
+                "roc_window": int(strategy.roc_window),
+                "roc_entry_pct": float(strategy.roc_entry_pct),
+                "rsi_window": int(strategy.rsi_window),
+                "rsi_upper": float(strategy.rsi_upper),
+                "rsi_lower": float(strategy.rsi_lower),
+                "atr_window": int(strategy.atr_window),
+                "order_qty": float(strategy.order_qty),
+                "timeframe": str(strategy.timeframe),
+            }
+
+        return None
+
+    def _extract_risk_params_payload(self) -> Optional[Dict[str, Any]]:
+        payload: Dict[str, Any] = {}
+
+        risk_manager_cfg = getattr(getattr(self, "risk_manager", None), "config", None)
+        if risk_manager_cfg is not None:
+            payload["risk_manager"] = {
+                "max_position_pct": float(getattr(risk_manager_cfg, "max_position_pct", 0.0)),
+                "max_portfolio_drawdown": float(
+                    getattr(risk_manager_cfg, "max_portfolio_drawdown", 0.0)
+                ),
+                "max_daily_loss": float(getattr(risk_manager_cfg, "max_daily_loss", 0.0)),
+                "max_consecutive_losses": int(
+                    getattr(risk_manager_cfg, "max_consecutive_losses", 0)
+                ),
+                "circuit_breaker_cooldown_minutes": int(
+                    getattr(risk_manager_cfg, "circuit_breaker_cooldown_minutes", 0)
+                ),
+            }
+
+        adaptive_cfg = getattr(getattr(self, "_adaptive_risk", None), "config", None)
+        if adaptive_cfg is not None:
+            payload["adaptive_risk"] = {
+                "max_drawdown_for_entry": float(
+                    getattr(adaptive_cfg, "max_drawdown_for_entry", 0.0)
+                ),
+                "max_daily_loss_for_entry": float(
+                    getattr(adaptive_cfg, "max_daily_loss_for_entry", 0.0)
+                ),
+                "drawdown_scalar_per_pct": float(
+                    getattr(adaptive_cfg, "drawdown_scalar_per_pct", 0.0)
+                ),
+                "drawdown_scalar_floor": float(
+                    getattr(adaptive_cfg, "drawdown_scalar_floor", 0.0)
+                ),
+                "low_confidence_threshold": float(
+                    getattr(adaptive_cfg, "low_confidence_threshold", 0.0)
+                ),
+                "high_confidence_threshold": float(
+                    getattr(adaptive_cfg, "high_confidence_threshold", 0.0)
+                ),
+                "low_confidence_scalar": float(
+                    getattr(adaptive_cfg, "low_confidence_scalar", 0.0)
+                ),
+                "high_confidence_scalar": float(
+                    getattr(adaptive_cfg, "high_confidence_scalar", 0.0)
+                ),
+                "high_vol_scalar": float(getattr(adaptive_cfg, "high_vol_scalar", 0.0)),
+                "unknown_regime_scalar": float(
+                    getattr(adaptive_cfg, "unknown_regime_scalar", 0.0)
+                ),
+                "max_position_scalar": float(
+                    getattr(adaptive_cfg, "max_position_scalar", 0.0)
+                ),
+                "default_cooldown_minutes": int(
+                    getattr(adaptive_cfg, "default_cooldown_minutes", 0)
+                ),
+            }
+
+        budget_cfg = getattr(getattr(self, "_budget_checker", None), "config", None)
+        if budget_cfg is not None:
+            payload["budget_checker"] = {
+                "max_budget_usage_pct": float(
+                    getattr(budget_cfg, "max_budget_usage_pct", 0.0)
+                ),
+                "max_single_order_budget_pct": float(
+                    getattr(budget_cfg, "max_single_order_budget_pct", 0.0)
+                ),
+                "fee_reserve_pct": float(getattr(budget_cfg, "fee_reserve_pct", 0.0)),
+                "slippage_reserve_pct": float(
+                    getattr(budget_cfg, "slippage_reserve_pct", 0.0)
+                ),
+                "dca_budget_cap_pct": float(
+                    getattr(budget_cfg, "dca_budget_cap_pct", 0.0)
+                ),
+                "min_order_budget_pct": float(
+                    getattr(budget_cfg, "min_order_budget_pct", 0.0)
+                ),
+                "intraday_budget_cap_pct": float(
+                    getattr(budget_cfg, "intraday_budget_cap_pct", 0.0)
+                ),
+            }
+
+        kill_switch_cfg = getattr(getattr(self, "_kill_switch", None), "config", None)
+        if kill_switch_cfg is not None:
+            payload["kill_switch"] = {
+                "drawdown_trigger": float(getattr(kill_switch_cfg, "drawdown_trigger", 0.0)),
+                "daily_loss_trigger": float(getattr(kill_switch_cfg, "daily_loss_trigger", 0.0)),
+                "max_consecutive_rejections": int(
+                    getattr(kill_switch_cfg, "max_consecutive_rejections", 0)
+                ),
+                "max_consecutive_failures": int(
+                    getattr(kill_switch_cfg, "max_consecutive_failures", 0)
+                ),
+                "stale_data_timeout_sec": int(
+                    getattr(kill_switch_cfg, "stale_data_timeout_sec", 0)
+                ),
+                "stale_sources_trigger_count": int(
+                    getattr(kill_switch_cfg, "stale_sources_trigger_count", 0)
+                ),
+                "auto_recover_minutes": int(
+                    getattr(kill_switch_cfg, "auto_recover_minutes", 0)
+                ),
+            }
+
+        position_sizer = getattr(self, "position_sizer", None)
+        if position_sizer is not None:
+            payload["position_sizer"] = {
+                "max_position_pct": float(
+                    getattr(position_sizer, "_max_position_pct", 0.0)
+                )
+            }
+
+        return payload or None
+
+    def _collect_phase3_param_optimization_targets(self) -> List[Dict[str, Any]]:
+        targets: List[Dict[str, Any]] = []
+        for strategy in getattr(self, "_strategies", []):
+            strategy_id = getattr(strategy, "strategy_id", "")
+            if not strategy_id:
+                continue
+            if hasattr(strategy, "model"):
+                targets.append(
+                    {
+                        "target_kind": "ml_strategy",
+                        "strategy_id": strategy_id,
+                        "symbol": getattr(strategy, "symbol", None),
+                    }
+                )
+                continue
+
+            params_payload = self._extract_strategy_params_payload(strategy)
+            if isinstance(params_payload, dict) and params_payload:
+                targets.append(
+                    {
+                        "target_kind": "strategy_params",
+                        "strategy_id": strategy_id,
+                        "params_payload": params_payload,
+                    }
+                )
+
+        risk_payload = self._extract_risk_params_payload()
+        if isinstance(risk_payload, dict) and risk_payload:
+            targets.append(
+                {
+                    "target_kind": "risk_params",
+                    "strategy_id": "phase2_risk_runtime",
+                    "params_payload": risk_payload,
+                }
+            )
+        return targets
+
+    def _store_strategy_params_candidate_runtime_state(
+        self,
+        strategy_id: str,
+        candidate_id: str,
+        params_payload: Dict[str, Any],
+    ) -> None:
+        self._ensure_phase3_candidate_bindings()
+        self._phase3_candidate_runtime_state[candidate_id] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "strategy_params",
+            "binding_slot": "params",
+            "params_payload": dict(params_payload),
+            "metric_owner": self._phase3_strategy_metric_bindings.get(strategy_id) == "params",
+        }
+
+    def _store_risk_params_candidate_runtime_state(
+        self,
+        strategy_id: str,
+        candidate_id: str,
+        params_payload: Dict[str, Any],
+    ) -> None:
+        self._ensure_phase3_candidate_bindings()
+        self._phase3_candidate_runtime_state[candidate_id] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "risk_params",
+            "binding_slot": "params",
+            "params_payload": dict(params_payload),
+            "metric_owner": False,
+        }
+
+    def _register_evolution_strategy_params_candidate(
+        self,
+        strategy,
+        *,
+        source: str,
+        set_metric_owner: bool = True,
+    ) -> Optional[str]:
+        if self._phase3_evolution is None:
+            return None
+
+        strategy_id = getattr(strategy, "strategy_id", "")
+        params_payload = self._extract_strategy_params_payload(strategy)
+        if not strategy_id or not isinstance(params_payload, dict) or not params_payload:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        payload_signature = self._params_payload_signature(params_payload)
+        version = f"params_{payload_signature[:12]}"
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="params")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:
+                current = None
+            if current is not None and current.version == version:
+                self._store_strategy_params_candidate_runtime_state(
+                    strategy_id,
+                    current_candidate_id,
+                    params_payload,
+                )
+                if set_metric_owner:
+                    restored = self._restore_strategy_params_candidate_runtime_state(
+                        strategy_id,
+                        current_candidate_id,
+                    )
+                    if restored:
+                        self._set_metric_owner_binding(strategy_id, "params")
+                        self._sync_evolution_strategy_metrics(strategy_id)
+                return current_candidate_id
+
+        metadata = {
+            "strategy_id": strategy_id,
+            "family_key": f"{strategy_id}/params",
+            "binding_slot": "params",
+            "source": source,
+            "params_kind": "strategy_params",
+            "strategy_class": type(strategy).__name__,
+            "params_payload": dict(params_payload),
+        }
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.PARAMS,
+            owner=f"strategy/{type(strategy).__name__.lower()}",
+            version=version,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="params",
+            set_metric_owner=set_metric_owner,
+        )
+        self._store_strategy_params_candidate_runtime_state(
+            strategy_id,
+            snap.candidate_id,
+            params_payload,
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        if set_metric_owner:
+            restored = self._restore_strategy_params_candidate_runtime_state(
+                strategy_id,
+                snap.candidate_id,
+            )
+            if restored:
+                self._set_metric_owner_binding(strategy_id, "params")
+                self._sync_evolution_strategy_metrics(strategy_id)
+        return snap.candidate_id
+
+    def _register_evolution_risk_params_candidate(
+        self,
+        *,
+        source: str,
+    ) -> Optional[str]:
+        if self._phase3_evolution is None:
+            return None
+
+        strategy_id = "phase2_risk_runtime"
+        params_payload = self._extract_risk_params_payload()
+        if not isinstance(params_payload, dict) or not params_payload:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        payload_signature = self._params_payload_signature(params_payload)
+        version = f"risk_{payload_signature[:12]}"
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="params")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:
+                current = None
+            if current is not None and current.version == version:
+                self._store_risk_params_candidate_runtime_state(
+                    strategy_id,
+                    current_candidate_id,
+                    params_payload,
+                )
+                return current_candidate_id
+
+        metadata = {
+            "strategy_id": strategy_id,
+            "family_key": f"{strategy_id}/params",
+            "binding_slot": "params",
+            "source": source,
+            "params_kind": "risk_params",
+            "params_payload": dict(params_payload),
+        }
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.PARAMS,
+            owner="risk/params",
+            version=version,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="params",
+            set_metric_owner=False,
+        )
+        self._store_risk_params_candidate_runtime_state(
+            strategy_id,
+            snap.candidate_id,
+            params_payload,
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        return snap.candidate_id
+
+    def _find_strategy_by_id(self, strategy_id: str):
+        for strategy in getattr(self, "_strategies", []):
+            if getattr(strategy, "strategy_id", "") == strategy_id:
+                return strategy
+        return None
+
+    def _ensure_phase3_candidate_bindings(self) -> None:
+        if not hasattr(self, "_phase3_strategy_candidates"):
+            self._phase3_strategy_candidates = {}
+        if not hasattr(self, "_phase3_strategy_candidate_bindings"):
+            self._phase3_strategy_candidate_bindings = {}
+        if not hasattr(self, "_phase3_strategy_metric_bindings"):
+            self._phase3_strategy_metric_bindings = {}
+        if not hasattr(self, "_phase3_params_artifact_signatures"):
+            self._phase3_params_artifact_signatures = {}
+
+    def _bind_evolution_candidate(
+        self,
+        strategy_id: str,
+        candidate_id: str,
+        *,
+        slot: str,
+        set_metric_owner: bool = False,
+    ) -> None:
+        self._ensure_phase3_candidate_bindings()
+        bindings = self._phase3_strategy_candidate_bindings.setdefault(strategy_id, {})
+        bindings[slot] = candidate_id
+
+        if strategy_id not in self._phase3_strategy_candidates:
+            self._phase3_strategy_candidates[strategy_id] = candidate_id
+
+        if set_metric_owner:
+            self._set_metric_owner_binding(strategy_id, slot)
+
+    def _get_evolution_candidate_id(
+        self,
+        strategy_id: str,
+        *,
+        slot: Optional[str] = None,
+        metric_owner: bool = False,
+    ) -> Optional[str]:
+        self._ensure_phase3_candidate_bindings()
+        bindings = self._phase3_strategy_candidate_bindings.get(strategy_id, {})
+
+        if slot is None and metric_owner:
+            slot = self._phase3_strategy_metric_bindings.get(strategy_id)
+
+        if slot is not None:
+            candidate_id = bindings.get(slot)
+            if candidate_id is not None:
+                return candidate_id
+            if slot != "params":
+                return self._phase3_strategy_candidates.get(strategy_id)
+            return None
+
+        return self._phase3_strategy_candidates.get(strategy_id)
+
+    def _set_metric_owner_binding(self, strategy_id: str, slot: str) -> None:
+        self._ensure_phase3_candidate_bindings()
+        candidate_id = self._get_evolution_candidate_id(strategy_id, slot=slot)
+        if candidate_id is None:
+            return
+
+        self._phase3_strategy_metric_bindings[strategy_id] = slot
+        self._phase3_strategy_candidates[strategy_id] = candidate_id
+
+        bindings = self._phase3_strategy_candidate_bindings.get(strategy_id, {})
+        for binding_slot, binding_candidate_id in bindings.items():
+            state = self._phase3_candidate_runtime_state.get(binding_candidate_id)
+            if isinstance(state, dict):
+                state["metric_owner"] = binding_slot == slot
+
+    @staticmethod
+    def _default_metric_binding_slot(active_slots: List[str]) -> Optional[str]:
+        for slot in ("model", "policy", "strategy", "params"):
+            if slot in active_slots:
+                return slot
+        return None
+
+    def _get_candidate_binding_slot(
+        self,
+        *,
+        candidate=None,
+        candidate_id: Optional[str] = None,
+    ) -> str:
+        metadata = getattr(candidate, "metadata", {}) or {}
+        slot = metadata.get("binding_slot")
+        if isinstance(slot, str) and slot:
+            return slot
+
+        state = self._phase3_candidate_runtime_state.get(candidate_id or "")
+        if isinstance(state, dict):
+            slot = state.get("binding_slot")
+            if isinstance(slot, str) and slot:
+                return slot
+
+            runtime_kind = state.get("runtime_kind")
+            if runtime_kind == "ml_params":
+                return "params"
+            if runtime_kind == "rl_policy":
+                return "policy"
+            if runtime_kind == "market_making":
+                return "strategy"
+            if runtime_kind == "ml_model":
+                return "model"
+
+        candidate_type = getattr(candidate, "candidate_type", None)
+        if candidate_type == "params":
+            return "params"
+        if candidate_type == "policy":
+            return "policy"
+        if candidate_type == "strategy":
+            return "strategy"
+
+        strategy_id = metadata.get("strategy_id")
+        if isinstance(strategy_id, str):
+            if strategy_id.startswith("phase3_rl_"):
+                return "policy"
+            if strategy_id.startswith("phase3_mm_"):
+                return "strategy"
+
+        return "model"
+
+    def _get_evolution_candidate_strategy_id(
+        self,
+        *,
+        candidate=None,
+        candidate_id: Optional[str] = None,
+    ) -> Optional[str]:
+        metadata = getattr(candidate, "metadata", {}) or {}
+        strategy_id = metadata.get("strategy_id")
+        if isinstance(strategy_id, str) and strategy_id:
+            return strategy_id
+
+        if candidate_id is None and candidate is not None:
+            candidate_id = getattr(candidate, "candidate_id", None)
+        if not candidate_id:
+            return None
+
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if isinstance(state, dict):
+            strategy_id = state.get("strategy_id")
+            if isinstance(strategy_id, str) and strategy_id:
+                return strategy_id
+
+        if self._phase3_evolution is not None:
+            try:
+                snapshot = self._phase3_evolution.get_candidate(candidate_id)
+            except Exception:  # noqa: BLE001
+                snapshot = None
+            metadata = getattr(snapshot, "metadata", {}) or {}
+            strategy_id = metadata.get("strategy_id")
+            if isinstance(strategy_id, str) and strategy_id:
+                return strategy_id
+
+        for strategy_id, bindings in self._phase3_strategy_candidate_bindings.items():
+            if candidate_id in bindings.values():
+                return strategy_id
+        return None
+
+    def _ml_params_artifact_signature(self, runtime_artifacts: Dict[str, Any]) -> str:
+        payload = {
+            "buy_threshold": runtime_artifacts.get("buy_threshold"),
+            "sell_threshold": runtime_artifacts.get("sell_threshold"),
+            "trainer_model_type": runtime_artifacts.get("trainer_model_type"),
+            "trainer_model_params": dict(runtime_artifacts.get("trainer_model_params") or {}),
+            "params_source": runtime_artifacts.get("params_source"),
+            "threshold_source": runtime_artifacts.get("threshold_source"),
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    def _load_strategy_ml_runtime_artifacts(self, strategy_id: str) -> Optional[Dict[str, Any]]:
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None or not hasattr(strategy, "model"):
+            return None
+
+        symbol = getattr(strategy, "symbol", None)
+        if not isinstance(symbol, str) or not symbol:
+            return None
+
+        model_dir = Path("./models")
+        if not model_dir.exists():
+            return None
+
+        learner = self._continuous_learners.get(strategy_id)
+        active_version = getattr(learner, "_active_version", None)
+        model_path_raw = getattr(active_version, "model_path", None)
+        model_path = Path(model_path_raw) if model_path_raw else None
+        return _load_ml_runtime_artifacts(model_dir, symbol, model_path)
+
+    def _maybe_rollout_updated_ml_params_candidates(self) -> None:
+        if self._phase3_evolution is None:
+            return
+
+        for strategy in getattr(self, "_strategies", []):
+            strategy_id = getattr(strategy, "strategy_id", "")
+            if not strategy_id or not hasattr(strategy, "model"):
+                continue
+
+            runtime_artifacts = self._load_strategy_ml_runtime_artifacts(strategy_id)
+            if not isinstance(runtime_artifacts, dict) or not runtime_artifacts:
+                continue
+
+            artifact_signature = self._ml_params_artifact_signature(runtime_artifacts)
+            previous_signature = self._phase3_params_artifact_signatures.get(strategy_id)
+            if previous_signature is None:
+                self._phase3_params_artifact_signatures[strategy_id] = artifact_signature
+                continue
+            if artifact_signature == previous_signature:
+                continue
+
+            learner = self._continuous_learners.get(strategy_id)
+            candidate_id = self._register_evolution_params_candidate(
+                strategy_id,
+                learner,
+                runtime_artifacts,
+                source="artifact_refresh",
+                set_metric_owner=True,
+            )
+            self._phase3_params_artifact_signatures[strategy_id] = artifact_signature
+            if candidate_id is None:
+                continue
+
+            log.info(
+                "[Phase3/EV] 参数工件变更已rollout: strategy_id={} candidate_id={} threshold_source={} params_source={}",
+                strategy_id,
+                candidate_id,
+                runtime_artifacts.get("threshold_source"),
+                runtime_artifacts.get("params_source"),
+            )
+
+    def _save_phase3_params_optimizer_state(self, **updates: Any) -> None:
+        state = dict(getattr(self, "_phase3_params_optimizer_state", {}) or {})
+        state.update(updates)
+
+        evolution = getattr(self, "_phase3_evolution", None)
+        if evolution is not None and callable(
+            getattr(evolution, "save_weekly_params_optimizer_state", None)
+        ):
+            try:
+                self._phase3_params_optimizer_state = (
+                    evolution.save_weekly_params_optimizer_state(state)
+                )
+                return
+            except Exception as exc:
+                log.warning("[Phase3/EV] 周级参数优化状态写入演进引擎失败: {}", exc)
+
+        self._phase3_params_optimizer_state = state
+
+        state_store = getattr(self, "_phase3_params_optimizer_state_store", None)
+        if state_store is None:
+            return
+
+        try:
+            state_store.save_scheduler_state(state)
+        except Exception as exc:
+            log.warning("[Phase3/EV] 周级参数优化状态保存失败: {}", exc)
+
+    @staticmethod
+    def _cron_field_matches(
+        expression: str,
+        value: int,
+        *,
+        minimum: int,
+        maximum: int,
+        sunday_is_zero: bool = False,
+    ) -> bool:
+        expression = (expression or "").strip()
+        if not expression:
+            return False
+        if expression == "*":
+            return True
+
+        def _normalize(raw: int) -> int:
+            if sunday_is_zero and raw == 7:
+                return 0
+            return raw
+
+        try:
+            for token in expression.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+
+                step = 1
+                if "/" in token:
+                    token, step_text = token.split("/", 1)
+                    step = max(1, int(step_text))
+
+                if token == "*":
+                    start, end = minimum, maximum
+                    if start <= value <= end and (value - start) % step == 0:
+                        return True
+                    continue
+
+                if "-" in token:
+                    start_text, end_text = token.split("-", 1)
+                    start = _normalize(int(start_text))
+                    end = _normalize(int(end_text))
+                    if start <= value <= end and (value - start) % step == 0:
+                        return True
+                    continue
+
+                candidate = _normalize(int(token))
+                if minimum <= candidate <= maximum and candidate == value:
+                    return True
+        except ValueError:
+            return False
+
+        return False
+
+    def _current_weekly_ml_params_optimization_slot(
+        self,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        now = now or datetime.now(timezone.utc)
+        evolution_cfg = getattr(getattr(self.sys_config, "phase3", None), "evolution", None)
+        cron_expr = getattr(evolution_cfg, "weekly_optimization_cron", "")
+        if not isinstance(cron_expr, str) or not cron_expr.strip():
+            return None
+
+        fields = cron_expr.split()
+        if len(fields) != 5:
+            log.warning("[Phase3/EV] 非法 weekly_optimization_cron，已跳过: {}", cron_expr)
+            return None
+
+        minute_expr, hour_expr, day_expr, month_expr, weekday_expr = fields
+        weekday_value = now.isoweekday() % 7
+        if not self._cron_field_matches(minute_expr, now.minute, minimum=0, maximum=59):
+            return None
+        if not self._cron_field_matches(hour_expr, now.hour, minimum=0, maximum=23):
+            return None
+        if not self._cron_field_matches(day_expr, now.day, minimum=1, maximum=31):
+            return None
+        if not self._cron_field_matches(month_expr, now.month, minimum=1, maximum=12):
+            return None
+        if not self._cron_field_matches(
+            weekday_expr,
+            weekday_value,
+            minimum=0,
+            maximum=6,
+            sunday_is_zero=True,
+        ):
+            return None
+
+        return now.replace(second=0, microsecond=0).isoformat()
+
+    def _start_weekly_ml_params_optimization(self, slot_id: str) -> bool:
+        if self._phase3_params_optimizer_running:
+            return False
+
+        worker = threading.Thread(
+            target=self._run_weekly_ml_params_optimization,
+            args=(slot_id,),
+            daemon=True,
+            name=f"phase3-weekly-params-{slot_id}",
+        )
+        self._phase3_params_optimizer_thread = worker
+        self._phase3_params_optimizer_running = True
+        worker.start()
+        return True
+
+    def _maybe_start_weekly_ml_params_optimization(
+        self,
+        now: Optional[datetime] = None,
+    ) -> None:
+        now = now or datetime.now(timezone.utc)
+        evolution = getattr(self, "_phase3_evolution", None)
+        if evolution is not None and callable(
+            getattr(evolution, "get_due_weekly_params_optimizer_slot", None)
+        ):
+            slot_id = evolution.get_due_weekly_params_optimizer_slot(now)
+            try:
+                self._phase3_params_optimizer_state = (
+                    evolution.weekly_params_optimizer_state()
+                )
+            except Exception:
+                pass
+        else:
+            slot_id = self._current_weekly_ml_params_optimization_slot(now)
+        if slot_id is None:
+            return
+
+        if self._phase3_params_optimizer_state.get("last_successful_slot") == slot_id:
+            return
+
+        worker = self._phase3_params_optimizer_thread
+        if self._phase3_params_optimizer_running or (
+            worker is not None and worker.is_alive()
+        ):
+            return
+
+        if evolution is not None and callable(
+            getattr(evolution, "record_weekly_params_optimizer_start", None)
+        ):
+            try:
+                self._phase3_params_optimizer_state = (
+                    evolution.record_weekly_params_optimizer_start(slot_id, now=now)
+                )
+            except Exception as exc:
+                log.warning("[Phase3/EV] 周级参数优化启动记录失败，回退本地状态: {}", exc)
+                self._save_phase3_params_optimizer_state(
+                    last_attempted_slot=slot_id,
+                    last_attempted_at=now.isoformat(),
+                    status="running",
+                )
+        else:
+            self._save_phase3_params_optimizer_state(
+                last_attempted_slot=slot_id,
+                last_attempted_at=now.isoformat(),
+                status="running",
+            )
+        if self._start_weekly_ml_params_optimization(slot_id):
+            log.info("[Phase3/EV] 周级参数优化任务已启动: slot={}", slot_id)
+
+    def _build_weekly_ml_optimization_dataframe(
+        self,
+        symbol: str,
+        *,
+        lookback_bars: int = 1200,
+        min_bars: int = 900,
+    ) -> Optional[pd.DataFrame]:
+        timeframe = getattr(getattr(self.sys_config, "data", None), "default_timeframe", "1m")
+        candles = self.gateway.fetch_ohlcv(symbol, timeframe=timeframe, limit=lookback_bars)
+        if not candles or len(candles) <= 1:
+            return None
+
+        rows: List[Dict[str, Any]] = []
+        for candle in candles[:-1]:
+            if not isinstance(candle, (list, tuple)) or len(candle) < 6:
+                continue
+            timestamp_ms, open_, high, low, close, volume = candle[:6]
+            rows.append(
+                {
+                    "timestamp": pd.to_datetime(timestamp_ms, unit="ms", utc=True),
+                    "open": float(open_),
+                    "high": float(high),
+                    "low": float(low),
+                    "close": float(close),
+                    "volume": float(volume),
+                    "symbol": symbol,
+                }
+            )
+
+        if len(rows) < min_bars:
+            return None
+
+        return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+    def _run_weekly_ml_params_optimization(self, slot_id: str) -> None:
+        optimized_symbols: List[Dict[str, Any]] = []
+        errors: Dict[str, str] = {}
+        evolution = getattr(self, "_phase3_evolution", None)
+
+        try:
+            from scripts.optimize_phase1_params import optimize_params_from_dataframe
+
+            seen_symbols: Set[str] = set()
+            for target in self._collect_phase3_param_optimization_targets():
+                if target.get("target_kind") != "ml_strategy":
+                    continue
+
+                strategy_id = str(target.get("strategy_id") or "")
+                symbol = target.get("symbol")
+                if (
+                    not strategy_id
+                    or not isinstance(symbol, str)
+                    or not symbol
+                    or symbol in seen_symbols
+                ):
+                    continue
+
+                seen_symbols.add(symbol)
+                try:
+                    df = self._build_weekly_ml_optimization_dataframe(symbol)
+                    if df is None or df.empty:
+                        errors[strategy_id] = "insufficient_ohlcv_data"
+                        continue
+
+                    result = optimize_params_from_dataframe(
+                        df,
+                        symbol=symbol,
+                        output_dir=Path("./models"),
+                    )
+                    candidate_id = None
+                    learner = self._continuous_learners.get(strategy_id)
+                    runtime_artifacts = self._load_strategy_ml_runtime_artifacts(strategy_id)
+                    if learner is not None and isinstance(runtime_artifacts, dict) and runtime_artifacts:
+                        candidate_id = self._register_evolution_params_candidate(
+                            strategy_id,
+                            learner,
+                            runtime_artifacts,
+                            source="weekly_optimization",
+                            set_metric_owner=False,
+                        )
+                    optimized_symbols.append(
+                        {
+                            "strategy_id": strategy_id,
+                            "symbol": symbol,
+                            "rows": int(len(df)),
+                            "runtime_threshold_path": str(result["runtime_threshold_path"]),
+                            "runtime_params_path": str(result["runtime_params_path"]),
+                            "candidate_id": candidate_id,
+                        }
+                    )
+                except Exception as exc:
+                    errors[strategy_id] = str(exc)
+                    log.exception(
+                        "[Phase3/EV] 周级参数优化失败: strategy_id={} symbol={}",
+                        strategy_id,
+                        symbol,
+                    )
+
+            finished_at = datetime.now(timezone.utc)
+            if optimized_symbols:
+                status = "success" if not errors else "partial_success"
+                if evolution is not None and callable(
+                    getattr(evolution, "record_weekly_params_optimizer_finish", None)
+                ):
+                    self._phase3_params_optimizer_state = (
+                        evolution.record_weekly_params_optimizer_finish(
+                            slot_id,
+                            status=status,
+                            optimized_symbols=optimized_symbols,
+                            errors=errors or None,
+                            now=finished_at,
+                        )
+                    )
+                else:
+                    self._save_phase3_params_optimizer_state(
+                        status=status,
+                        last_successful_slot=slot_id,
+                        last_successful_run_at=finished_at.isoformat(),
+                        last_finished_at=finished_at.isoformat(),
+                        optimized_symbols=optimized_symbols,
+                        last_error=errors or None,
+                    )
+                log.info(
+                    "[Phase3/EV] 周级参数优化完成: slot={} optimized_symbols={}",
+                    slot_id,
+                    [item.get("symbol") for item in optimized_symbols],
+                )
+                return
+
+            status = "skipped" if not errors else "error"
+            if evolution is not None and callable(
+                getattr(evolution, "record_weekly_params_optimizer_finish", None)
+            ):
+                self._phase3_params_optimizer_state = (
+                    evolution.record_weekly_params_optimizer_finish(
+                        slot_id,
+                        status=status,
+                        optimized_symbols=[],
+                        errors=errors or None,
+                        now=finished_at,
+                    )
+                )
+            else:
+                self._save_phase3_params_optimizer_state(
+                    status=status,
+                    last_finished_at=finished_at.isoformat(),
+                    optimized_symbols=[],
+                    last_error=errors or None,
+                )
+            if errors:
+                log.warning(
+                    "[Phase3/EV] 周级参数优化未产出工件: slot={} errors={}",
+                    slot_id,
+                    errors,
+                )
+            else:
+                log.info("[Phase3/EV] 周级参数优化跳过: slot={} reason=no_ml_strategies", slot_id)
+        except Exception as exc:
+            finished_at = datetime.now(timezone.utc)
+            if evolution is not None and callable(
+                getattr(evolution, "record_weekly_params_optimizer_finish", None)
+            ):
+                self._phase3_params_optimizer_state = (
+                    evolution.record_weekly_params_optimizer_finish(
+                        slot_id,
+                        status="error",
+                        optimized_symbols=[],
+                        errors={"task": str(exc)},
+                        now=finished_at,
+                    )
+                )
+            else:
+                self._save_phase3_params_optimizer_state(
+                    status="error",
+                    last_finished_at=finished_at.isoformat(),
+                    last_error=str(exc),
+                )
+            log.exception("[Phase3/EV] 周级参数优化任务执行失败: slot={}", slot_id)
+        finally:
+            self._phase3_params_optimizer_running = False
+
+    def _store_ml_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> None:
+        self._ensure_phase3_candidate_bindings()
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None or not hasattr(strategy, "model"):
+            return
+
+        state: Dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "ml_model",
+            "binding_slot": "model",
+            "model": strategy.model,
+            "metric_owner": self._phase3_strategy_metric_bindings.get(strategy_id) == "model",
+        }
+        cfg = getattr(strategy, "cfg", None)
+        if cfg is not None:
+            state["buy_threshold"] = getattr(cfg, "buy_threshold", None)
+            state["sell_threshold"] = getattr(cfg, "sell_threshold", None)
+
+        self._phase3_candidate_runtime_state[candidate_id] = state
+
+    def _store_ml_params_candidate_runtime_state(
+        self,
+        strategy_id: str,
+        candidate_id: str,
+        *,
+        learner=None,
+        runtime_artifacts: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._ensure_phase3_candidate_bindings()
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None:
+            return
+
+        cfg = getattr(strategy, "cfg", None)
+        buy_threshold = None
+        sell_threshold = None
+        trainer_model_type = None
+        trainer_model_params: Dict[str, Any] = {}
+        params_source = None
+        threshold_source = None
+
+        if isinstance(runtime_artifacts, dict):
+            buy_threshold = runtime_artifacts.get("buy_threshold")
+            sell_threshold = runtime_artifacts.get("sell_threshold")
+            trainer_model_type = runtime_artifacts.get("trainer_model_type")
+            trainer_model_params = dict(runtime_artifacts.get("trainer_model_params") or {})
+            params_source = runtime_artifacts.get("params_source")
+            threshold_source = runtime_artifacts.get("threshold_source")
+
+        if cfg is not None:
+            if buy_threshold is None:
+                buy_threshold = getattr(cfg, "buy_threshold", None)
+            if sell_threshold is None:
+                sell_threshold = getattr(cfg, "sell_threshold", None)
+
+        if learner is None:
+            learner = self._continuous_learners.get(strategy_id)
+        trainer = getattr(learner, "trainer", None)
+        if trainer is not None:
+            if trainer_model_type is None:
+                trainer_model_type = getattr(trainer, "model_type", None)
+            if not trainer_model_params:
+                trainer_model_params = dict(getattr(trainer, "model_params", {}) or {})
+
+        self._phase3_candidate_runtime_state[candidate_id] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "ml_params",
+            "binding_slot": "params",
+            "metric_owner": self._phase3_strategy_metric_bindings.get(strategy_id) == "params",
+            "buy_threshold": buy_threshold,
+            "sell_threshold": sell_threshold,
+            "trainer_model_type": trainer_model_type,
+            "trainer_model_params": trainer_model_params,
+            "params_source": params_source,
+            "threshold_source": threshold_source,
+        }
+
+    def _store_policy_candidate_runtime_state(self, strategy_id: str, candidate_id: str, policy) -> None:
+        self._ensure_phase3_candidate_bindings()
+        if policy is None:
+            return
+
+        self._phase3_candidate_runtime_state[candidate_id] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "rl_policy",
+            "binding_slot": "policy",
+            "policy": policy,
+            "policy_mode": self._phase3_rl_policy_mode,
+            "metric_owner": self._phase3_strategy_metric_bindings.get(strategy_id) == "policy",
+        }
+
+    def _store_market_making_candidate_runtime_state(self, strategy_id: str, candidate_id: str, strategy) -> None:
+        self._ensure_phase3_candidate_bindings()
+        if strategy is None:
+            return
+
+        self._phase3_candidate_runtime_state[candidate_id] = {
+            "strategy_id": strategy_id,
+            "runtime_kind": "market_making",
+            "binding_slot": "strategy",
+            "strategy": strategy,
+            "metric_owner": self._phase3_strategy_metric_bindings.get(strategy_id) == "strategy",
+        }
+
+    def _restore_ml_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None or not hasattr(strategy, "model"):
+            return False
+
+        strategy.model = state["model"]
+        buy_threshold = state.get("buy_threshold")
+        sell_threshold = state.get("sell_threshold")
+        if (
+            buy_threshold is not None
+            and sell_threshold is not None
+            and hasattr(strategy, "set_thresholds")
+        ):
+            strategy.set_thresholds(float(buy_threshold), float(sell_threshold))
+
+        return True
+
+    def _restore_policy_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        policy = state.get("policy")
+        if policy is None:
+            return False
+
+        self._phase3_ppo = policy
+        policy_mode = state.get("policy_mode")
+        if isinstance(policy_mode, str) and policy_mode:
+            self._phase3_rl_policy_mode = policy_mode
+        return True
+
+    def _restore_ml_params_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        strategy = self._find_strategy_by_id(strategy_id)
+        if strategy is None:
+            return False
+
+        buy_threshold = state.get("buy_threshold")
+        sell_threshold = state.get("sell_threshold")
+        restored = False
+        if buy_threshold is not None and sell_threshold is not None:
+            if hasattr(strategy, "set_thresholds"):
+                strategy.set_thresholds(float(buy_threshold), float(sell_threshold))
+            else:
+                cfg = getattr(strategy, "cfg", None)
+                if cfg is not None:
+                    cfg.buy_threshold = float(buy_threshold)
+                    cfg.sell_threshold = float(sell_threshold)
+            restored = True
+
+        learner = self._continuous_learners.get(strategy_id)
+        if learner is not None:
+            if buy_threshold is not None:
+                learner._optimal_buy_threshold = float(buy_threshold)
+                restored = True
+            if sell_threshold is not None:
+                learner._optimal_sell_threshold = float(sell_threshold)
+                restored = True
+
+            trainer = getattr(learner, "trainer", None)
+            if trainer is not None:
+                trainer_model_type = state.get("trainer_model_type")
+                if isinstance(trainer_model_type, str) and trainer_model_type:
+                    trainer.model_type = trainer_model_type
+                    restored = True
+
+                trainer_model_params = state.get("trainer_model_params")
+                if isinstance(trainer_model_params, dict):
+                    trainer.model_params = dict(trainer_model_params)
+                    restored = True
+
+        return restored
+
+    def _restore_strategy_params_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        strategy = self._find_strategy_by_id(strategy_id)
+        params_payload = state.get("params_payload")
+        if strategy is None or not isinstance(params_payload, dict) or not params_payload:
+            return False
+
+        self._apply_marshaled_param_payload(strategy, params_payload)
+        return True
+
+    def _restore_risk_params_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        params_payload = state.get("params_payload")
+        if not isinstance(params_payload, dict) or not params_payload:
+            return False
+
+        restored = False
+        risk_manager_cfg = getattr(getattr(self, "risk_manager", None), "config", None)
+        if risk_manager_cfg is not None and isinstance(params_payload.get("risk_manager"), dict):
+            self._apply_marshaled_param_payload(
+                risk_manager_cfg,
+                params_payload["risk_manager"],
+            )
+            restored = True
+
+        adaptive_cfg = getattr(getattr(self, "_adaptive_risk", None), "config", None)
+        if adaptive_cfg is not None and isinstance(params_payload.get("adaptive_risk"), dict):
+            self._apply_marshaled_param_payload(
+                adaptive_cfg,
+                params_payload["adaptive_risk"],
+            )
+            restored = True
+
+        budget_cfg = getattr(getattr(self, "_budget_checker", None), "config", None)
+        if budget_cfg is not None and isinstance(params_payload.get("budget_checker"), dict):
+            self._apply_marshaled_param_payload(
+                budget_cfg,
+                params_payload["budget_checker"],
+            )
+            restored = True
+
+        kill_switch_cfg = getattr(getattr(self, "_kill_switch", None), "config", None)
+        if kill_switch_cfg is not None and isinstance(params_payload.get("kill_switch"), dict):
+            self._apply_marshaled_param_payload(
+                kill_switch_cfg,
+                params_payload["kill_switch"],
+            )
+            restored = True
+
+        position_sizer_cfg = params_payload.get("position_sizer")
+        if isinstance(position_sizer_cfg, dict) and self.position_sizer is not None:
+            max_position_pct = position_sizer_cfg.get("max_position_pct")
+            if max_position_pct is not None:
+                self.position_sizer._max_position_pct = Decimal(str(max_position_pct))
+                restored = True
+
+        return restored
+
+    def _restore_params_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        runtime_kind = state.get("runtime_kind")
+        if runtime_kind == "ml_params":
+            return self._restore_ml_params_candidate_runtime_state(strategy_id, candidate_id)
+        if runtime_kind == "strategy_params":
+            return self._restore_strategy_params_candidate_runtime_state(
+                strategy_id,
+                candidate_id,
+            )
+        if runtime_kind == "risk_params":
+            return self._restore_risk_params_candidate_runtime_state(
+                strategy_id,
+                candidate_id,
+            )
+        return False
+
+    def _restore_market_making_candidate_runtime_state(self, strategy_id: str, candidate_id: str) -> bool:
+        state = self._phase3_candidate_runtime_state.get(candidate_id)
+        if not isinstance(state, dict) or state.get("strategy_id") != strategy_id:
+            return False
+
+        strategy = state.get("strategy")
+        if strategy is None:
+            return False
+
+        self._phase3_mm = strategy
+        return True
+
+    def _restore_evolution_slot_runtime_state(self, strategy_id: str, slot: str) -> bool:
+        candidate_id = self._get_evolution_candidate_id(strategy_id, slot=slot)
+        if candidate_id is None:
+            return False
+
+        if slot == "model":
+            return self._restore_ml_candidate_runtime_state(strategy_id, candidate_id)
+        if slot == "params":
+            return self._restore_params_candidate_runtime_state(strategy_id, candidate_id)
+        if slot == "policy":
+            return self._restore_policy_candidate_runtime_state(strategy_id, candidate_id)
+        if slot == "strategy":
+            return self._restore_market_making_candidate_runtime_state(strategy_id, candidate_id)
+        return False
+
+    def _get_evolution_realized_trade_pnls(
+        self,
+        strategy_id: str,
+        *,
+        limit: Optional[int] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[float]:
+        if strategy_id.startswith("phase3_mm_"):
+            records = list(self._phase3_mm_realized_trade_records.get(strategy_id, []))
+            if end_time is not None:
+                records = [r for r in records if r.get("timestamp") <= end_time]
+            if limit is not None and limit > 0:
+                records = records[-limit:]
+            return [float(r.get("pnl", 0.0)) for r in records]
+
+        if hasattr(self, "attributor"):
+            return self.attributor.get_strategy_realized_trade_pnls(
+                strategy_id,
+                limit=limit,
+                end_time=end_time,
+            )
+        return []
+
+    def _get_market_making_evolution_metrics(
+        self,
+        strategy_id: str,
+        *,
+        min_samples: int = 5,
+    ) -> Dict[str, float]:
+        pnl_series = np.array(
+            self._get_evolution_realized_trade_pnls(strategy_id),
+            dtype=float,
+        )
+        if len(pnl_series) < min_samples:
+            return {}
+
+        mean_pnl = float(np.mean(pnl_series))
+        std_pnl = float(np.std(pnl_series, ddof=1)) if len(pnl_series) > 1 else 0.0
+        if std_pnl > 1e-12:
+            sharpe_proxy = mean_pnl / std_pnl * float(np.sqrt(len(pnl_series)))
+        elif abs(mean_pnl) > 1e-12:
+            sharpe_proxy = float(np.sign(mean_pnl) * min(np.sqrt(len(pnl_series)), 3.0))
+        else:
+            sharpe_proxy = 0.0
+
+        base_equity = max(float(np.sum(np.abs(pnl_series))), 1.0)
+        equity_curve = base_equity + np.cumsum(pnl_series)
+        rolling_peak = np.maximum.accumulate(np.concatenate(([base_equity], equity_curve)))
+        drawdown = (rolling_peak[1:] - equity_curve) / np.maximum(rolling_peak[1:], 1.0)
+        max_drawdown = float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
+        win_rate = float(np.sum(pnl_series > 0) / len(pnl_series))
+
+        return {
+            "strategy_id": strategy_id,
+            "sell_trades": float(len(pnl_series)),
+            "sharpe_30d": round(sharpe_proxy, 6),
+            "max_drawdown_30d": round(max_drawdown, 6),
+            "win_rate_30d": round(win_rate, 6),
+            "total_realized_pnl_usdt": round(float(np.sum(pnl_series)), 4),
+        }
+
+    def _record_market_making_evolution_feedback(self, strategy_id: str, decision: object) -> None:
+        if self._phase3_evolution is None or self._phase3_mm is None:
+            return
+
+        diagnostics = {}
+        try:
+            diagnostics = self._phase3_mm.diagnostics()
+        except Exception:  # noqa: BLE001
+            diagnostics = {}
+
+        inventory = diagnostics.get("inventory", {}) if isinstance(diagnostics, dict) else {}
+        realized_pnl = float(inventory.get("realized_pnl", 0.0) or 0.0)
+        previous_realized_pnl = self._phase3_mm_last_realized_pnl.get(strategy_id)
+        if previous_realized_pnl is None:
+            self._phase3_mm_last_realized_pnl[strategy_id] = realized_pnl
+        else:
+            pnl_delta = realized_pnl - previous_realized_pnl
+            if abs(pnl_delta) > 1e-9:
+                self._phase3_mm_realized_trade_records.setdefault(strategy_id, []).append({
+                    "timestamp": datetime.now(tz=timezone.utc),
+                    "pnl": float(pnl_delta),
+                })
+                self._phase3_mm_last_realized_pnl[strategy_id] = realized_pnl
+                self._sync_evolution_strategy_metrics(strategy_id)
+                self._record_evolution_ab_step(strategy_id, float(pnl_delta))
+
+        reason_codes = list(getattr(decision, "reason_codes", []) or [])
+        halt_reason = next(
+            (
+                reason
+                for reason in reason_codes
+                if reason in {"RISK_BLOCKED", "INVENTORY_HALT", "SNAPSHOT_UNHEALTHY"}
+            ),
+            None,
+        )
+        previous_halt_reason = self._phase3_mm_last_halt_reason.get(strategy_id)
+        if halt_reason is None:
+            self._phase3_mm_last_halt_reason.pop(strategy_id, None)
+        elif halt_reason != previous_halt_reason:
+            self._phase3_mm_last_halt_reason[strategy_id] = halt_reason
+            self._record_evolution_risk_violation(
+                strategy_id,
+                stage=f"market-making:{halt_reason.lower()}",
+            )
+
+    def _apply_evolution_runtime_state(self, report) -> None:
+        active_snapshot = list(getattr(report, "active_snapshot", []) or [])
+        if not active_snapshot:
+            return
+
+        previous_metric_bindings = dict(
+            getattr(self, "_phase3_strategy_metric_bindings", {}) or {}
+        )
+        params_transitioned_strategies: Set[str] = set()
+        for decision in list(getattr(report, "decisions", []) or []):
+            candidate_id = getattr(decision, "candidate_id", None)
+            if not candidate_id:
+                continue
+            if self._get_candidate_binding_slot(candidate_id=candidate_id) != "params":
+                continue
+            strategy_id = self._get_evolution_candidate_strategy_id(
+                candidate_id=candidate_id,
+            )
+            if strategy_id:
+                params_transitioned_strategies.add(strategy_id)
+
+        ordered_snapshot = sorted(
+            active_snapshot,
+            key=lambda candidate: 1
+            if self._get_candidate_binding_slot(
+                candidate=candidate,
+                candidate_id=getattr(candidate, "candidate_id", None),
+            )
+            == "params"
+            else 0,
+        )
+        active_slots_by_strategy: Dict[str, set[str]] = {}
+
+        for candidate in ordered_snapshot:
+            strategy_id = self._get_evolution_candidate_strategy_id(candidate=candidate)
+            if not strategy_id:
+                continue
+
+            active_candidate_id = getattr(candidate, "candidate_id", None)
+            if not active_candidate_id:
+                continue
+
+            slot = self._get_candidate_binding_slot(
+                candidate=candidate,
+                candidate_id=active_candidate_id,
+            )
+            active_slots_by_strategy.setdefault(strategy_id, set()).add(slot)
+            current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot=slot)
+            if current_candidate_id == active_candidate_id:
+                self._bind_evolution_candidate(
+                    strategy_id,
+                    active_candidate_id,
+                    slot=slot,
+                    set_metric_owner=False,
+                )
+                continue
+
+            strategy = self._find_strategy_by_id(strategy_id)
+            restored = False
+            if slot == "params":
+                restored = self._restore_params_candidate_runtime_state(
+                    strategy_id,
+                    active_candidate_id,
+                )
+            elif strategy is not None and hasattr(strategy, "model"):
+                restored = self._restore_ml_candidate_runtime_state(
+                    strategy_id,
+                    active_candidate_id,
+                )
+            elif slot == "strategy" or strategy_id.startswith("phase3_mm_"):
+                restored = self._restore_market_making_candidate_runtime_state(
+                    strategy_id,
+                    active_candidate_id,
+                )
+            elif slot == "policy" or strategy_id.startswith("phase3_rl_"):
+                restored = self._restore_policy_candidate_runtime_state(
+                    strategy_id,
+                    active_candidate_id,
+                )
+
+            if not restored and slot in {"model", "params"} and strategy is not None and hasattr(strategy, "model"):
+                continue
+            if (
+                not restored
+                and strategy is None
+                and slot not in {"policy", "strategy"}
+                and not strategy_id.startswith("phase3_rl_")
+                and not strategy_id.startswith("phase3_mm_")
+            ):
+                continue
+
+            self._bind_evolution_candidate(
+                strategy_id,
+                active_candidate_id,
+                slot=slot,
+                set_metric_owner=False,
+            )
+            log.info(
+                "[Phase3/EV] runtime active candidate 已同步: strategy_id={} slot={} candidate_id={} restored={}",
+                strategy_id,
+                slot,
+                active_candidate_id,
+                restored,
+            )
+
+        for strategy_id, active_slots in active_slots_by_strategy.items():
+            if strategy_id in params_transitioned_strategies:
+                if "params" in active_slots:
+                    restored = self._restore_evolution_slot_runtime_state(
+                        strategy_id,
+                        "params",
+                    )
+                    self._set_metric_owner_binding(strategy_id, "params")
+                    log.info(
+                        "[Phase3/EV] 参数候选生产切换已同步: strategy_id={} slot=params restored={}",
+                        strategy_id,
+                        restored,
+                    )
+                    continue
+
+                fallback_slot = self._default_metric_binding_slot(
+                    sorted(slot for slot in active_slots if slot != "params")
+                )
+                if fallback_slot is not None:
+                    restored = self._restore_evolution_slot_runtime_state(
+                        strategy_id,
+                        fallback_slot,
+                    )
+                    self._set_metric_owner_binding(strategy_id, fallback_slot)
+                    log.info(
+                        "[Phase3/EV] 参数候选生产回滚已同步: strategy_id={} slot={} restored={}",
+                        strategy_id,
+                        fallback_slot,
+                        restored,
+                    )
+                    continue
+
+            metric_slot = previous_metric_bindings.get(strategy_id)
+            if metric_slot not in active_slots:
+                metric_slot = self._default_metric_binding_slot(sorted(active_slots))
+            if metric_slot is not None:
+                self._set_metric_owner_binding(strategy_id, metric_slot)
+
+    def _sync_evolution_strategy_metrics(self, strategy_id: str) -> None:
+        """将按策略聚合的真实成交指标回灌给当前候选。"""
+        if self._phase3_evolution is None:
+            return
+
+        candidate_id = self._get_evolution_candidate_id(strategy_id, metric_owner=True)
+        if candidate_id is None:
+            return
+
+        if strategy_id.startswith("phase3_mm_"):
+            metrics = self._get_market_making_evolution_metrics(strategy_id)
+        else:
+            if not hasattr(self, "attributor"):
+                return
+            try:
+                metrics = self.attributor.get_strategy_evolution_metrics(strategy_id)
+            except Exception:  # noqa: BLE001
+                log.debug("[Phase3/EV] 策略指标提取失败（已忽略）: strategy_id={}", strategy_id)
+                return
+
+        if not isinstance(metrics, dict) or not metrics:
+            return
+
+        self._phase3_evolution.update_metrics(
+            candidate_id,
+            sharpe_30d=metrics.get("sharpe_30d"),
+            max_drawdown_30d=metrics.get("max_drawdown_30d"),
+            win_rate_30d=metrics.get("win_rate_30d"),
+        )
+        log.debug(
+            "[Phase3/EV] 候选指标已回灌: strategy_id={} candidate_id={} sharpe={} maxdd={} win_rate={}",
+            strategy_id,
+            candidate_id,
+            metrics.get("sharpe_30d"),
+            metrics.get("max_drawdown_30d"),
+            metrics.get("win_rate_30d"),
+        )
+
+    def _record_evolution_risk_violation(
+        self,
+        strategy_id: str,
+        *,
+        n: int = 1,
+        stage: Optional[str] = None,
+    ) -> None:
+        """将风控拒单同步为候选风险违规计数。"""
+        if self._phase3_evolution is None:
+            return
+
+        candidate_id = self._get_evolution_candidate_id(strategy_id, metric_owner=True)
+        if candidate_id is None:
+            return
+
+        self._phase3_evolution.record_risk_violation(candidate_id, n=n)
+        log.debug(
+            "[Phase3/EV] 风险违规已记录: strategy_id={} candidate_id={} stage={} n={}",
+            strategy_id,
+            candidate_id,
+            stage or "unknown",
+            n,
+        )
+
+    def _register_evolution_market_making_candidate(
+        self,
+        strategy,
+        *,
+        source: str,
+    ) -> Optional[str]:
+        """注册 Phase 3 做市策略候选。"""
+        if self._phase3_evolution is None or strategy is None:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        cfg = getattr(strategy, "config", None)
+        symbol = getattr(cfg, "symbol", "BTC/USDT")
+        symbol_key = _normalize_symbol_key(symbol)
+        gamma = float(getattr(getattr(cfg, "avellaneda", None), "gamma", 0.12))
+        max_inventory_pct = float(
+            getattr(getattr(cfg, "inventory", None), "max_inventory_pct", 0.20)
+        )
+        version = f"g{gamma:.4f}_inv{max_inventory_pct:.4f}".replace(".", "p")
+        strategy_id = f"phase3_mm_{symbol_key}"
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="strategy")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:  # noqa: BLE001
+                current = None
+            if current is not None and current.version == version:
+                self._store_market_making_candidate_runtime_state(
+                    strategy_id,
+                    current_candidate_id,
+                    strategy,
+                )
+                return current_candidate_id
+
+        metadata = {
+            "strategy_id": strategy_id,
+            "family_key": f"mm/avellaneda/{symbol_key}",
+            "binding_slot": "strategy",
+            "source": source,
+            "symbol": symbol,
+            "exchange": getattr(cfg, "exchange", None),
+            "gamma": gamma,
+            "max_inventory_pct": max_inventory_pct,
+            "paper_mode": getattr(cfg, "paper_mode", None),
+        }
+
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.STRATEGY,
+            owner="market_making/avellaneda",
+            version=version,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="strategy",
+            set_metric_owner=True,
+        )
+        self._store_market_making_candidate_runtime_state(strategy_id, snap.candidate_id, strategy)
+        log.info(
+            "[Phase3/EV] 做市候选已注册: strategy_id={} candidate_id={} version={} source={}",
+            strategy_id,
+            snap.candidate_id,
+            version,
+            source,
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        return snap.candidate_id
+
+    def _register_evolution_policy_candidate(
+        self,
+        policy,
+        *,
+        source: str,
+    ) -> Optional[str]:
+        """注册 Phase 3 RL policy 候选，并绑定到 paper 订单使用的 strategy_id。"""
+        if self._phase3_evolution is None or policy is None:
+            return None
+
+        from modules.alpha.contracts.evolution_types import CandidateType
+
+        version = None
+        if hasattr(policy, "version"):
+            try:
+                version = policy.version()
+            except Exception:  # noqa: BLE001
+                version = None
+        if version is None:
+            version = getattr(policy, "_version", "ppo_v0")
+
+        strategy_id = f"phase3_rl_{version}"
+        current_candidate_id = self._get_evolution_candidate_id(strategy_id, slot="policy")
+        if current_candidate_id is not None:
+            try:
+                current = self._phase3_evolution.get_candidate(current_candidate_id)
+            except Exception:  # noqa: BLE001
+                current = None
+            if current is not None and current.version == version:
+                self._store_policy_candidate_runtime_state(
+                    strategy_id,
+                    current_candidate_id,
+                    policy,
+                )
+                return current_candidate_id
+
+        metadata = {
+            "strategy_id": strategy_id,
+            "family_key": "rl/ppo",
+            "binding_slot": "policy",
+            "policy_mode": self._phase3_rl_policy_mode,
+            "source": source,
+        }
+        if hasattr(policy, "config"):
+            metadata.update({
+                "obs_dim": getattr(policy.config, "obs_dim", None),
+                "n_actions": getattr(policy.config, "n_actions", None),
+            })
+
+        snap = self._phase3_evolution.register_candidate(
+            CandidateType.POLICY,
+            owner="rl/ppo",
+            version=version,
+            metadata=metadata,
+        )
+        self._bind_evolution_candidate(
+            strategy_id,
+            snap.candidate_id,
+            slot="policy",
+            set_metric_owner=True,
+        )
+        self._store_policy_candidate_runtime_state(strategy_id, snap.candidate_id, policy)
+        log.info(
+            "[Phase3/EV] RL policy 候选已注册: strategy_id={} candidate_id={} version={} source={}",
+            strategy_id,
+            snap.candidate_id,
+            version,
+            source,
+        )
+        self._activate_or_stage_evolution_candidate(
+            snap.candidate_id,
+            strategy_id=strategy_id,
+            family_key=metadata["family_key"],
+            source=source,
+        )
+        self._sync_evolution_strategy_metrics(strategy_id)
+        return snap.candidate_id
+
+    def _activate_or_stage_evolution_candidate(
+        self,
+        candidate_id: str,
+        *,
+        strategy_id: str,
+        family_key: str,
+        source: str,
+    ) -> None:
+        """初始运行版本直接标记为 active baseline；后续版本尝试启动 A/B。"""
+        if self._phase3_evolution is None:
+            return
+
+        from modules.alpha.contracts.evolution_types import CandidateStatus
+
+        active_baseline = self._get_active_candidate_for_family(family_key)
+        if source in {"initial_load", "phase3_init"}:
+            if active_baseline is None:
+                self._phase3_evolution.force_promote(
+                    candidate_id,
+                    CandidateStatus.ACTIVE,
+                    reason="INITIAL_RUNTIME_BASELINE",
+                )
+            return
+
+        if active_baseline is None or active_baseline.candidate_id == candidate_id:
+            return
+
+        self._bootstrap_evolution_ab_experiment(
+            control_candidate=active_baseline,
+            test_candidate_id=candidate_id,
+            test_strategy_id=strategy_id,
+        )
+
+    def _get_active_candidate_for_family(self, family_key: str):
+        """按 family_key 查找当前 active baseline。"""
+        if self._phase3_evolution is None:
+            return None
+
+        try:
+            active_candidates = self._phase3_evolution.list_active()
+        except Exception:  # noqa: BLE001
+            return None
+
+        if not isinstance(active_candidates, list):
+            return None
+
+        for candidate in active_candidates:
+            metadata = getattr(candidate, "metadata", {}) or {}
+            if metadata.get("family_key") == family_key:
+                return candidate
+        return None
+
+    def _bootstrap_evolution_ab_experiment(
+        self,
+        *,
+        control_candidate,
+        test_candidate_id: str,
+        test_strategy_id: str,
+    ) -> Optional[str]:
+        """用当前 active baseline 的最近真实成交 PnL 预填 control 样本。"""
+        if self._phase3_evolution is None:
+            return None
+        if test_candidate_id in self._phase3_candidate_experiments:
+            return self._phase3_candidate_experiments[test_candidate_id]
+
+        ab_cfg = getattr(getattr(self._phase3_evolution, "config", None), "ab_test", None)
+        min_samples = max(int(getattr(ab_cfg, "min_samples", 0)), 1)
+        control_strategy_id = (getattr(control_candidate, "metadata", {}) or {}).get("strategy_id")
+        if not control_strategy_id:
+            return None
+
+        try:
+            control_pnls = self._get_evolution_realized_trade_pnls(
+                control_strategy_id,
+                limit=min_samples,
+                end_time=datetime.now(tz=timezone.utc),
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("[Phase3/EV] control PnL 历史提取失败（已忽略）: strategy_id={}", control_strategy_id)
+            return None
+
+        if len(control_pnls) < min_samples:
+            return None
+
+        experiment_id = self._phase3_evolution.create_ab_experiment(
+            control_candidate.candidate_id,
+            test_candidate_id,
+        )
+        for pnl in control_pnls:
+            self._phase3_evolution.record_ab_step(
+                experiment_id,
+                is_test=False,
+                step_pnl=float(pnl),
+            )
+
+        self._phase3_candidate_experiments[test_candidate_id] = experiment_id
+        log.info(
+            "[Phase3/EV] A/B 实验已启动: experiment_id={} control={} test={} control_samples={} strategy_id={}",
+            experiment_id,
+            control_candidate.candidate_id,
+            test_candidate_id,
+            len(control_pnls),
+            test_strategy_id,
+        )
+        return experiment_id
+
+    def _record_evolution_ab_step(self, strategy_id: str, step_pnl: float) -> None:
+        """向候选的 A/B 实验写入 test 侧成交 PnL，并在样本满足后自动收尾。"""
+        if self._phase3_evolution is None:
+            return
+
+        candidate_id = self._get_evolution_candidate_id(strategy_id, metric_owner=True)
+        if candidate_id is None:
+            return
+
+        experiment_id = self._phase3_candidate_experiments.get(candidate_id)
+        if experiment_id is None:
+            return
+
+        self._phase3_evolution.record_ab_step(
+            experiment_id,
+            is_test=True,
+            step_pnl=float(step_pnl),
+        )
+
+        try:
+            status = self._phase3_evolution.ab_experiment_status(experiment_id)
+        except Exception:  # noqa: BLE001
+            status = None
+
+        if status and status.get("has_sufficient_samples"):
+            result = self._phase3_evolution.conclude_ab_experiment(experiment_id)
+            if result is not None:
+                self._phase3_candidate_experiments.pop(candidate_id, None)
+                log.info(
+                    "[Phase3/EV] A/B 实验已完结: experiment_id={} candidate_id={} lift={:+.4f}",
+                    experiment_id,
+                    candidate_id,
+                    result.lift,
+                )
 
     def _on_fill(self, fill) -> None:
         """处理成交回报：更新持仓和入场均价，记录指标，写入交易日志。"""
@@ -1919,6 +4373,9 @@ class LiveTrader:
                 rec.strategy_id, rec.symbol, rec.side,
                 float(fill.new_filled_qty), float(fill.avg_price),
             )
+            self._sync_evolution_strategy_metrics(rec.strategy_id)
+            if rec.side == "sell":
+                self._record_evolution_ab_step(rec.strategy_id, pnl)
         except Exception:
             log.debug("[Attributor] record_trade 失败（非关键）")
 
@@ -2599,7 +5056,7 @@ def _register_ml_strategies(trader, symbols: list) -> None:
     """
     from modules.alpha.ml.predictor_v2 import MLPredictor as MLPredictorV2, PredictorConfig
     from modules.alpha.ml.model import SignalModel
-    from modules.alpha.ml.feature_builder import MLFeatureBuilder, FeatureConfig
+    from modules.alpha.ml.feature_builder import MLFeatureBuilder
     from modules.alpha.ml.continuous_learner import ContinuousLearner, ContinuousLearnerConfig
     from modules.alpha.ml.trainer import WalkForwardTrainer
     from modules.alpha.ml.labeler import ReturnLabeler
@@ -2618,7 +5075,7 @@ def _register_ml_strategies(trader, symbols: list) -> None:
 
     registered = 0
     for symbol in symbols:
-        symbol_safe = symbol.replace("/", "").lower()
+        symbol_safe = _normalize_symbol_key(symbol)
 
         # 按优先级查找模型文件
         model_path = None
@@ -2635,11 +5092,18 @@ def _register_ml_strategies(trader, symbols: list) -> None:
         try:
             log.info("[MLReg] 加载 ML 模型: {} → {}", symbol, model_path)
             model = SignalModel.load(model_path)
+            runtime_artifacts = _load_ml_runtime_artifacts(model_dir, symbol, model_path)
+            log.info(
+                "[MLReg] 运行时工件: {} threshold_source={} trainer_source={}",
+                symbol,
+                runtime_artifacts["threshold_source"],
+                runtime_artifacts["params_source"] or getattr(model, "model_type", "default"),
+            )
 
-            # 使用较保守的配置（实际阈值在首次 ContinuousLearner 重训后自动更新）
+            # 优先使用离线优化产物；无工件时回退到保守默认值。
             config = PredictorConfig(
-                buy_threshold=0.60,
-                sell_threshold=0.40,
+                buy_threshold=runtime_artifacts["buy_threshold"],
+                sell_threshold=runtime_artifacts["sell_threshold"],
                 order_qty=ml_qty_map.get(symbol, 0.001),
                 cooling_bars=5,
                 min_buffer_size=300,
@@ -2663,12 +5127,22 @@ def _register_ml_strategies(trader, symbols: list) -> None:
             # ── ContinuousLearner 接入（如已启用）─────────────────
             cl_cfg = trader.sys_config.continuous_learning
             if cl_cfg.enabled:
+                evolution_registered = False
                 try:
                     feature_builder = MLFeatureBuilder()
                     labeler = ReturnLabeler()
+                    trainer_model_type = (
+                        runtime_artifacts["trainer_model_type"]
+                        or getattr(model, "model_type", "rf")
+                    )
+                    trainer_model_params = dict(runtime_artifacts["trainer_model_params"])
+                    if not trainer_model_params:
+                        trainer_model_params = dict(getattr(model, "params", {}) or {})
                     trainer = WalkForwardTrainer(
                         feature_builder=feature_builder,
                         labeler=labeler,
+                        model_type=trainer_model_type,
+                        model_params=trainer_model_params,
                         calibrate=True,
                         feature_selection=True,
                     )
@@ -2708,8 +5182,35 @@ def _register_ml_strategies(trader, symbols: list) -> None:
                         "[MLReg] ContinuousLearner 已绑定: {} retrain_every={}",
                         predictor.strategy_id, cl_cfg.retrain_every_n_bars,
                     )
+                    trader._register_evolution_model_candidate(
+                        predictor.strategy_id,
+                        learner,
+                        model,
+                        source="initial_load",
+                        model_path=str(model_path),
+                    )
+                    evolution_registered = True
                 except Exception as cl_exc:
                     log.warning("[MLReg] ContinuousLearner 创建失败: {} error={}", symbol, cl_exc)
+            else:
+                evolution_registered = False
+
+            if not evolution_registered:
+                trader._register_evolution_model_candidate(
+                    predictor.strategy_id,
+                    None,
+                    model,
+                    source="initial_load",
+                    model_path=str(model_path),
+                )
+
+            trader._register_evolution_params_candidate(
+                predictor.strategy_id,
+                trader._continuous_learners.get(predictor.strategy_id),
+                runtime_artifacts,
+                source="initial_load",
+                set_metric_owner=False,
+            )
         except Exception as exc:
             log.warning("[MLReg] ML 策略注册失败: {} error={}", symbol, exc)
 
@@ -2717,6 +5218,103 @@ def _register_ml_strategies(trader, symbols: list) -> None:
         log.info("[MLReg] ML 策略注册完成: {} 个品种", registered)
     else:
         log.info("[MLReg] 无可用 ML 模型文件，ML 策略未注册（可通过 train_ml_model.py 训练）")
+
+
+def _normalize_symbol_key(symbol: str) -> str:
+    return "".join(ch for ch in symbol.lower() if ch.isalnum())
+
+
+def _load_ml_runtime_artifacts(
+    model_dir: Path,
+    symbol: str,
+    model_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """加载 ML runtime 可消费的阈值/参数工件。"""
+    from modules.alpha.ml.model_registry import ModelRegistry
+    from modules.alpha.ml.threshold_calibrator import CalibrationResult
+
+    runtime_artifacts: Dict[str, Any] = {
+        "buy_threshold": 0.60,
+        "sell_threshold": 0.40,
+        "threshold_source": "default",
+        "trainer_model_type": None,
+        "trainer_model_params": {},
+        "params_source": None,
+    }
+
+    symbol_safe = _normalize_symbol_key(symbol)
+
+    for threshold_path in (
+        model_dir / f"{symbol_safe}_threshold.json",
+        model_dir / "threshold_v1.json",
+    ):
+        if not threshold_path.exists():
+            continue
+        try:
+            calibration = CalibrationResult.load(threshold_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[MLReg] 阈值工件加载失败: {} error={}", threshold_path, exc)
+            continue
+
+        runtime_artifacts["buy_threshold"] = calibration.recommended_buy_threshold
+        runtime_artifacts["sell_threshold"] = calibration.recommended_sell_threshold
+        runtime_artifacts["threshold_source"] = threshold_path.name
+        break
+
+    params_path = model_dir / f"{symbol_safe}_best_params.json"
+    if params_path.exists():
+        try:
+            with open(params_path, "r", encoding="utf-8") as f:
+                best_params_info = json.load(f)
+            params = dict(best_params_info.get("params") or {})
+            runtime_artifacts["trainer_model_type"] = (
+                params.pop("model_type_lgbm", None)
+                or params.pop("model_type", None)
+            )
+            runtime_artifacts["trainer_model_params"] = params
+            runtime_artifacts["params_source"] = params_path.name
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[MLReg] 参数工件加载失败: {} error={}", params_path, exc)
+
+    registry_path = model_dir / "registry.json"
+    if not registry_path.exists():
+        return runtime_artifacts
+
+    try:
+        registry = ModelRegistry(models_dir=model_dir)
+        registry_version = None
+        for version in [registry.active_version, registry.latest_version()]:
+            if (
+                model_path is not None
+                and version is not None
+                and version.model_path == model_path.name
+            ):
+                registry_version = version
+                break
+        if registry_version is None:
+            for version in reversed(registry.all_versions):
+                if model_path is not None and version.model_path == model_path.name:
+                    registry_version = version
+                    break
+
+        if registry_version is None:
+            return runtime_artifacts
+
+        if runtime_artifacts["threshold_source"] == "default":
+            runtime_artifacts["buy_threshold"] = registry_version.recommended_buy_threshold
+            runtime_artifacts["sell_threshold"] = registry_version.recommended_sell_threshold
+            runtime_artifacts["threshold_source"] = f"registry:{registry_version.version_id}"
+
+        if runtime_artifacts["trainer_model_type"] is None:
+            runtime_artifacts["trainer_model_type"] = registry_version.model_type
+            runtime_artifacts["params_source"] = (
+                runtime_artifacts["params_source"]
+                or f"registry:{registry_version.version_id}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[MLReg] ModelRegistry 工件加载失败: {} error={}", registry_path, exc)
+
+    return runtime_artifacts
 
 
 

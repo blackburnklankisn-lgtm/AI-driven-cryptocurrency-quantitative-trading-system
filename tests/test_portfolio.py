@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import List
@@ -417,6 +417,52 @@ class TestPerformanceAttributor:
         }
         for key in required_keys:
             assert key in summary, f"缺少指标: {key}"
+
+    def test_strategy_evolution_metrics_requires_min_sell_trades(self) -> None:
+        attr = PerformanceAttributor()
+        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        attr.record_trade("BTC/USDT", "strategy_sparse", "buy", 0.1, 40_000.0, ts)
+        attr.record_trade("BTC/USDT", "strategy_sparse", "sell", 0.1, 41_000.0, ts)
+
+        assert attr.get_strategy_evolution_metrics("strategy_sparse") == {}
+
+    def test_strategy_evolution_metrics_returns_conservative_snapshot(self) -> None:
+        attr = PerformanceAttributor()
+        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        sell_prices = [41_000.0, 42_500.0, 39_500.0, 43_000.0, 44_000.0]
+        buy_prices = [40_000.0, 41_000.0, 40_500.0, 41_500.0, 42_000.0]
+
+        for buy_price, sell_price in zip(buy_prices, sell_prices):
+            attr.record_trade("BTC/USDT", "strategy_ev", "buy", 0.1, buy_price, ts)
+            attr.record_trade("BTC/USDT", "strategy_ev", "sell", 0.1, sell_price, ts)
+
+        metrics = attr.get_strategy_evolution_metrics("strategy_ev")
+
+        assert metrics["strategy_id"] == "strategy_ev"
+        assert metrics["sell_trades"] == pytest.approx(5.0)
+        assert 0.0 <= metrics["max_drawdown_30d"] <= 1.0
+        assert 0.0 <= metrics["win_rate_30d"] <= 1.0
+        assert metrics["total_realized_pnl_usdt"] != 0.0
+        assert isinstance(metrics["sharpe_30d"], float)
+
+    def test_strategy_realized_trade_pnls_respects_limit_and_end_time(self) -> None:
+        attr = PerformanceAttributor()
+        ts0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        for idx, sell_price in enumerate([41_000.0, 42_000.0, 43_000.0]):
+            ts = ts0 + timedelta(days=idx)
+            attr.record_trade("BTC/USDT", "strategy_hist", "buy", 0.1, 40_000.0, ts)
+            attr.record_trade("BTC/USDT", "strategy_hist", "sell", 0.1, sell_price, ts)
+
+        pnl_all = attr.get_strategy_realized_trade_pnls("strategy_hist")
+        pnl_two = attr.get_strategy_realized_trade_pnls("strategy_hist", limit=2)
+        pnl_before_last = attr.get_strategy_realized_trade_pnls(
+            "strategy_hist",
+            end_time=ts0 + timedelta(days=1, hours=1),
+        )
+
+        assert len(pnl_all) == 3
+        assert len(pnl_two) == 2
+        assert len(pnl_before_last) == 2
 
     def test_empty_attributor_returns_empty(self) -> None:
         """无成交记录时，归因报告应返回空。"""

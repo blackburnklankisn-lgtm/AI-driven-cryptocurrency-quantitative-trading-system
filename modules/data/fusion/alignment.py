@@ -168,14 +168,17 @@ class SourceAligner:
         if self.config.timestamp_tolerance_sec > 0:
             tolerance = pd.Timedelta(seconds=self.config.timestamp_tolerance_sec)
 
+        left_frame = kline_frame.reset_index()
+        left_index_col = left_frame.columns[0]
+
         merged = pd.merge_asof(
-            kline_frame.reset_index(),
+            left_frame,
             src_df.reset_index(drop=True),
             left_on="__kline_ts__",
             right_on="__src_ts__",
             direction="backward",
             tolerance=tolerance,
-        ).set_index("index")
+        ).set_index(left_index_col)
 
         # 删除辅助列（先保留 __src_ts__ 用于 gap 计算）
         data_cols = [

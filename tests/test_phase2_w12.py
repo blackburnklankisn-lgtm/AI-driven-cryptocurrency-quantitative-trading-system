@@ -17,6 +17,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -39,6 +40,7 @@ from modules.data.onchain.providers import (
     OnChainFetchError,
     OnChainRecord,
     ONCHAIN_FIELDS,
+    PublicOnChainProvider,
 )
 
 
@@ -333,6 +335,58 @@ class TestMockOnChainProvider:
         provider = MockOnChainProvider(missing_fields=["nvt_proxy"])
         record = provider.fetch()
         assert "nvt_proxy" in record.missing_fields()
+
+
+class TestPublicOnChainProvider:
+    def test_fetch_builds_public_proxy_metrics(self):
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        def _fake_get(url, params=None, timeout=None):
+            if url.endswith("/bitcoin"):
+                return _Resp(
+                    {
+                        "market_data": {
+                            "market_cap": {"usd": 883.0},
+                            "total_volume": {"usd": 60.0},
+                        }
+                    }
+                )
+            if url.endswith("/tether"):
+                return _Resp({"market_data": {"market_cap": {"usd": 100.0}}})
+            if url.endswith("/usd-coin"):
+                return _Resp({"market_data": {"market_cap": {"usd": 50.0}}})
+            if url.endswith("/dai"):
+                return _Resp({"market_data": {"market_cap": {"usd": 5.0}}})
+            if url.endswith("/n-unique-addresses"):
+                return _Resp({"values": [{"y": 100.0}, {"y": 110.0}]})
+            if url.endswith("/estimated-transaction-volume-usd"):
+                return _Resp({"values": [{"y": 1000.0}, {"y": 1200.0}]})
+            if url.endswith("/n-transactions"):
+                return _Resp({"values": [{"y": 10.0}, {"y": 12.0}]})
+            if url.endswith("/hash-rate"):
+                return _Resp({"values": [{"y": 200.0}, {"y": 190.0}]})
+            raise AssertionError(f"unexpected url: {url}")
+
+        provider = PublicOnChainProvider(timeout_sec=1.0)
+        with patch("modules.data.onchain.providers.requests.get", side_effect=_fake_get):
+            record = provider.fetch("ETH/USDT")
+
+        assert record.source_name == "public"
+        assert record.fields["active_addresses_change"] == pytest.approx(0.10)
+        assert record.fields["exchange_inflow_ratio"] == pytest.approx(60.0 / 1260.0)
+        assert record.fields["stablecoin_supply_ratio"] == pytest.approx(155.0 / 883.0)
+        assert record.fields["miner_reserve_change"] == pytest.approx(-0.05)
+        assert record.fields["nvt_proxy"] == pytest.approx(883.0 / 1200.0)
+        assert record.metadata["proxy_mode"] is True
+        assert record.metadata["proxy_symbol"] == "BTC"
 
 
 # ─────────────────────────────────────────────────────────────

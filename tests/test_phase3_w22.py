@@ -612,12 +612,13 @@ class TestReportBuilder:
 # ══════════════════════════════════════════════════════════════
 
 class TestSelfEvolutionEngine:
-    def make_engine(self) -> SelfEvolutionEngine:
+    def make_engine(self, *, weekly_params_optimizer_cron: str = "") -> SelfEvolutionEngine:
         d = make_tmp_dir()
         config = SelfEvolutionConfig(
             state_dir=d,
             auto_run=False,
             scheduler=SchedulerConfig(interval_sec=0.0, cooldown_sec=0.0),
+            weekly_params_optimizer_cron=weekly_params_optimizer_cron,
         )
         return SelfEvolutionEngine(config)
 
@@ -686,9 +687,127 @@ class TestSelfEvolutionEngine:
         assert result is not None
         assert result.experiment_id == eid
 
+    def test_promotion_to_active_pauses_previous_active_in_same_family(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base",
+            candidate_id="cand_base",
+            metadata={"family_key": "rl/ppo/main"},
+        )
+        challenger = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_new",
+            candidate_id="cand_new",
+            metadata={"family_key": "rl/ppo/main"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(challenger.candidate_id, CandidateStatus.PAPER)
+        engine.update_metrics(
+            challenger.candidate_id,
+            sharpe_30d=1.2,
+            max_drawdown_30d=0.03,
+            ab_lift=0.2,
+        )
+
+        engine.run_cycle(force=True)
+
+        updated_base = engine.get_candidate(base.candidate_id)
+        updated_new = engine.get_candidate(challenger.candidate_id)
+        active_ids = {snap.candidate_id for snap in engine.list_active()}
+        assert updated_base.status == CandidateStatus.PAUSED.value
+        assert updated_new.status == CandidateStatus.ACTIVE.value
+        assert active_ids == {"cand_new"}
+
+    def test_rollback_reactivates_previous_active_candidate(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base",
+            candidate_id="cand_base",
+            metadata={"family_key": "rl/ppo/main"},
+        )
+        challenger = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_new",
+            candidate_id="cand_new",
+            metadata={"family_key": "rl/ppo/main"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(challenger.candidate_id, CandidateStatus.PAPER)
+        engine.update_metrics(
+            challenger.candidate_id,
+            sharpe_30d=1.2,
+            max_drawdown_30d=0.03,
+            ab_lift=0.2,
+        )
+        engine.run_cycle(force=True)
+
+        engine.record_risk_violation(challenger.candidate_id, n=10)
+        engine.run_cycle(force=True)
+
+        updated_base = engine.get_candidate(base.candidate_id)
+        updated_new = engine.get_candidate(challenger.candidate_id)
+        active_ids = {snap.candidate_id for snap in engine.list_active()}
+        assert updated_new.status == CandidateStatus.PAUSED.value
+        assert updated_base.status == CandidateStatus.ACTIVE.value
+        assert active_ids == {"cand_base"}
+
     def test_diagnostics_keys(self):
         engine = self.make_engine()
         d = engine.diagnostics()
         assert "registry" in d
         assert "scheduler" in d
         assert "ab_manager" in d
+        assert "weekly_params_optimizer" in d
+
+    def test_weekly_params_optimizer_due_once_per_slot(self):
+        engine = self.make_engine(weekly_params_optimizer_cron="0 3 * * 0")
+        slot_time = datetime(2024, 1, 7, 3, 0, tzinfo=timezone.utc)
+
+        slot_id = engine.get_due_weekly_params_optimizer_slot(slot_time)
+        assert slot_id == "2024-01-07T03:00:00+00:00"
+
+        engine.record_weekly_params_optimizer_start(slot_id, now=slot_time)
+        engine.record_weekly_params_optimizer_finish(
+            slot_id,
+            status="success",
+            optimized_symbols=[{"strategy_id": "ml_BTC_USDT_1h"}],
+            now=slot_time,
+        )
+
+        assert engine.get_due_weekly_params_optimizer_slot(slot_time) is None
+
+    def test_weekly_params_optimizer_finish_persists_state_and_audit(self):
+        engine = self.make_engine(weekly_params_optimizer_cron="0 3 * * 0")
+        slot_id = "2024-01-07T03:00:00+00:00"
+        slot_time = datetime(2024, 1, 7, 3, 0, tzinfo=timezone.utc)
+
+        engine.record_weekly_params_optimizer_start(slot_id, now=slot_time)
+        state = engine.record_weekly_params_optimizer_finish(
+            slot_id,
+            status="partial_success",
+            optimized_symbols=[
+                {
+                    "strategy_id": "ml_BTC_USDT_1h",
+                    "candidate_id": "cand-params-weekly",
+                }
+            ],
+            errors={"momentum_10_BTC_USDT": "not_implemented"},
+            now=slot_time,
+        )
+
+        assert state["status"] == "partial_success"
+        assert state["last_successful_slot"] == slot_id
+        assert state["optimized_symbols"][0]["candidate_id"] == "cand-params-weekly"
+
+        runs = engine.weekly_params_optimizer_runs(limit=5)
+        assert runs[0]["slot_id"] == slot_id
+        assert runs[0]["status"] == "partial_success"
+        assert runs[0]["errors"]["momentum_10_BTC_USDT"] == "not_implemented"
