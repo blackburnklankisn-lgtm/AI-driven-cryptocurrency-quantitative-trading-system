@@ -106,6 +106,49 @@
 .dcc-empty, .dcc-error { padding: 24px; border-radius: 18px; background: rgba(14, 27, 46, 0.74); border: 1px solid var(--dcc-border); }
 .dcc-error { color: var(--dcc-risk); }
 
+/* Alert badge */
+.dcc-alert-badge { padding: 8px 14px; border-radius: 999px; background: rgba(255, 95, 95, 0.18); border: 1px solid rgba(255, 95, 95, 0.5); color: var(--dcc-risk); font-size: 12px; font-weight: 600; cursor: default; }
+
+/* K-line chart container */
+.dcc-kline-chart { width: 100%; background: transparent; }
+
+/* Progress bar */
+.dcc-progress-wrap { display: grid; gap: 8px; }
+.dcc-progress-bar { height: 12px; border-radius: 999px; background: rgba(14, 27, 46, 0.86); border: 1px solid var(--dcc-border); overflow: hidden; }
+.dcc-progress-bar__fill { height: 100%; border-radius: 999px; transition: width 0.6s ease; }
+.dcc-progress-bar__fill.is-good { background: linear-gradient(90deg, #29c49a, #1ea082); }
+.dcc-progress-bar__fill.is-risk { background: linear-gradient(90deg, #ff5f5f, #d94444); }
+.dcc-progress-label { font-size: 13px; color: var(--dcc-muted); }
+
+/* Status / freshness badges */
+.dcc-badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
+.dcc-badge--fresh { background: rgba(41, 196, 154, 0.16); border: 1px solid rgba(41, 196, 154, 0.4); color: var(--dcc-bull); }
+.dcc-badge--stale { background: rgba(255, 95, 95, 0.16); border: 1px solid rgba(255, 95, 95, 0.4); color: var(--dcc-risk); }
+.dcc-badge--partial { background: rgba(212, 178, 106, 0.16); border: 1px solid rgba(212, 178, 106, 0.4); color: #d4b26a; }
+
+/* Three-column layout */
+.dcc-three-col { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+
+/* Action button */
+.dcc-action-btn { background: linear-gradient(135deg, rgba(31, 64, 104, 0.96), rgba(15, 40, 71, 0.96)); color: var(--dcc-text); border: 1px solid rgba(87, 182, 255, 0.26); border-radius: 12px; padding: 10px 18px; cursor: pointer; font-size: 13px; transition: border-color 0.2s ease; }
+.dcc-action-btn:hover { border-color: rgba(87, 182, 255, 0.6); }
+
+/* Risk event timeline */
+.dcc-timeline { display: grid; gap: 16px; }
+.dcc-timeline__item { display: flex; gap: 14px; align-items: flex-start; }
+.dcc-timeline__dot { width: 10px; height: 10px; border-radius: 50%; background: rgba(87, 182, 255, 0.6); border: 2px solid rgba(87, 182, 255, 0.3); flex-shrink: 0; margin-top: 4px; }
+.dcc-timeline__body { flex: 1; min-width: 0; }
+.dcc-timeline__header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.dcc-timeline__time { font-size: 12px; color: var(--dcc-muted); margin-left: auto; }
+.dcc-timeline__reason { margin: 0; font-size: 13px; color: var(--dcc-text); }
+
+/* Audit log stream */
+.dcc-log-stream { font-family: "Cascadia Code", "Fira Code", monospace; font-size: 11.5px; line-height: 1.6; background: rgba(3, 8, 17, 0.88); border: 1px solid rgba(90, 118, 153, 0.18); border-radius: 14px; padding: 14px; max-height: 360px; overflow-y: auto; display: grid; gap: 2px; }
+.dcc-log-line { color: var(--dcc-text); word-break: break-all; }
+.dcc-log-line--error { color: var(--dcc-risk); }
+.dcc-log-line--warning { color: #f4c14f; }
+.dcc-log-line--muted { color: var(--dcc-muted); }
+
 @media (max-width: 1440px) {
   .dcc-content-wrap { grid-template-columns: 1fr 290px; }
   .dcc-four-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -116,5 +159,5 @@
   .dcc-sidebar { border-right: none; border-bottom: 1px solid var(--dcc-border); }
   .dcc-content-wrap { grid-template-columns: 1fr; }
   .dcc-context-panel { border-left: none; border-top: 1px solid rgba(90, 118, 153, 0.16); }
-  .dcc-metric-grid, .dcc-two-col, .dcc-prob-grid { grid-template-columns: 1fr; }
+  .dcc-metric-grid, .dcc-two-col, .dcc-prob-grid, .dcc-three-col { grid-template-columns: 1fr; }
 }

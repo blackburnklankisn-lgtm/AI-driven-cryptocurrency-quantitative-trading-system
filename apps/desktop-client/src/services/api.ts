@@ -2,9 +2,11 @@ import type {
   AlphaBrainSnapshot,
   DashboardSnapshot,
   DataFusionSnapshot,
+  EvolutionReport,
   EvolutionSnapshot,
   ExecutionSnapshot,
   OverviewSnapshot,
+  RiskEvent,
   RiskMatrixSnapshot,
 } from '../types/dashboard';
 
@@ -45,4 +47,12 @@ export async function postControlAction(action: string): Promise<{ result: strin
   const data = (await response.json()) as { result: string; message: string };
   console.info('[desktop-client][api] control result', action, data);
   return data;
+}
+
+export function getRiskEvents(): Promise<RiskEvent[]> {
+  return fetchJson<RiskEvent[]>('/api/v2/risk/events');
+}
+
+export function getEvolutionReports(): Promise<EvolutionReport[]> {
+  return fetchJson<EvolutionReport[]>('/api/v2/evolution/reports');
 }

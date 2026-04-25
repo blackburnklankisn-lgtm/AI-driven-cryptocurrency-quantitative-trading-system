@@ -17,6 +17,8 @@ export interface PositionSummaryItem {
   quantity: number;
   last_price: number;
   notional: number;
+  entry_price?: number | null;
+  unrealized_pnl?: number | null;
 }
 
 export interface PositionsSummary {
@@ -52,6 +54,14 @@ export interface AlphaBrainSelectedResult {
   confidence: number;
 }
 
+export interface ContinuousLearnerItem {
+  id?: string;
+  active_version?: string | null;
+  thresholds?: Record<string, number>;
+  versions?: string[];
+  error?: string;
+}
+
 export interface AlphaBrainSnapshot {
   generated_at: string;
   dominant_regime: string;
@@ -71,7 +81,10 @@ export interface AlphaBrainSnapshot {
   };
   continuous_learner: {
     count: number;
-    items: Array<Record<string, unknown>>;
+    active_version: string | null;
+    thresholds: Record<string, number>;
+    last_retrain_at: string | null;
+    items: ContinuousLearnerItem[];
   };
   ai_analysis: string;
 }
@@ -141,4 +154,20 @@ export interface DashboardSnapshot {
   risk_matrix: RiskMatrixSnapshot;
   data_fusion: DataFusionSnapshot;
   execution: ExecutionSnapshot;
+}
+
+export interface RiskEvent {
+  event_id?: string;
+  timestamp?: string;
+  event_type?: string;
+  reason?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface EvolutionReport {
+  report_id?: string;
+  created_at?: string;
+  candidate_id?: string;
+  result?: string;
+  summary?: Record<string, unknown>;
 }

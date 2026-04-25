@@ -1,4 +1,5 @@
-import { Activity, ShieldAlert, TrendingUp } from 'lucide-react';
+import { Activity, ShieldAlert, TrendingDown, TrendingUp } from 'lucide-react';
+import { KlineChart } from '../components/charts/KlineChart';
 import { MetricCard } from '../components/cards/MetricCard';
 import { SectionPanel } from '../components/layout/SectionPanel';
 import type { OverviewSnapshot } from '../types/dashboard';
@@ -22,6 +23,20 @@ export function OverviewPage({ snapshot }: OverviewPageProps) {
           icon={<TrendingUp size={18} />}
         />
         <MetricCard
+          label="Daily PnL"
+          value={`${(snapshot.daily_pnl ?? 0) >= 0 ? '+' : ''}${(snapshot.daily_pnl ?? 0).toFixed(2)}`}
+          accent={(snapshot.daily_pnl ?? 0) >= 0 ? 'bull' : 'bear'}
+          subtitle={`Peak equity $${(snapshot.peak_equity ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+          icon={(snapshot.daily_pnl ?? 0) >= 0 ? <TrendingUp size={18} /> : <TrendingDown size={18} />}
+        />
+        <MetricCard
+          label="Drawdown"
+          value={`${((snapshot.drawdown_pct ?? 0) * 100).toFixed(2)}%`}
+          accent={(snapshot.drawdown_pct ?? 0) > 0.1 ? 'risk' : 'neutral'}
+          subtitle={`Peak $${(snapshot.peak_equity ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+          icon={<TrendingDown size={18} />}
+        />
+        <MetricCard
           label="Dominant Regime"
           value={`${snapshot.dominant_regime ?? 'unknown'}`}
           accent={snapshot.dominant_regime === 'bear' ? 'bear' : 'bull'}
@@ -32,10 +47,14 @@ export function OverviewPage({ snapshot }: OverviewPageProps) {
           label="Risk Level"
           value={`${snapshot.risk_level ?? 'unknown'}`}
           accent={snapshot.risk_level === 'critical' ? 'risk' : 'neutral'}
-          subtitle={`Drawdown ${((snapshot.drawdown_pct ?? 0) * 100).toFixed(2)}% · Daily PnL ${(snapshot.daily_pnl ?? 0).toFixed(2)}`}
+          subtitle={`Feed ${snapshot.feed_health?.health ?? 'unknown'} · Reconnects ${snapshot.feed_health?.reconnect_count ?? 0}`}
           icon={<ShieldAlert size={18} />}
         />
       </div>
+
+      <SectionPanel title="BTC/USDT K-Line" kicker="60s auto-refresh">
+        <KlineChart symbol="BTC/USDT" height={280} />
+      </SectionPanel>
 
       <SectionPanel title="Global Situation" kicker="Overview workspace">
         <div className="dcc-two-col">
@@ -61,7 +80,7 @@ export function OverviewPage({ snapshot }: OverviewPageProps) {
       <SectionPanel title="Exposure & Positioning" kicker="Portfolio view">
         <div className="dcc-two-col">
           <div>
-            <h3 className="dcc-subtitle">Positions</h3>
+            <h3 className="dcc-subtitle">Positions ({snapshot.positions_summary?.count ?? 0})</h3>
             <table className="dcc-table">
               <thead>
                 <tr><th>Symbol</th><th>Qty</th><th>Last</th><th>Notional</th></tr>

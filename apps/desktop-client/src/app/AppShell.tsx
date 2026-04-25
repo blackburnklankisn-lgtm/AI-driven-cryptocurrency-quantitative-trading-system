@@ -98,6 +98,17 @@ export function AppShell() {
             <span className="dcc-pill">exchange {overview?.exchange ?? 'unknown'}</span>
             <span className="dcc-pill">regime {overview?.dominant_regime ?? 'unknown'}</span>
             <span className={`dcc-pill ${overview?.risk_level === 'critical' ? 'is-risk' : 'is-info'}`}>risk {overview?.risk_level ?? 'unknown'}</span>
+            <span className={`dcc-pill ${overview?.feed_health?.health === 'healthy' ? 'is-good' : overview?.feed_health?.health === 'degraded' ? 'is-risk' : 'is-info'}`}>
+              feed {overview?.feed_health?.health ?? 'unknown'}
+            </span>
+            {(snapshot?.overview.alerts?.length ?? 0) > 0 && (
+              <span
+                className="dcc-alert-badge"
+                title={snapshot!.overview.alerts!.join('\n')}
+              >
+                ⚠ {snapshot!.overview.alerts!.length} alert{snapshot!.overview.alerts!.length > 1 ? 's' : ''}
+              </span>
+            )}
           </div>
         </header>
 
@@ -123,6 +134,19 @@ export function AppShell() {
               <div className="dcc-context-card__kicker">AI Insight Drawer</div>
               <p className="dcc-paragraph">{snapshot?.alpha_brain.ai_analysis ?? 'Waiting for AI analysis...'}</p>
             </section>
+
+            {(snapshot?.overview.alerts?.length ?? 0) > 0 && (
+              <section className="dcc-context-card">
+                <div className="dcc-context-card__kicker">Active Alerts</div>
+                <ul className="dcc-list" style={{ paddingLeft: 0, listStyle: 'none' }}>
+                  {snapshot!.overview.alerts!.map((alert, index) => (
+                    <li key={index} style={{ padding: '6px 0', borderBottom: '1px solid rgba(90,118,153,0.12)', color: 'var(--dcc-risk)', fontSize: '13px' }}>
+                      ⚠ {alert}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
 
             <section className="dcc-context-card">
               <div className="dcc-context-card__kicker">Latest Snapshot</div>

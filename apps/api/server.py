@@ -299,17 +299,22 @@ def _iso_now() -> str:
 def _summarize_positions(trader: Any) -> Dict[str, Any]:
     positions = {sym: float(qty) for sym, qty in _safe_getattr(trader, "_positions", {}).items() if qty > 0}
     latest_prices = {sym: float(price) for sym, price in _safe_getattr(trader, "_latest_prices", {}).items()}
+    entry_prices = {sym: float(price) for sym, price in _safe_getattr(trader, "_entry_prices", {}).items()}
     total_notional = 0.0
     enriched = []
     for sym, qty in positions.items():
         px = latest_prices.get(sym, 0.0)
+        entry_price = entry_prices.get(sym, 0.0)
         notional = qty * px
+        unrealized_pnl = (px - entry_price) * qty if entry_price > 0 and px > 0 else None
         total_notional += notional
         enriched.append({
             "symbol": sym,
             "quantity": qty,
             "last_price": px,
             "notional": round(notional, 4),
+            "entry_price": round(entry_price, 4) if entry_price > 0 else None,
+            "unrealized_pnl": round(unrealized_pnl, 4) if unrealized_pnl is not None else None,
         })
     return {
         "count": len(enriched),
