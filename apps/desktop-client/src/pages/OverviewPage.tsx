@@ -12,6 +12,8 @@ interface OverviewPageProps {
 export function OverviewPage({ snapshot }: OverviewPageProps) {
   const positions = snapshot.positions_summary?.items ?? [];
   const weights = Object.entries(snapshot.strategy_weight_summary ?? {});
+  const alerts = snapshot.alerts ?? [];
+  const latestRejection = snapshot.latest_order_rejection;
 
   return (
     <div className="dcc-page-grid">
@@ -62,10 +64,24 @@ export function OverviewPage({ snapshot }: OverviewPageProps) {
           <div>
             <h3 className="dcc-subtitle">告警</h3>
             <ul className="dcc-list">
-              {(snapshot.alerts?.length ? snapshot.alerts : ['暂无活动告警']).map((item) => (
-                <li key={item}>{item}</li>
-              ))}
+              {alerts.length > 0 ? alerts.map((item) => (
+                <li key={`${item.code}-${item.occurred_at}`}>
+                  [{item.severity.toUpperCase()}] {zh(item.message, item.message)}
+                </li>
+              )) : <li>暂无活动告警</li>}
             </ul>
+            <h3 className="dcc-subtitle" style={{ marginTop: 14 }}>最近拒单</h3>
+            {latestRejection ? (
+              <dl className="dcc-definition-list">
+                <div><dt>阶段</dt><dd>{zh(latestRejection.stage, latestRejection.stage)}</dd></div>
+                <div><dt>策略</dt><dd>{latestRejection.strategy_id}</dd></div>
+                <div><dt>标的/方向</dt><dd>{latestRejection.symbol} · {latestRejection.side}</dd></div>
+                <div><dt>原因</dt><dd>{zh(latestRejection.reason, latestRejection.reason)}</dd></div>
+                <div><dt>时间</dt><dd>{latestRejection.timestamp}</dd></div>
+              </dl>
+            ) : (
+              <p className="dcc-muted">暂无拒单记录</p>
+            )}
           </div>
           <div>
             <h3 className="dcc-subtitle">数据源健康</h3>

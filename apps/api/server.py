@@ -339,9 +339,13 @@ def _build_overview_snapshot() -> Dict[str, Any]:
     if peak_equity > 0 and equity >= 0:
         drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
 
-    regime = _safe_getattr(trader, "_latest_regime_state", None)
+    regime = _safe_getattr(trader, "_latest_regime_state", None) or _safe_getattr(trader, "_current_regime", None)
     orchestrator_decision = _safe_getattr(trader, "_latest_orchestration_decision", None)
-    feed_health = _safe_getattr(_safe_getattr(trader, "_subscription_manager", None), "diagnostics", None)
+    subscription_manager = (
+        _safe_getattr(trader, "_phase3_subscription_manager", None)
+        or _safe_getattr(trader, "_subscription_manager", None)
+    )
+    feed_health = _safe_getattr(subscription_manager, "diagnostics", None)
     if callable(feed_health):
         try:
             feed_health = feed_health()
@@ -352,9 +356,108 @@ def _build_overview_snapshot() -> Dict[str, Any]:
 
     circuit_broken = trader.risk_manager.is_circuit_broken()
     risk_level = "critical" if circuit_broken else ("elevated" if drawdown_pct >= 0.1 else "normal")
+    latest_rejection = _safe_getattr(trader, "_latest_order_rejection", None)
+    generated_at = _iso_now()
+
+    alerts: List[Dict[str, Any]] = []
+
+    if circuit_broken:
+        alerts.append(
+            {
+                "code": "circuit_broken",
+                "severity": "critical",
+                "source": "risk",
+                "message": risk_summary.get("circuit_reason", "Circuit breaker active"),
+                "occurred_at": generated_at,
+                "details": {
+                    "drawdown_pct": round(drawdown_pct, 6),
+                    "risk_level": risk_level,
+                },
+            }
+        )
+
+    feed_state = str(feed_health.get("health", "unknown"))
+    if feed_state in {"degraded", "stopped", "unknown"}:
+        severity = "critical" if feed_state == "stopped" else ("warning" if feed_state == "degraded" else "info")
+        alerts.append(
+            {
+                "code": f"feed_{feed_state}",
+                "severity": severity,
+                "source": "data-feed",
+                "message": f"数据源状态异常: {feed_state}",
+                "occurred_at": generated_at,
+                "details": {
+                    "exchange": feed_health.get("exchange"),
+                    "reconnect_count": feed_health.get("reconnect_count", 0),
+                },
+            }
+        )
+
+    regime_name = _safe_getattr(regime, "dominant_regime", "unknown")
+    regime_confidence = float(_safe_getattr(regime, "confidence", 0.0) or 0.0)
+    if regime_name == "unknown":
+        alerts.append(
+            {
+                "code": "regime_unknown",
+                "severity": "warning",
+                "source": "alpha-brain",
+                "message": "当前市场状态为 unknown，编排可能降级或阻断",
+                "occurred_at": generated_at,
+                "details": {
+                    "confidence": regime_confidence,
+                },
+            }
+        )
+    elif regime_confidence < 0.2:
+        alerts.append(
+            {
+                "code": "regime_low_confidence",
+                "severity": "info",
+                "source": "alpha-brain",
+                "message": "市场状态置信度较低，仓位可能被压缩",
+                "occurred_at": generated_at,
+                "details": {
+                    "dominant_regime": regime_name,
+                    "confidence": regime_confidence,
+                },
+            }
+        )
+
+    if not bool(_safe_getattr(trader, "_latest_regime_stable", False)):
+        alerts.append(
+            {
+                "code": "regime_unstable",
+                "severity": "info",
+                "source": "alpha-brain",
+                "message": "市场状态最近不稳定，编排可能进入 REDUCE",
+                "occurred_at": generated_at,
+                "details": {
+                    "dominant_regime": regime_name,
+                    "confidence": regime_confidence,
+                },
+            }
+        )
+
+    if isinstance(latest_rejection, dict) and latest_rejection:
+        alerts.append(
+            {
+                "code": "latest_order_rejection",
+                "severity": "warning",
+                "source": "execution",
+                "message": f"最近一次拒单: {latest_rejection.get('reason', 'unknown')}",
+                "occurred_at": latest_rejection.get("timestamp", generated_at),
+                "details": {
+                    "stage": latest_rejection.get("stage", "unknown"),
+                    "strategy_id": latest_rejection.get("strategy_id", "unknown"),
+                    "symbol": latest_rejection.get("symbol", "unknown"),
+                    "side": latest_rejection.get("side", "unknown"),
+                    "quantity": latest_rejection.get("quantity", "0"),
+                },
+            }
+        )
 
     snapshot = {
-        "generated_at": _iso_now(),
+        "generated_at": generated_at,
         "status": "running" if _safe_getattr(trader, "_running", False) else "stopped",
         "mode": _safe_getattr(trader, "mode", "unknown"),
         "exchange": _safe_getattr(_safe_getattr(trader, "gateway", None), "exchange_id", "unknown"),
@@ -365,7 +468,7 @@ def _build_overview_snapshot() -> Dict[str, Any]:
         "positions_summary": _summarize_positions(trader),
         "dominant_regime": _safe_getattr(regime, "dominant_regime", "unknown"),
         "regime_confidence": float(_safe_getattr(regime, "confidence", 0.0) or 0.0),
-        "is_regime_stable": bool(_safe_getattr(_safe_getattr(trader, "_regime_detector", None), "is_stable", False)),
+        "is_regime_stable": bool(_safe_getattr(trader, "_latest_regime_stable", False)),
         "risk_level": risk_level,
         "feed_health": {
             "health": feed_health.get("health", "unknown"),
@@ -373,12 +476,8 @@ def _build_overview_snapshot() -> Dict[str, Any]:
             "reconnect_count": feed_health.get("reconnect_count", 0),
         },
         "strategy_weight_summary": _safe_getattr(orchestrator_decision, "weights", {}) or {},
-        "alerts": [
-            msg for msg in [
-                risk_summary.get("circuit_reason", "") if circuit_broken else "",
-                "Feed degraded" if feed_health.get("health") == "degraded" else "",
-            ] if msg
-        ],
+        "alerts": alerts,
+        "latest_order_rejection": latest_rejection if isinstance(latest_rejection, dict) and latest_rejection else None,
     }
     log.debug("[APIv2] Overview snapshot built: status={} mode={} regime={} risk={}", snapshot["status"], snapshot["mode"], snapshot["dominant_regime"], snapshot["risk_level"])
     return snapshot
@@ -389,7 +488,7 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
     if not trader:
         return {"generated_at": _iso_now(), "status": "inactive"}
 
-    regime = _safe_getattr(trader, "_latest_regime_state", None)
+    regime = _safe_getattr(trader, "_latest_regime_state", None) or _safe_getattr(trader, "_current_regime", None)
     orchestrator_decision = _safe_getattr(trader, "_latest_orchestration_decision", None)
     continuous_learners = _safe_getattr(trader, "_continuous_learners", {}) or {}
 
@@ -426,7 +525,7 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
             "sideways": float(_safe_getattr(regime, "sideways_prob", 0.0) or 0.0),
             "high_vol": float(_safe_getattr(regime, "high_vol_prob", 0.0) or 0.0),
         },
-        "is_regime_stable": bool(_safe_getattr(_safe_getattr(trader, "_regime_detector", None), "is_stable", False)),
+        "is_regime_stable": bool(_safe_getattr(trader, "_latest_regime_stable", False)),
         "orchestrator": {
             "gating_action": _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None).value if _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None) else "unknown",
             "weights": _safe_getattr(orchestrator_decision, "weights", {}) or {},

@@ -27,6 +27,25 @@ export interface PositionsSummary {
   items: PositionSummaryItem[];
 }
 
+export interface OverviewAlert {
+  code: string;
+  severity: 'info' | 'warning' | 'critical';
+  source: string;
+  message: string;
+  occurred_at: string;
+  details?: Record<string, unknown>;
+}
+
+export interface OrderRejectionSummary {
+  timestamp: string;
+  stage: string;
+  reason: string;
+  strategy_id: string;
+  symbol: string;
+  side: string;
+  quantity: string;
+}
+
 export interface OverviewSnapshot {
   generated_at: string;
   status: string;
@@ -43,7 +62,8 @@ export interface OverviewSnapshot {
   risk_level?: string;
   feed_health?: FeedHealthSummary;
   strategy_weight_summary?: Record<string, number>;
-  alerts?: string[];
+  alerts?: OverviewAlert[];
+  latest_order_rejection?: OrderRejectionSummary | null;
   message?: string;
 }
 

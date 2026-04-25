@@ -112,7 +112,7 @@ export function AppShell() {
             {(snapshot?.overview.alerts?.length ?? 0) > 0 && (
               <span
                 className="dcc-alert-badge"
-                title={snapshot!.overview.alerts!.join('\n')}
+                title={snapshot!.overview.alerts!.map((item) => item.message).join('\n')}
               >
                 ⚠ {snapshot!.overview.alerts!.length} 条告警
               </span>
@@ -149,7 +149,7 @@ export function AppShell() {
                 <ul className="dcc-list" style={{ paddingLeft: 0, listStyle: 'none' }}>
                   {snapshot!.overview.alerts!.map((alert, index) => (
                     <li key={index} style={{ padding: '6px 0', borderBottom: '1px solid rgba(90,118,153,0.12)', color: 'var(--dcc-risk)', fontSize: '13px' }}>
-                      ⚠ {alert}
+                      ⚠ [{alert.severity}] {zh(alert.message, alert.message)}
                     </li>
                   ))}
                 </ul>

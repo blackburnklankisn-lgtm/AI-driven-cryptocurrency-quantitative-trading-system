@@ -213,6 +213,9 @@ class LiveTrader:
             bull_prob=0.33, bear_prob=0.33, sideways_prob=0.34,
             high_vol_prob=0.0, confidence=0.5, dominant_regime="sideways"
         )
+        self._latest_regime_state = self._current_regime
+        self._latest_regime_stable: bool = False
+        self._latest_orchestration_decision = None
         self._phase1_orchestrator = StrategyOrchestrator()
         self._phase1_data_kitchens: Dict[str, DataKitchen] = {}
         self._phase1_regime_detectors: Dict[str, MarketRegimeDetector] = {}
@@ -220,6 +223,8 @@ class LiveTrader:
         self._symbol_regimes: Dict[str, RegimeState] = {}
         self._last_trace_ids: Dict[str, str] = {}
         self._symbol_risk_plans: Dict[str, object] = {}
+        self._latest_order_rejection: Optional[Dict[str, str]] = None
+        self._recent_order_rejections: List[Dict[str, str]] = []
         self._phase2_source_aligner = SourceAligner(
             AlignmentConfig(
                 max_fill_periods=max(
@@ -1029,6 +1034,20 @@ class LiveTrader:
         reason: str,
         stage: str,
     ) -> None:
+        rejection = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "stage": stage,
+            "reason": str(reason),
+            "strategy_id": str(req.strategy_id),
+            "symbol": str(req.symbol),
+            "side": str(req.side),
+            "quantity": str(quantity),
+        }
+        self._latest_order_rejection = rejection
+        self._recent_order_rejections.append(rejection)
+        if len(self._recent_order_rejections) > 10:
+            self._recent_order_rejections = self._recent_order_rejections[-10:]
+
         log.warning(
             "[RiskBlock:{}] strategy={} {} {} qty={} 被拒绝: {}",
             stage,
@@ -1775,6 +1794,8 @@ class LiveTrader:
                     )
             self._current_regime = regime
             self._symbol_regimes[event.symbol] = regime
+            self._latest_regime_state = regime
+            self._latest_regime_stable = detector.is_stable
             risk_snapshot = self._build_risk_snapshot()
             
             # 通过 AlphaRuntime 处理 K 线事件
@@ -1804,6 +1825,7 @@ class LiveTrader:
                     current_drawdown=risk_snapshot.current_drawdown,
                     is_regime_stable=detector.is_stable,
                     bar_seq=context.loop_seq,
+            self._latest_orchestration_decision = decision
                 )
             )
             

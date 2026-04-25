@@ -5,6 +5,7 @@ import type {
   EvolutionReport,
   EvolutionSnapshot,
   ExecutionSnapshot,
+  OverviewAlert,
   OverviewSnapshot,
   RiskEvent,
   RiskMatrixSnapshot,
@@ -42,6 +43,31 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
   const overview = asRecord(source.overview);
   const overviewPositions = asRecord(overview.positions_summary);
   const overviewFeedHealth = asRecord(overview.feed_health);
+  const overviewLatestRejection = asRecord(overview.latest_order_rejection);
+  const normalizedAlerts: OverviewAlert[] = asArray<unknown>(overview.alerts).map((item, index) => {
+    if (typeof item === 'string') {
+      return {
+        code: `legacy_${index}`,
+        severity: 'warning' as const,
+        source: 'overview',
+        message: item,
+        occurred_at: asString(overview.generated_at),
+        details: {},
+      };
+    }
+    const alert = asRecord(item);
+    const severityRaw = asString(alert.severity, 'warning');
+    const severity: OverviewAlert['severity'] =
+      severityRaw === 'critical' ? 'critical' : severityRaw === 'info' ? 'info' : 'warning';
+    return {
+      code: asString(alert.code, `alert_${index}`),
+      severity,
+      source: asString(alert.source, 'overview'),
+      message: asString(alert.message),
+      occurred_at: asString(alert.occurred_at, asString(overview.generated_at)),
+      details: asRecord(alert.details),
+    };
+  });
   const alphaBrain = asRecord(source.alpha_brain);
   const regimeProbs = asRecord(alphaBrain.regime_probs);
   const orchestrator = asRecord(alphaBrain.orchestrator);
@@ -78,7 +104,18 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
         reconnect_count: asNumber(overviewFeedHealth.reconnect_count),
       },
       strategy_weight_summary: asRecord(overview.strategy_weight_summary) as Record<string, number>,
-      alerts: asArray<string>(overview.alerts),
+      alerts: normalizedAlerts,
+      latest_order_rejection: Object.keys(overviewLatestRejection).length
+        ? {
+            timestamp: asString(overviewLatestRejection.timestamp),
+            stage: asString(overviewLatestRejection.stage),
+            reason: asString(overviewLatestRejection.reason),
+            strategy_id: asString(overviewLatestRejection.strategy_id),
+            symbol: asString(overviewLatestRejection.symbol),
+            side: asString(overviewLatestRejection.side),
+            quantity: asString(overviewLatestRejection.quantity),
+          }
+        : null,
       message: asString(overview.message),
     },
     alpha_brain: {
