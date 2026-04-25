@@ -23,6 +23,12 @@
     --dcc-info: #57b6ff;
   }
 
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
   body {
     background:
       radial-gradient(circle at top left, rgba(48, 129, 255, 0.18), transparent 26%),
@@ -55,14 +61,14 @@
   background: #475569;
 }
 
-.dcc-shell { min-height: 100vh; display: grid; grid-template-columns: 260px 1fr; }
+.dcc-shell { height: 100vh; min-height: 100vh; display: grid; grid-template-columns: 260px 1fr; overflow: hidden; }
 .dcc-sidebar { border-right: 1px solid var(--dcc-border); background: linear-gradient(180deg, rgba(9, 20, 34, 0.96), rgba(7, 16, 28, 0.92)); padding: 24px 18px; display: flex; flex-direction: column; gap: 28px; }
 .dcc-brand h1 { margin: 4px 0 8px; font-size: 26px; line-height: 1.05; }
 .dcc-brand p, .dcc-brand__kicker, .dcc-panel__kicker, .dcc-topbar__kicker, .dcc-context-card__kicker, .dcc-card__label { color: var(--dcc-muted); text-transform: uppercase; letter-spacing: 0.12em; font-size: 11px; }
 .dcc-nav { display: flex; flex-direction: column; gap: 10px; }
 .dcc-nav__item { border: 1px solid transparent; background: rgba(14, 27, 46, 0.72); color: var(--dcc-text); border-radius: 14px; padding: 12px 14px; display: flex; align-items: center; gap: 10px; cursor: pointer; transition: all 0.2s ease; }
 .dcc-nav__item:hover, .dcc-nav__item.is-active { border-color: rgba(87, 182, 255, 0.35); background: rgba(19, 38, 63, 0.96); box-shadow: inset 0 0 0 1px rgba(87, 182, 255, 0.08); }
-.dcc-main { display: flex; flex-direction: column; min-width: 0; }
+.dcc-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .dcc-topbar { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 22px 28px 14px; border-bottom: 1px solid rgba(90, 118, 153, 0.16); background: rgba(7, 17, 30, 0.54); backdrop-filter: blur(12px); }
 .dcc-topbar h2 { margin: 4px 0 0; font-size: 28px; }
 .dcc-health-strip { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
@@ -71,8 +77,8 @@
 .dcc-pill.is-risk { border-color: rgba(255, 95, 95, 0.38); color: var(--dcc-risk); }
 .dcc-pill.is-info { border-color: rgba(87, 182, 255, 0.38); color: var(--dcc-info); }
 .dcc-content-wrap { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 320px; }
-.dcc-content { padding: 24px 28px 28px; overflow: auto; }
-.dcc-context-panel { border-left: 1px solid rgba(90, 118, 153, 0.16); padding: 24px 20px 28px; overflow: auto; background: rgba(5, 13, 23, 0.45); display: flex; flex-direction: column; gap: 18px; }
+.dcc-content { padding: 24px 28px 28px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.dcc-context-panel { border-left: 1px solid rgba(90, 118, 153, 0.16); padding: 24px 20px 28px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; background: rgba(5, 13, 23, 0.45); display: flex; flex-direction: column; gap: 18px; }
 .dcc-context-card, .dcc-panel, .dcc-card { background: var(--dcc-surface); border: 1px solid var(--dcc-border); border-radius: 20px; box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18); }
 .dcc-context-card { padding: 18px; }
 .dcc-control-stack { display: grid; gap: 10px; margin-top: 14px; }

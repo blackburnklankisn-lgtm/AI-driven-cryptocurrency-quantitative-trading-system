@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { getRiskEvents } from '../services/api';
+import { zh } from '../utils/i18n';
 import { useRiskStream } from '../hooks/useRiskStream';
 import { MetricCard } from '../components/cards/MetricCard';
 import { SectionPanel } from '../components/layout/SectionPanel';
@@ -21,7 +22,7 @@ function BudgetBar({ pct }: { pct: number | null }) {
           style={{ width: `${(value * 100).toFixed(0)}%` }}
         />
       </div>
-      <span className="dcc-progress-label">{pct == null ? 'N/A' : `${(pct * 100).toFixed(1)}% remaining`}</span>
+      <span className="dcc-progress-label">{pct == null ? '暂无' : `剩余 ${(pct * 100).toFixed(1)}%`}</span>
     </div>
   );
 }
@@ -41,56 +42,56 @@ export function RiskMatrixPage({ snapshot }: RiskMatrixPageProps) {
     <div className="dcc-page-grid">
       <div className="dcc-metric-grid">
         <MetricCard
-          label="Circuit Breaker"
-          value={data.circuit_broken ? 'TRIGGERED' : 'HEALTHY'}
+          label="熔断器"
+          value={data.circuit_broken ? '已触发' : '健康'}
           accent={data.circuit_broken ? 'risk' : 'bull'}
-          subtitle={data.circuit_reason || 'No active circuit condition'}
+          subtitle={data.circuit_reason ? zh(data.circuit_reason) : '无活动熔断条件'}
           icon={<AlertTriangle size={18} />}
         />
         <MetricCard
-          label="Cooldown Remaining"
+          label="冷却剩余"
           value={`${data.circuit_cooldown_remaining_sec}s`}
           accent="neutral"
-          subtitle={`Consecutive losses ${data.consecutive_losses}`}
+          subtitle={`连续亏损 ${data.consecutive_losses}`}
         />
         <MetricCard
-          label="Budget Remaining"
-          value={data.budget_remaining_pct == null ? 'N/A' : `${(data.budget_remaining_pct * 100).toFixed(1)}%`}
+          label="预算剩余"
+          value={data.budget_remaining_pct == null ? '暂无' : `${(data.budget_remaining_pct * 100).toFixed(1)}%`}
           accent="info"
-          subtitle={`Position sizing ${data.position_sizing_mode}`}
+          subtitle={`仓位模式 ${zh(data.position_sizing_mode, '未知')}`}
         />
       </div>
 
-      <SectionPanel title="Budget Usage" kicker="Risk Matrix workspace">
+      <SectionPanel title="预算使用" kicker="风险矩阵工作区">
         <BudgetBar pct={data.budget_remaining_pct} />
       </SectionPanel>
 
-      <SectionPanel title="Advanced Risk Components" kicker="Kill Switch / Cooldown / DCA / Exit Plan">
+      <SectionPanel title="高级风控组件" kicker="熔断开关 / 冷却 / DCA / 退出计划">
         <div className="dcc-four-col">
           <div>
-            <h3 className="dcc-subtitle">Kill Switch</h3>
+            <h3 className="dcc-subtitle">熔断开关</h3>
             <pre className="dcc-pre dcc-pre--compact">{JSON.stringify(data.kill_switch, null, 2)}</pre>
           </div>
           <div>
-            <h3 className="dcc-subtitle">Cooldown</h3>
+            <h3 className="dcc-subtitle">冷却</h3>
             <pre className="dcc-pre dcc-pre--compact">{JSON.stringify(data.cooldown, null, 2)}</pre>
           </div>
           <div>
-            <h3 className="dcc-subtitle">DCA Plan</h3>
+            <h3 className="dcc-subtitle">DCA 计划</h3>
             <pre className="dcc-pre dcc-pre--compact">{JSON.stringify(data.dca_plan, null, 2)}</pre>
           </div>
           <div>
-            <h3 className="dcc-subtitle">Exit Plan</h3>
+            <h3 className="dcc-subtitle">退出计划</h3>
             <pre className="dcc-pre dcc-pre--compact">{JSON.stringify(data.exit_plan, null, 2)}</pre>
           </div>
         </div>
       </SectionPanel>
 
-      <SectionPanel title="Risk State" kicker="Full risk context">
+      <SectionPanel title="风险状态" kicker="完整风控上下文">
         <pre className="dcc-pre">{JSON.stringify(data.risk_state, null, 2)}</pre>
       </SectionPanel>
 
-      <SectionPanel title="Risk Event Timeline" kicker="Historical risk events">
+      <SectionPanel title="风险事件时间线" kicker="历史风险事件">
         {riskEvents.length > 0 ? (
           <div className="dcc-timeline">
             {riskEvents.map((event, index) => (
@@ -98,15 +99,15 @@ export function RiskMatrixPage({ snapshot }: RiskMatrixPageProps) {
                 <span className="dcc-timeline__dot" />
                 <div className="dcc-timeline__body">
                   <div className="dcc-timeline__header">
-                    <span className="dcc-badge dcc-badge--partial">{event.event_type ?? 'event'}</span>
-                    <span className="dcc-timeline__time">{event.timestamp ?? 'unknown time'}</span>
+                    <span className="dcc-badge dcc-badge--partial">{zh(event.event_type, '事件')}</span>
+                    <span className="dcc-timeline__time">{event.timestamp ?? '未知时间'}</span>
                   </div>
-                  <p className="dcc-timeline__reason">{event.reason ?? 'No reason provided'}</p>
+                  <p className="dcc-timeline__reason">{event.reason ? zh(event.reason) : '未提供原因'}</p>
                 </div>
               </div>
             ))}
           </div>
-        ) : <p className="dcc-paragraph">No risk events recorded yet.</p>}
+        ) : <p className="dcc-paragraph">暂无风险事件记录。</p>}
       </SectionPanel>
     </div>
   );

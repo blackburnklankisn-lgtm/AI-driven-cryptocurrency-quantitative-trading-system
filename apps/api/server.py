@@ -394,19 +394,25 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
     continuous_learners = _safe_getattr(trader, "_continuous_learners", {}) or {}
 
     learner_items = []
+    active_learner_summary = None
     for key, learner in continuous_learners.items():
         try:
             version_info = learner.get_model_version_info()
             thresholds = learner.get_optimal_thresholds()
-            learner_items.append({
+            active_version = next((item for item in version_info if item.get("is_active")), version_info[-1] if version_info else None)
+            learner_summary = {
                 "id": key,
-                "active_version": version_info[-1] if version_info else None,
+                "active_version": active_version.get("version_id") if active_version else None,
+                "last_retrain_at": active_version.get("trained_at") if active_version else None,
                 "thresholds": {
                     "buy": float(thresholds[0]),
                     "sell": float(thresholds[1]),
                 },
-                "versions": version_info[-5:],
-            })
+                "versions": [item.get("version_id") for item in version_info[-5:] if item.get("version_id")],
+            }
+            learner_items.append(learner_summary)
+            if active_learner_summary is None:
+                active_learner_summary = learner_summary
         except Exception as exc:
             learner_items.append({"id": key, "error": str(exc)})
 
@@ -437,6 +443,9 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
         },
         "continuous_learner": {
             "count": len(learner_items),
+            "active_version": _safe_getattr(active_learner_summary, "get", lambda *_: None)("active_version") if active_learner_summary else None,
+            "thresholds": _safe_getattr(active_learner_summary, "get", lambda *_: {})("thresholds") if active_learner_summary else {},
+            "last_retrain_at": _safe_getattr(active_learner_summary, "get", lambda *_: None)("last_retrain_at") if active_learner_summary else None,
             "items": learner_items,
         },
         "ai_analysis": _safe_getattr(trader, "_last_ai_analysis", "N/A"),
@@ -459,12 +468,20 @@ def _candidate_to_summary(candidate: Any) -> Dict[str, Any]:
     }
 
 
+def _get_evolution_engine(trader: Any) -> Any:
+    return (
+        _safe_getattr(trader, "_phase3_evolution", None)
+        or _safe_getattr(trader, "_self_evolution_engine", None)
+        or _safe_getattr(trader, "self_evolution_engine", None)
+    )
+
+
 def _build_evolution_snapshot() -> Dict[str, Any]:
     trader = _global_trader_instance
     if not trader:
         return {"generated_at": _iso_now(), "status": "inactive"}
 
-    evolution = _safe_getattr(trader, "_self_evolution_engine", None) or _safe_getattr(trader, "self_evolution_engine", None)
+    evolution = _get_evolution_engine(trader)
     if evolution is None:
         return {
             "generated_at": _iso_now(),
@@ -796,7 +813,7 @@ async def get_dashboard_snapshot() -> Dict[str, Any]:
 @app.get("/api/v2/evolution/reports")
 async def get_evolution_reports() -> Dict[str, Any]:
     trader = _global_trader_instance
-    evolution = _safe_getattr(trader, "_self_evolution_engine", None) or _safe_getattr(trader, "self_evolution_engine", None)
+    evolution = _get_evolution_engine(trader)
     store = _safe_getattr(evolution, "_state_store", None)
     reports = []
     if store is not None:
@@ -811,7 +828,7 @@ async def get_evolution_reports() -> Dict[str, Any]:
 @app.get("/api/v2/evolution/decisions")
 async def get_evolution_decisions(limit: int = 50) -> Dict[str, Any]:
     trader = _global_trader_instance
-    evolution = _safe_getattr(trader, "_self_evolution_engine", None) or _safe_getattr(trader, "self_evolution_engine", None)
+    evolution = _get_evolution_engine(trader)
     store = _safe_getattr(evolution, "_state_store", None)
     decisions = []
     if store is not None:
@@ -825,7 +842,7 @@ async def get_evolution_decisions(limit: int = 50) -> Dict[str, Any]:
 @app.get("/api/v2/evolution/retirements")
 async def get_evolution_retirements(limit: int = 50) -> Dict[str, Any]:
     trader = _global_trader_instance
-    evolution = _safe_getattr(trader, "_self_evolution_engine", None) or _safe_getattr(trader, "self_evolution_engine", None)
+    evolution = _get_evolution_engine(trader)
     store = _safe_getattr(evolution, "_state_store", None)
     retirements = []
     if store is not None:
