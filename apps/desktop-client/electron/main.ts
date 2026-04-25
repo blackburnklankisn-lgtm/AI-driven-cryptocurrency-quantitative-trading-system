@@ -97,10 +97,12 @@ function stopPythonBackend(): void {
 function waitForBackend(maxRetries = 30, intervalMs = 1000): Promise<void> {
   return new Promise((resolve, reject) => {
     let attempts = 0;
+    const healthUrls = ['http://localhost:8000/api/v1/health', 'http://127.0.0.1:8000/api/v1/health'];
     const check = () => {
       attempts++;
-      console.log(`[Electron] Health check #${attempts}/${maxRetries} → GET http://localhost:8000/api/v1/health`);
-      const req = http.get('http://localhost:8000/api/v1/health', (res) => {
+      const healthUrl = healthUrls[(attempts - 1) % healthUrls.length];
+      console.log(`[Electron] Health check #${attempts}/${maxRetries} → GET ${healthUrl}`);
+      const req = http.get(healthUrl, (res) => {
         console.log(`[Electron] Health check response: HTTP ${res.statusCode}`);
         if (res.statusCode === 200) {
           console.log('[Electron] ✅ Backend is ready.');

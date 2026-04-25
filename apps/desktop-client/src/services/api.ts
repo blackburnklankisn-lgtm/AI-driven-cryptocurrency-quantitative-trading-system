@@ -9,8 +9,7 @@ import type {
   RiskEvent,
   RiskMatrixSnapshot,
 } from '../types/dashboard';
-
-const API_BASE = 'http://localhost:8000';
+import { fetchWithFallback } from './backendEndpoint';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -169,12 +168,11 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
 }
 
 async function fetchJson<T>(path: string): Promise<T> {
-  const url = `${API_BASE}${path}`;
-  console.debug('[desktop-client][api] request', url);
-  const response = await fetch(url);
+  console.debug('[desktop-client][api] request', path);
+  const response = await fetchWithFallback(path);
   if (!response.ok) {
     const text = await response.text();
-    console.error('[desktop-client][api] request failed', url, response.status, text);
+    console.error('[desktop-client][api] request failed', path, response.status, text);
     throw new Error(`Request failed: ${response.status} ${path}`);
   }
   const data = (await response.json()) as T;
@@ -193,9 +191,8 @@ export const dashboardApi = {
 };
 
 export async function postControlAction(action: string): Promise<{ result: string; message: string }> {
-  const url = `${API_BASE}/api/v1/control`;
   console.info('[desktop-client][api] control action', action);
-  const response = await fetch(url, {
+  const response = await fetchWithFallback('/api/v1/control', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action }),

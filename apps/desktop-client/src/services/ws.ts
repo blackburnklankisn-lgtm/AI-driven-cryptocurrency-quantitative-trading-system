@@ -1,3 +1,5 @@
+import { getPreferredWsBase, rotatePreferredBase } from './backendEndpoint';
+
 export interface WsChannelOptions<T> {
   path: string;
   onMessage: (data: T) => void;
@@ -7,12 +9,12 @@ export interface WsChannelOptions<T> {
 }
 
 export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
-  const url = `ws://localhost:8000${options.path}`;
   let socket: WebSocket | null = null;
   let retryTimer: number | null = null;
   let closedByClient = false;
 
   const connect = () => {
+    const url = `${getPreferredWsBase()}${options.path}`;
     console.info('[desktop-client][ws] connecting', url);
     socket = new WebSocket(url);
     socket.onopen = () => {
@@ -39,6 +41,7 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
       console.warn('[desktop-client][ws] closed', url);
       options.onClose?.();
       if (!closedByClient) {
+        rotatePreferredBase();
         retryTimer = window.setTimeout(connect, 3000);
       }
     };
