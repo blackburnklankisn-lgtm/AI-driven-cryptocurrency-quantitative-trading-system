@@ -8,6 +8,7 @@ modules/evolution/state_store.py — 演进状态原子持久化
     * 决策历史（decisions.jsonl — append-only audit log）
     * 淘汰记录（retirements.jsonl — append-only）
     * 最新演进报告（latest_report.json）
+    * 演进报告历史（reports.jsonl）
     * 调度器状态（scheduler_state.json）
     * 周级参数优化状态（weekly_params_optimizer_state.json）
     * 周级参数优化运行审计（weekly_params_optimizer_runs.jsonl）
@@ -50,6 +51,7 @@ class EvolutionStateStore:
     - decisions.jsonl:       追加式决策审计日志（每行一个 JSON）
     - retirements.jsonl:     追加式淘汰记录
     - latest_report.json:    最新演进报告
+    - reports.jsonl:         历史演进报告（追加式）
     - scheduler_state.json:  调度器状态
     """
 
@@ -106,6 +108,11 @@ class EvolutionStateStore:
         path = os.path.join(self._dir, "latest_report.json")
         data = asdict(report)
         self._atomic_write(path, data)
+        history_path = os.path.join(self._dir, "reports.jsonl")
+        self._append_line(
+            history_path,
+            json.dumps(data, default=_json_default, ensure_ascii=False),
+        )
         log.info("[Evolution] 报告已保存: id={}", report.report_id)
 
     def load_report(self) -> Optional[dict[str, Any]]:
@@ -119,6 +126,11 @@ class EvolutionStateStore:
         except Exception:
             log.exception("[Evolution] 报告加载失败: path={}", path)
             return None
+
+    def load_reports(self, limit: int = 100) -> list[dict[str, Any]]:
+        """加载最近 N 条历史演进报告（最新优先）。"""
+        path = os.path.join(self._dir, "reports.jsonl")
+        return self._load_jsonl_tail(path, limit)
 
     # ─────────────────────────────────────────────
     # 调度器状态（原子覆写）
@@ -220,6 +232,7 @@ class EvolutionStateStore:
         decisions_path = os.path.join(self._dir, "decisions.jsonl")
         retirements_path = os.path.join(self._dir, "retirements.jsonl")
         report_path = os.path.join(self._dir, "latest_report.json")
+        reports_path = os.path.join(self._dir, "reports.jsonl")
         weekly_params_state_path = os.path.join(
             self._dir,
             "weekly_params_optimizer_state.json",
@@ -243,6 +256,7 @@ class EvolutionStateStore:
             "total_decisions": _line_count(decisions_path),
             "total_retirements": _line_count(retirements_path),
             "has_latest_report": os.path.exists(report_path),
+            "total_reports": _line_count(reports_path),
             "has_weekly_params_optimizer_state": os.path.exists(
                 weekly_params_state_path
             ),

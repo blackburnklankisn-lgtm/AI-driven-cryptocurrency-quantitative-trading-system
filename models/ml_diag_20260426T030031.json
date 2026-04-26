@@ -1,0 +1,98 @@
+{
+  "report_count": 2,
+  "generated_at": "2026-04-26T03:01:56.532113+00:00",
+  "reports": [
+    {
+      "type": "walk_forward",
+      "tag": "BTC/USDT",
+      "n_folds": 4,
+      "avg_accuracy": 0.7383,
+      "avg_f1": 0.198,
+      "avg_auc": 0.5293,
+      "optimal_buy_threshold": 0.4424,
+      "optimal_sell_threshold": 0.5576,
+      "feature_count": 68,
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "train_size": 150,
+          "test_size": 150,
+          "accuracy": 0.7333,
+          "f1": 0.5238,
+          "auc": 0.693,
+          "optimal_threshold": 0.448
+        },
+        {
+          "fold": 2,
+          "train_size": 297,
+          "test_size": 150,
+          "accuracy": 0.7533,
+          "f1": 0.0513,
+          "auc": 0.5494,
+          "optimal_threshold": 0.4369
+        },
+        {
+          "fold": 3,
+          "train_size": 445,
+          "test_size": 150,
+          "accuracy": 0.7267,
+          "f1": 0.0465,
+          "auc": 0.5549,
+          "optimal_threshold": 0.3531
+        },
+        {
+          "fold": 4,
+          "train_size": 592,
+          "test_size": 150,
+          "accuracy": 0.74,
+          "f1": 0.1702,
+          "auc": 0.3198,
+          "optimal_threshold": 0.8
+        }
+      ],
+      "created_at": "2026-04-26T03:01:56.510265+00:00"
+    },
+    {
+      "type": "calibration",
+      "tag": "BTC/USDT",
+      "version": "cal_20260426T030156",
+      "strategy": "median",
+      "recommended_buy": 0.4424,
+      "recommended_sell": 0.5576,
+      "buy_mean": 0.5212,
+      "buy_median": 0.4424,
+      "buy_conservative": 0.6022,
+      "threshold_std": 0.1619,
+      "avg_auc": 0.5293,
+      "avg_j_statistic": 0.229,
+      "n_folds": 4,
+      "fold_details": [
+        {
+          "fold_id": 0,
+          "threshold": 0.448,
+          "j_stat": 0.3987,
+          "auc": 0.693
+        },
+        {
+          "fold_id": 1,
+          "threshold": 0.4369,
+          "j_stat": 0.2869,
+          "auc": 0.5494
+        },
+        {
+          "fold_id": 2,
+          "threshold": 0.4,
+          "j_stat": 0.2303,
+          "auc": 0.5549
+        },
+        {
+          "fold_id": 3,
+          "threshold": 0.8,
+          "j_stat": 0.0,
+          "auc": 0.3198
+        }
+      ],
+      "created_at": "2026-04-26T03:01:56.514468+00:00"
+    }
+  ]
+}

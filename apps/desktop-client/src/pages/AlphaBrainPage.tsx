@@ -40,7 +40,7 @@ export function AlphaBrainPage({ snapshot }: AlphaBrainPageProps) {
         </div>
       </SectionPanel>
 
-      <SectionPanel title="编排器" kicker="决策链">
+      <SectionPanel title="编排器" kicker={`决策链 · ${zh(snapshot.orchestrator.decision_chain, snapshot.orchestrator.decision_chain)}`}>
         <div className="dcc-two-col">
           <div>
             <h3 className="dcc-subtitle">权重</h3>
@@ -63,6 +63,9 @@ export function AlphaBrainPage({ snapshot }: AlphaBrainPageProps) {
             <h3 className="dcc-subtitle">当前模型</h3>
             <dl className="dcc-definition-list">
               <div><dt>版本</dt><dd>{snapshot.continuous_learner.active_version ?? '无'}</dd></div>
+              <div><dt>模型类型</dt><dd>{zh(snapshot.continuous_learner.model_type, '未知')}</dd></div>
+              <div><dt>模型路径</dt><dd>{snapshot.continuous_learner.model_path ?? '无'}</dd></div>
+              <div><dt>阈值来源</dt><dd>{snapshot.continuous_learner.threshold_source ?? '默认'}</dd></div>
               <div><dt>最近重训</dt><dd>{snapshot.continuous_learner.last_retrain_at ?? '从未'}</dd></div>
               <div><dt>学习器数量</dt><dd>{snapshot.continuous_learner.count}</dd></div>
             </dl>
@@ -84,6 +87,8 @@ export function AlphaBrainPage({ snapshot }: AlphaBrainPageProps) {
               {snapshot.continuous_learner.items.length > 0 ? snapshot.continuous_learner.items.map((item, index) => (
                 <li key={`${item.id ?? 'learner'}-${index}`}>
                   <strong>{item.id ?? `学习器-${index + 1}`}</strong>: {item.versions?.length ? item.versions.join(' -> ') : (item.active_version ?? '无版本历史')}
+                  {item.model_type ? ` · ${item.model_type}` : ''}
+                  {item.threshold_source ? ` · 阈值来源 ${item.threshold_source}` : ''}
                 </li>
               )) : <li>暂无学习器版本历史</li>}
             </ul>

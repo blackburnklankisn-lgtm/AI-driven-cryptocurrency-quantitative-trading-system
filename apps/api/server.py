@@ -12,10 +12,12 @@ apps/api/server.py — FastAPI 后端桥接服务
 """
 
 import asyncio
+from dataclasses import asdict, is_dataclass
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -233,6 +235,7 @@ async def _ticker_refresh_worker():
         symbols = getattr(trader, '_symbols', None) or _symbols
         cycle += 1
         updated = []
+        current_time = time.time()
         for symbol in symbols:
             try:
                 ticker = await loop.run_in_executor(
@@ -242,6 +245,7 @@ async def _ticker_refresh_worker():
                 if last:
                     old = trader._latest_prices.get(symbol, 0)
                     trader._latest_prices[symbol] = float(last)
+                    trader._latest_prices_updated_at[symbol] = current_time  # 记录更新时间戳
                     if old != float(last):
                         updated.append(f"{symbol}: {old:.4f}→{float(last):.4f}")
             except Exception as exc:  # noqa: BLE001
@@ -491,6 +495,7 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
     regime = _safe_getattr(trader, "_latest_regime_state", None) or _safe_getattr(trader, "_current_regime", None)
     orchestrator_decision = _safe_getattr(trader, "_latest_orchestration_decision", None)
     continuous_learners = _safe_getattr(trader, "_continuous_learners", {}) or {}
+    latest_decision_chain = _safe_getattr(trader, "_latest_decision_chain", "unknown")
 
     learner_items = []
     active_learner_summary = None
@@ -499,10 +504,21 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
             version_info = learner.get_model_version_info()
             thresholds = learner.get_optimal_thresholds()
             active_version = next((item for item in version_info if item.get("is_active")), version_info[-1] if version_info else None)
+            runtime_artifacts_loader = _safe_getattr(trader, "_load_strategy_ml_runtime_artifacts", None)
+            runtime_artifacts = runtime_artifacts_loader(key) if callable(runtime_artifacts_loader) else {}
+            strategy_finder = _safe_getattr(trader, "_find_strategy_by_id", None)
+            strategy = strategy_finder(key) if callable(strategy_finder) else None
             learner_summary = {
                 "id": key,
                 "active_version": active_version.get("version_id") if active_version else None,
                 "last_retrain_at": active_version.get("trained_at") if active_version else None,
+                "model_type": (
+                    runtime_artifacts.get("trainer_model_type")
+                    or _safe_getattr(_safe_getattr(strategy, "model", None), "model_type", None)
+                    or "unknown"
+                ),
+                "model_path": active_version.get("model_path") if active_version else None,
+                "threshold_source": runtime_artifacts.get("threshold_source"),
                 "thresholds": {
                     "buy": float(thresholds[0]),
                     "sell": float(thresholds[1]),
@@ -527,6 +543,7 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
         },
         "is_regime_stable": bool(_safe_getattr(trader, "_latest_regime_stable", False)),
         "orchestrator": {
+            "decision_chain": latest_decision_chain,
             "gating_action": _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None).value if _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None) else "unknown",
             "weights": _safe_getattr(orchestrator_decision, "weights", {}) or {},
             "block_reasons": _safe_getattr(orchestrator_decision, "block_reasons", []) or [],
@@ -543,6 +560,9 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
         "continuous_learner": {
             "count": len(learner_items),
             "active_version": _safe_getattr(active_learner_summary, "get", lambda *_: None)("active_version") if active_learner_summary else None,
+            "model_type": _safe_getattr(active_learner_summary, "get", lambda *_: None)("model_type") if active_learner_summary else None,
+            "model_path": _safe_getattr(active_learner_summary, "get", lambda *_: None)("model_path") if active_learner_summary else None,
+            "threshold_source": _safe_getattr(active_learner_summary, "get", lambda *_: None)("threshold_source") if active_learner_summary else None,
             "thresholds": _safe_getattr(active_learner_summary, "get", lambda *_: {})("thresholds") if active_learner_summary else {},
             "last_retrain_at": _safe_getattr(active_learner_summary, "get", lambda *_: None)("last_retrain_at") if active_learner_summary else None,
             "items": learner_items,
@@ -554,9 +574,12 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
 
 
 def _candidate_to_summary(candidate: Any) -> Dict[str, Any]:
+    metadata = _safe_getattr(candidate, "metadata", {}) or {}
     return {
         "candidate_id": _safe_getattr(candidate, "candidate_id", "unknown"),
         "owner": _safe_getattr(candidate, "owner", "unknown"),
+        "family_key": _safe_getattr(metadata, "get", lambda *_: None)("family_key") or _safe_getattr(candidate, "owner", "unknown"),
+        "strategy_id": _safe_getattr(metadata, "get", lambda *_: None)("strategy_id"),
         "version": _safe_getattr(candidate, "version", "unknown"),
         "status": _safe_getattr(_safe_getattr(candidate, "status", None), "value", _safe_getattr(candidate, "status", "unknown")),
         "candidate_type": _safe_getattr(_safe_getattr(candidate, "candidate_type", None), "value", _safe_getattr(candidate, "candidate_type", "unknown")),
@@ -631,6 +654,44 @@ def _build_evolution_snapshot() -> Dict[str, Any]:
         except Exception:
             weekly_runs = []
 
+    ab_manager = _safe_getattr(evolution, "_ab_manager", None)
+    active_experiment_items = []
+    completed_experiment_items = []
+    if ab_manager is not None:
+        try:
+            for experiment_id in _safe_getattr(ab_manager, "list_active_experiments", lambda: [])() or []:
+                status = _safe_getattr(ab_manager, "get_experiment_status", lambda *_: None)(experiment_id)
+                if isinstance(status, dict):
+                    status["status"] = "active"
+                    active_experiment_items.append(status)
+        except Exception:
+            active_experiment_items = []
+        try:
+            completed_results = _safe_getattr(ab_manager, "completed_results", lambda: [])() or []
+            for item in completed_results[-10:]:
+                if is_dataclass(item):
+                    completed_experiment_items.append(asdict(item))
+                elif isinstance(item, dict):
+                    completed_experiment_items.append(item)
+        except Exception:
+            completed_experiment_items = []
+
+    weekly_state_loader = _safe_getattr(state_store, "load_weekly_params_optimizer_state", None)
+    weekly_state = weekly_state_loader() if callable(weekly_state_loader) else {}
+    if not isinstance(weekly_state, dict) or not weekly_state:
+        weekly_state = {
+            "status": "idle",
+            "reason": "not_triggered_yet",
+        }
+
+    optimization_targets = []
+    target_loader = _safe_getattr(trader, "_collect_phase3_param_optimization_targets", None)
+    if callable(target_loader):
+        try:
+            optimization_targets = target_loader() or []
+        except Exception:
+            optimization_targets = []
+
     snapshot = {
         "generated_at": _iso_now(),
         "candidate_counts_by_status": counts,
@@ -638,11 +699,22 @@ def _build_evolution_snapshot() -> Dict[str, Any]:
         "candidates": candidate_summaries,
         "latest_promotions": decisions,
         "latest_retirements": retirements,
-        "latest_rollbacks": [d for d in decisions if (d.get("metadata") or {}).get("rollback_to")],
-        "ab_experiments": _safe_getattr(_safe_getattr(evolution, "_ab_manager", None), "diagnostics", lambda: {})(),
+        "latest_rollbacks": [
+            d for d in decisions
+            if d.get("action") == "ROLLBACK" or (d.get("metadata") or {}).get("rollback_to")
+        ],
+        "ab_experiments": {
+            "summary": _safe_getattr(ab_manager, "diagnostics", lambda: {})(),
+            "active": active_experiment_items,
+            "completed": completed_experiment_items,
+        },
         "weekly_params_optimizer": {
+            "cron": _safe_getattr(_safe_getattr(evolution, "config", None), "weekly_params_optimizer_cron", ""),
+            "is_running": bool(_safe_getattr(trader, "_phase3_params_optimizer_running", False)),
+            "target_count": len(optimization_targets),
+            "targets": optimization_targets,
             "runs": weekly_runs,
-            "state": _safe_getattr(state_store, "load_weekly_params_optimizer_state", lambda: {})(),
+            "state": weekly_state,
         },
         "last_report_meta": _safe_getattr(_safe_getattr(evolution, "_report_builder", None), "__class__", type("X", (), {})).__name__,
     }
@@ -667,9 +739,47 @@ def _build_risk_matrix_snapshot() -> Dict[str, Any]:
     budget_checker = _safe_getattr(trader, "_budget_checker", None)
     kill_switch = _safe_getattr(trader, "_kill_switch", None)
     cooldown_manager = _safe_getattr(trader, "_cooldown_manager", None)
+    adaptive_risk = _safe_getattr(trader, "_adaptive_risk", None)
     dca_engine = _safe_getattr(trader, "_dca_engine", None)
     exit_planner = _safe_getattr(trader, "_exit_planner", None)
     position_sizer = _safe_getattr(trader, "position_sizer", None)
+
+    budget_remaining_pct = _safe_getattr(budget_checker, "remaining_budget_pct", None)
+    if budget_remaining_pct is None and budget_checker is not None:
+        budget_remaining_pct = _safe_getattr(
+            _safe_getattr(budget_checker, "snapshot", lambda: {})(),
+            "get",
+            lambda *_args, **_kwargs: None,
+        )("remaining_budget_pct", None)
+
+    kill_switch_payload = _safe_getattr(
+        kill_switch,
+        "health_snapshot",
+        lambda: {"status": "unavailable"},
+    )()
+
+    cooldown_payload = _safe_getattr(
+        cooldown_manager,
+        "diagnostics",
+        lambda: {"status": "unavailable"},
+    )()
+    if cooldown_payload.get("status") == "unavailable" and adaptive_risk is not None:
+        adaptive_diag = _safe_getattr(adaptive_risk, "health_snapshot", lambda: {})()
+        cooldown_payload = _safe_getattr(
+            adaptive_diag,
+            "get",
+            lambda *_args, **_kwargs: {"status": "unavailable"},
+        )("cooldown", {"status": "unavailable"})
+
+    if dca_engine is None and adaptive_risk is not None:
+        dca_engine = _safe_getattr(adaptive_risk, "_dca_engine", None)
+    if exit_planner is None and adaptive_risk is not None:
+        exit_planner = _safe_getattr(adaptive_risk, "_exit_planner", None)
+
+    position_sizing_mode = _safe_getattr(_safe_getattr(position_sizer, "config", None), "method", None)
+    if not position_sizing_mode:
+        # 当前实现采用 PositionSizer + 动态波动率目标法，未暴露独立 config.method。
+        position_sizing_mode = "dynamic"
 
     snapshot = {
         "generated_at": _iso_now(),
@@ -679,16 +789,16 @@ def _build_risk_matrix_snapshot() -> Dict[str, Any]:
         "daily_pnl": float(risk_summary.get("daily_pnl", 0.0)),
         "consecutive_losses": int(risk_summary.get("consecutive_losses", 0)),
         "peak_equity": float(risk_summary.get("peak_equity", 0.0)),
-        "budget_remaining_pct": _safe_getattr(budget_checker, "budget_remaining_pct", None),
-        "kill_switch": _safe_getattr(kill_switch, "diagnostics", lambda: {"status": "unavailable"})(),
-        "cooldown": _safe_getattr(cooldown_manager, "diagnostics", lambda: {"status": "unavailable"})(),
+        "budget_remaining_pct": budget_remaining_pct,
+        "kill_switch": kill_switch_payload,
+        "cooldown": cooldown_payload,
         "dca_plan": {
             "config": _safe_getattr(_safe_getattr(dca_engine, "config", None), "__dict__", {}) if dca_engine else {},
         },
         "exit_plan": {
             "config": _safe_getattr(_safe_getattr(exit_planner, "config", None), "__dict__", {}) if exit_planner else {},
         },
-        "position_sizing_mode": _safe_getattr(_safe_getattr(position_sizer, "config", None), "method", "unknown"),
+        "position_sizing_mode": position_sizing_mode,
         "risk_state": risk_summary,
     }
     log.debug("[APIv2] Risk matrix snapshot built: circuit={} cooldown_remaining={} daily_pnl={}", snapshot["circuit_broken"], snapshot["circuit_cooldown_remaining_sec"], snapshot["daily_pnl"])
@@ -700,26 +810,175 @@ def _build_data_fusion_snapshot() -> Dict[str, Any]:
     if not trader:
         return {"generated_at": _iso_now(), "status": "inactive"}
 
-    subscription_manager = _safe_getattr(trader, "_subscription_manager", None)
+    subscription_manager = (
+        _safe_getattr(trader, "_phase3_subscription_manager", None)
+        or _safe_getattr(trader, "_subscription_manager", None)
+    )
     sub_diag = _safe_getattr(subscription_manager, "diagnostics", lambda: {"health": "unavailable"})()
-    latest_prices = {sym: float(price) for sym, price in _safe_getattr(trader, "_latest_prices", {}).items()}
+    
+    # 构建最新价格结构，包含 price, updated_at, age_sec
+    latest_prices_raw = _safe_getattr(trader, "_latest_prices", {})
+    latest_prices_ts = _safe_getattr(trader, "_latest_prices_updated_at", {})
+    current_time = time.time()
+    
+    latest_prices = {}
+    for sym, price in latest_prices_raw.items():
+        ts = latest_prices_ts.get(sym, current_time)
+        age_sec = current_time - ts
+        updated_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        if not updated_at.endswith('Z'):
+            updated_at = updated_at.replace('+00:00', 'Z')
+        latest_prices[sym] = {
+            "price": float(price),
+            "updated_at": updated_at,
+            "age_sec": round(age_sec, 2)
+        }
+
+    def _normalize_status(raw: Any) -> str:
+        return str(raw or "unknown").strip().lower()
+
+    def _status_from_depth_registry() -> Dict[str, Any]:
+        registry = _safe_getattr(trader, "_phase3_depth_registry", None)
+        if registry is None:
+            return {"status": "unknown", "reason": "depth_registry_unavailable"}
+
+        diagnostics = _safe_getattr(registry, "diagnostics", lambda: {})()
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            return {"status": "unknown", "reason": "no_orderbook_symbol_data"}
+
+        total = len(diagnostics)
+        healthy = 0
+        stale = 0
+        for item in diagnostics.values():
+            gap_ok = _normalize_status(_safe_getattr(item, "get", lambda *_a, **_k: "")("gap_status", "")) in {"ok", "healthy"}
+            has_snapshot = bool(_safe_getattr(item, "get", lambda *_a, **_k: False)("has_snapshot", False))
+            if gap_ok and has_snapshot:
+                healthy += 1
+            else:
+                stale += 1
+
+        status = "healthy" if healthy == total else ("partial" if healthy > 0 else "degraded")
+        return {
+            "status": status,
+            "active_symbols": total,
+            "healthy_symbols": healthy,
+            "stale_symbols": stale,
+            "details": diagnostics,
+        }
+
+    def _status_from_trade_registry() -> Dict[str, Any]:
+        registry = _safe_getattr(trader, "_phase3_trade_registry", None)
+        if registry is None:
+            return {"status": "unknown", "reason": "trade_registry_unavailable"}
+
+        diagnostics = _safe_getattr(registry, "diagnostics", lambda: {})()
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            return {"status": "unknown", "reason": "no_trade_symbol_data"}
+
+        total = len(diagnostics)
+        active = 0
+        inactive = 0
+        for item in diagnostics.values():
+            trade_count = int(_safe_getattr(item, "get", lambda *_a, **_k: 0)("trade_count", 0) or 0)
+            if trade_count > 0:
+                active += 1
+            else:
+                inactive += 1
+
+        status = "healthy" if active == total else ("partial" if active > 0 else "degraded")
+        return {
+            "status": status,
+            "active_symbols": total,
+            "symbols_with_trades": active,
+            "symbols_without_trades": inactive,
+            "details": diagnostics,
+        }
+
+    def _status_from_external_collector(collector_attr: str, source_name: str) -> Dict[str, Any]:
+        collector = _safe_getattr(trader, collector_attr, None)
+        if collector is None:
+            return {"status": "unknown", "reason": f"{source_name}_collector_unavailable"}
+
+        diagnostics = _safe_getattr(collector, "diagnostics", lambda: {})()
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+
+        symbols = _safe_getattr(_safe_getattr(trader, "sys_config", None), "data", None)
+        default_symbols = _safe_getattr(symbols, "default_symbols", []) or []
+        probe_symbol = "BTC/USDT"
+        if isinstance(default_symbols, list) and default_symbols:
+            probe_symbol = str(default_symbols[0])
+
+        cache = _safe_getattr(collector, "cache", None)
+        eval_freshness = _safe_getattr(cache, "evaluate_freshness", None)
+        if callable(eval_freshness):
+            try:
+                freshness = eval_freshness(
+                    probe_symbol,
+                    _safe_getattr(_safe_getattr(collector, "config", None), "freshness_config", None),
+                )
+                freshness_status = _normalize_status(_safe_getattr(_safe_getattr(freshness, "status", None), "value", None))
+                status = freshness_status if freshness_status else "unknown"
+                return {
+                    "status": status,
+                    "probe_symbol": probe_symbol,
+                    "lag_sec": float(_safe_getattr(freshness, "lag_sec", 0.0) or 0.0),
+                    "ttl_sec": int(_safe_getattr(freshness, "ttl_sec", 0) or 0),
+                    "degrade_reason": _safe_getattr(freshness, "degrade_reason", None),
+                    "diagnostics": diagnostics,
+                }
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "status": "unknown",
+                    "probe_symbol": probe_symbol,
+                    "reason": f"freshness_eval_failed:{exc}",
+                    "diagnostics": diagnostics,
+                }
+
+        return {"status": "unknown", "reason": "collector_cache_unavailable", "diagnostics": diagnostics}
+
+    orderbook_health = _status_from_depth_registry()
+    trade_feed_health = _status_from_trade_registry()
+    onchain_health = _status_from_external_collector("_onchain_collector", "onchain")
+    sentiment_health = _status_from_external_collector("_sentiment_collector", "sentiment")
 
     price_feed_health = "healthy" if latest_prices else "degraded"
     stale_fields = [] if latest_prices else ["latest_prices"]
+
+    for field_name, payload in {
+        "subscription_manager": sub_diag,
+        "orderbook_health": orderbook_health,
+        "trade_feed_health": trade_feed_health,
+        "onchain_health": onchain_health,
+        "sentiment_health": sentiment_health,
+    }.items():
+        status = _normalize_status(_safe_getattr(payload, "get", lambda *_a, **_k: "unknown")("status", "unknown"))
+        if status in {"stale", "degraded", "missing", "error", "failed", "fail"}:
+            stale_fields.append(field_name)
+
+    freshness_status = "fresh"
+    if stale_fields:
+        freshness_status = "stale"
+    elif any(
+        _normalize_status(_safe_getattr(payload, "get", lambda *_a, **_k: "")("status", "")) in {"partial", "unknown", "unavailable"}
+        for payload in (orderbook_health, trade_feed_health, onchain_health, sentiment_health)
+    ):
+        freshness_status = "partial"
 
     snapshot = {
         "generated_at": _iso_now(),
         "price_feed_health": price_feed_health,
         "subscription_manager": sub_diag,
-        "orderbook_health": _safe_getattr(trader, "_orderbook_health", {"status": "unknown"}),
-        "trade_feed_health": _safe_getattr(trader, "_trade_feed_health", {"status": "unknown"}),
-        "onchain_health": _safe_getattr(trader, "_onchain_health", {"status": "unknown"}),
-        "sentiment_health": _safe_getattr(trader, "_sentiment_health", {"status": "unknown"}),
+        "orderbook_health": orderbook_health,
+        "trade_feed_health": trade_feed_health,
+        "onchain_health": onchain_health,
+        "sentiment_health": sentiment_health,
         "freshness_summary": {
-            "status": "fresh" if latest_prices else "partial",
+            "status": freshness_status,
             "field_count": len(latest_prices),
+            "source_count": 5,
         },
-        "stale_fields": stale_fields,
+        "stale_fields": sorted(set(stale_fields)),
         "latest_prices": latest_prices,
     }
     log.debug("[APIv2] Data fusion snapshot built: price_feed={} stale_fields={} reconnect_count={}", snapshot["price_feed_health"], len(snapshot["stale_fields"]), sub_diag.get("reconnect_count", 0))
@@ -836,11 +1095,14 @@ async def get_klines(symbol: str = "BTC/USDT") -> List[Dict[str, Any]]:
 
 
 class ControlAction(BaseModel):
-    action: str  # "stop", "reset_circuit", "trigger_circuit_test"
+    action: str  # "stop", "reset_circuit", "trigger_circuit_test", "rollback_evolution", "trigger_weekly_optimizer"
+    family_key: Optional[str] = None
+    candidate_id: Optional[str] = None
+    rollback_to_candidate_id: Optional[str] = None
 
 
 @app.post("/api/v1/control")
-async def execute_control(cmd: ControlAction) -> Dict[str, str]:
+async def execute_control(cmd: ControlAction) -> Dict[str, Any]:
     trader = _global_trader_instance
     if not trader:
         return {"result": "error", "message": "Trader engine is not running"}
@@ -859,6 +1121,39 @@ async def execute_control(cmd: ControlAction) -> Dict[str, str]:
             return {"result": "error", "message": "trigger_circuit_test only allowed in paper mode"}
         trader.risk_manager._trigger_circuit_breaker("手动测试触发熔断 [trigger_circuit_test]")
         return {"result": "ok", "message": "Circuit breaker triggered for testing"}
+
+    elif cmd.action == "rollback_evolution":
+        rollback_result = _safe_getattr(
+            trader,
+            "manual_rollback_evolution",
+            lambda **_: {"ok": False, "message": "Rollback handler unavailable"},
+        )(
+            family_key=cmd.family_key,
+            current_candidate_id=cmd.candidate_id,
+            rollback_to_candidate_id=cmd.rollback_to_candidate_id,
+        )
+        if rollback_result.get("ok"):
+            message = rollback_result.get("message", "Evolution rollback applied")
+            rollback_from = rollback_result.get("rollback_from")
+            rollback_to = rollback_result.get("rollback_to")
+            if rollback_from and rollback_to:
+                message = f"{message}: {rollback_from} -> {rollback_to}"
+            return {"result": "ok", "message": message}
+        return {
+            "result": "error",
+            "error_code": str(rollback_result.get("error_code", "ROLLBACK_FAILED")),
+            "message": str(rollback_result.get("message", "No rollback target is available")),
+        }
+
+    elif cmd.action == "trigger_weekly_optimizer":
+        trigger_result = _safe_getattr(trader, "trigger_weekly_ml_params_optimization", lambda: {"ok": False, "message": "Weekly optimizer handler unavailable"})()
+        if trigger_result.get("ok"):
+            slot_id = trigger_result.get("slot_id")
+            message = trigger_result.get("message", "Weekly params optimizer triggered")
+            if slot_id:
+                message = f"{message}: {slot_id}"
+            return {"result": "ok", "message": message}
+        return {"result": "error", "message": str(trigger_result.get("message", "Failed to trigger weekly params optimizer"))}
 
     return {"result": "error", "message": f"Unknown action: {cmd.action}"}
 
@@ -910,15 +1205,19 @@ async def get_dashboard_snapshot() -> Dict[str, Any]:
 
 
 @app.get("/api/v2/evolution/reports")
-async def get_evolution_reports() -> Dict[str, Any]:
+async def get_evolution_reports(limit: int = 50) -> Dict[str, Any]:
     trader = _global_trader_instance
     evolution = _get_evolution_engine(trader)
     store = _safe_getattr(evolution, "_state_store", None)
     reports = []
     if store is not None:
         try:
-            report = store.load_report()
-            reports = [report] if report else []
+            history_loader = _safe_getattr(store, "load_reports", None)
+            if callable(history_loader):
+                reports = history_loader(limit=max(1, min(limit, 500)))
+            else:
+                report = store.load_report()
+                reports = [report] if report else []
         except Exception:
             reports = []
     return {"generated_at": _iso_now(), "reports": reports}
@@ -958,9 +1257,15 @@ async def get_risk_events() -> Dict[str, Any]:
     events = []
     if snapshot.get("circuit_reason"):
         events.append({
-            "type": "circuit_breaker",
-            "message": snapshot["circuit_reason"],
-            "generated_at": snapshot["generated_at"],
+            "event_id": f"circuit-{snapshot.get('generated_at', _iso_now())}",
+            "timestamp": snapshot.get("generated_at", _iso_now()),
+            "event_type": "circuit_breaker",
+            "reason": snapshot["circuit_reason"],
+            "details": {
+                "circuit_broken": bool(snapshot.get("circuit_broken", False)),
+                "consecutive_losses": int(snapshot.get("consecutive_losses", 0)),
+                "daily_pnl": float(snapshot.get("daily_pnl", 0.0)),
+            },
         })
     return {"generated_at": _iso_now(), "items": events}
 

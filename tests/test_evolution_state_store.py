@@ -214,6 +214,17 @@ class TestReport:
         result = store.load_report()
         assert result is None
 
+    def test_save_report_appends_history(self, store):
+        store.save_report(_make_report("r-001"))
+        store.save_report(_make_report("r-002"))
+        reports = store.load_reports(limit=10)
+        assert len(reports) == 2
+        assert reports[0]["report_id"] == "r-002"
+        assert reports[1]["report_id"] == "r-001"
+
+    def test_load_reports_empty_when_no_file(self, store):
+        assert store.load_reports() == []
+
 
 # ══════════════════════════════════════════════════════════════
 # 5. 调度器状态
@@ -298,6 +309,7 @@ class TestDiagnostics:
         assert diag["total_decisions"] == 0
         assert diag["total_retirements"] == 0
         assert diag["has_latest_report"] is False
+        assert diag["total_reports"] == 0
         assert "state_dir" in diag
 
     def test_diagnostics_after_data(self, store):
@@ -312,6 +324,7 @@ class TestDiagnostics:
         assert diag["total_decisions"] == 2
         assert diag["total_retirements"] == 1
         assert diag["has_latest_report"] is True
+        assert diag["total_reports"] == 1
         assert diag["has_weekly_params_optimizer_state"] is True
         assert diag["total_weekly_params_optimizer_runs"] == 1
 

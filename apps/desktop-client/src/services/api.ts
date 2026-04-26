@@ -18,6 +18,18 @@ interface EvolutionReportsEnvelope {
   reports?: EvolutionReport[];
 }
 
+export interface ControlActionPayload {
+  action: string;
+  family_key?: string;
+  candidate_id?: string;
+  rollback_to_candidate_id?: string;
+}
+
+interface RiskEventsEnvelope {
+  generated_at?: string;
+  items?: Array<Record<string, unknown>>;
+}
+
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
@@ -130,6 +142,7 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
       },
       is_regime_stable: asBoolean(alphaBrain.is_regime_stable),
       orchestrator: {
+        decision_chain: asString(orchestrator.decision_chain, 'unknown'),
         gating_action: asString(orchestrator.gating_action, 'unknown'),
         weights: asRecord(orchestrator.weights) as Record<string, number>,
         block_reasons: asArray<string>(orchestrator.block_reasons),
@@ -138,6 +151,9 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
       continuous_learner: {
         count: asNumber(continuousLearner.count),
         active_version: asString(continuousLearner.active_version) || null,
+        model_type: asString(continuousLearner.model_type) || null,
+        model_path: asString(continuousLearner.model_path) || null,
+        threshold_source: asString(continuousLearner.threshold_source) || null,
         thresholds: asRecord(continuousLearner.thresholds) as Record<string, number>,
         last_retrain_at: asString(continuousLearner.last_retrain_at) || null,
         items: asArray(continuousLearner.items),
@@ -152,8 +168,19 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
       latest_promotions: asArray(evolution.latest_promotions),
       latest_retirements: asArray(evolution.latest_retirements),
       latest_rollbacks: asArray(evolution.latest_rollbacks),
-      ab_experiments: asRecord(evolution.ab_experiments),
-      weekly_params_optimizer: asRecord(evolution.weekly_params_optimizer),
+      ab_experiments: {
+        summary: asRecord(asRecord(evolution.ab_experiments).summary),
+        active: asArray(asRecord(evolution.ab_experiments).active),
+        completed: asArray(asRecord(evolution.ab_experiments).completed),
+      },
+      weekly_params_optimizer: {
+        cron: asString(asRecord(evolution.weekly_params_optimizer).cron),
+        is_running: asBoolean(asRecord(evolution.weekly_params_optimizer).is_running),
+        target_count: asNumber(asRecord(evolution.weekly_params_optimizer).target_count),
+        targets: asArray(asRecord(evolution.weekly_params_optimizer).targets),
+        runs: asArray(asRecord(evolution.weekly_params_optimizer).runs),
+        state: asRecord(asRecord(evolution.weekly_params_optimizer).state),
+      },
       last_report_meta: evolution.last_report_meta ?? null,
       status: asString(evolution.status),
       message: asString(evolution.message),
@@ -185,7 +212,7 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
       sentiment_health: asRecord(dataFusion.sentiment_health),
       freshness_summary: asRecord(dataFusion.freshness_summary),
       stale_fields: asArray<string>(dataFusion.stale_fields),
-      latest_prices: asRecord(dataFusion.latest_prices) as Record<string, number>,
+      latest_prices: asRecord(dataFusion.latest_prices) as Record<string, { price: number; updated_at: string; age_sec: number }>,
       status: asString(dataFusion.status),
     },
     execution: {
@@ -227,22 +254,39 @@ export const dashboardApi = {
   getExecution: () => fetchJson<ExecutionSnapshot>('/api/v2/dashboard/execution'),
 };
 
-export async function postControlAction(action: string): Promise<{ result: string; message: string }> {
-  console.info('[desktop-client][api] control action', action);
+export async function postControlAction(
+  actionOrPayload: string | ControlActionPayload,
+): Promise<{ result: string; message: string; error_code?: string }> {
+  const payload: ControlActionPayload =
+    typeof actionOrPayload === 'string' ? { action: actionOrPayload } : actionOrPayload;
+  console.info('[desktop-client][api] control action', payload);
   const response = await fetchWithFallback('/api/v1/control', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action }),
+    body: JSON.stringify(payload),
   });
-  const data = (await response.json()) as { result: string; message: string };
-  console.info('[desktop-client][api] control result', action, data);
+  const data = (await response.json()) as { result: string; message: string; error_code?: string };
+  console.info('[desktop-client][api] control result', payload.action, data);
   return data;
 }
 
 export function getRiskEvents(): Promise<RiskEvent[]> {
-  return fetchJson<RiskEvent[]>('/api/v2/risk/events');
+  return fetchJson<RiskEventsEnvelope>('/api/v2/risk/events').then((payload) => {
+    const items = asArray<Record<string, unknown>>(asRecord(payload).items);
+    return items.map((item, index) => {
+      const event = asRecord(item);
+      return {
+        event_id: asString(event.event_id, `risk_evt_${index}`),
+        timestamp: asString(event.timestamp, asString(event.generated_at)),
+        event_type: asString(event.event_type, asString(event.type, 'risk_event')),
+        reason: asString(event.reason, asString(event.message)),
+        details: asRecord(event.details),
+      };
+    });
+  });
 }
 
-export function getEvolutionReports(): Promise<EvolutionReport[]> {
-  return fetchJson<EvolutionReportsEnvelope>('/api/v2/evolution/reports').then((data) => asArray<EvolutionReport>(data.reports));
+export function getEvolutionReports(limit?: number): Promise<EvolutionReport[]> {
+  const query = typeof limit === 'number' && Number.isFinite(limit) ? `?limit=${Math.max(1, Math.floor(limit))}` : '';
+  return fetchJson<EvolutionReportsEnvelope>(`/api/v2/evolution/reports${query}`).then((data) => asArray<EvolutionReport>(data.reports));
 }

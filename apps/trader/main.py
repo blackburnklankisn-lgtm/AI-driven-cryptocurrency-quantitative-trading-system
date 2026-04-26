@@ -216,6 +216,7 @@ class LiveTrader:
         self._latest_regime_state = self._current_regime
         self._latest_regime_stable: bool = False
         self._latest_orchestration_decision = None
+        self._latest_decision_chain: str = "unknown"
         self._phase1_orchestrator = StrategyOrchestrator()
         self._phase1_data_kitchens: Dict[str, DataKitchen] = {}
         self._phase1_regime_detectors: Dict[str, MarketRegimeDetector] = {}
@@ -244,6 +245,7 @@ class LiveTrader:
         self._entry_prices: Dict[str, float] = {}   # 入场均价追踪
         self._stop_loss_pending: set = set()         # 已发出止损单的品种，防重复触发
         self._latest_prices: Dict[str, float] = {}
+        self._latest_prices_updated_at: Dict[str, float] = {}  # 每个价格的更新时间戳（Unix秒）
         self._current_equity: float = 0.0
         self._running: bool = False
         
@@ -1334,6 +1336,7 @@ class LiveTrader:
                 ):
                     order_req = self._build_phase3_order_request(symbol, _decision, seq)
                     if order_req is not None:
+                        self._latest_decision_chain = "phase3_rl"
                         self._process_order_request(
                             order_req,
                             self._current_equity,
@@ -1715,6 +1718,7 @@ class LiveTrader:
                 # 同时更新最新价格（用最后一根的收盘价）
                 _, _, _, _, last_c, _ = candles[-1]
                 self._latest_prices[symbol] = float(last_c)
+                self._latest_prices_updated_at[symbol] = time.time()  # 记录更新时间戳
                 # Paper 模式：同步行情到网关（用于模拟成交价计算）
                 if self.mode == "paper":
                     self.gateway.update_paper_price(symbol, float(last_c))
@@ -1825,9 +1829,10 @@ class LiveTrader:
                     current_drawdown=risk_snapshot.current_drawdown,
                     is_regime_stable=detector.is_stable,
                     bar_seq=context.loop_seq,
-            self._latest_orchestration_decision = decision
                 )
             )
+            self._latest_orchestration_decision = decision
+            self._latest_decision_chain = "phase1_orchestrator"
             
             for result in decision.selected_results:
                 weight = decision.weights.get(result.strategy_id, 1.0)
@@ -1853,6 +1858,7 @@ class LiveTrader:
             
         except Exception:  # noqa: BLE001
             log.exception("AlphaRuntime 处理异常: symbol={}", event.symbol)
+            self._latest_decision_chain = "legacy_fallback"
             
             # 回退：直接调用策略（向后兼容）
             risk_snapshot = self._build_risk_snapshot()
@@ -3155,6 +3161,117 @@ class LiveTrader:
         self._phase3_params_optimizer_running = True
         worker.start()
         return True
+
+    def trigger_weekly_ml_params_optimization(self) -> Dict[str, Any]:
+        """手动触发一次周级参数优化任务。"""
+        now = datetime.now(timezone.utc)
+        evolution = getattr(self, "_phase3_evolution", None)
+        worker = self._phase3_params_optimizer_thread
+        if self._phase3_params_optimizer_running or (
+            worker is not None and worker.is_alive()
+        ):
+            return {"ok": False, "message": "Weekly params optimizer is already running"}
+
+        slot_id = f"manual:{now.isoformat()}"
+        if evolution is not None and callable(
+            getattr(evolution, "record_weekly_params_optimizer_start", None)
+        ):
+            self._phase3_params_optimizer_state = evolution.record_weekly_params_optimizer_start(
+                slot_id,
+                now=now,
+            )
+        else:
+            self._save_phase3_params_optimizer_state(
+                last_attempted_slot=slot_id,
+                last_attempted_at=now.isoformat(),
+                status="running",
+            )
+
+        if not self._start_weekly_ml_params_optimization(slot_id):
+            return {"ok": False, "message": "Failed to start weekly params optimizer"}
+
+        return {
+            "ok": True,
+            "message": "Weekly params optimizer triggered",
+            "slot_id": slot_id,
+        }
+
+    def manual_rollback_evolution(
+        self,
+        *,
+        family_key: Optional[str] = None,
+        current_candidate_id: Optional[str] = None,
+        rollback_to_candidate_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """执行手动回滚，并同步运行时状态。"""
+        evolution = getattr(self, "_phase3_evolution", None)
+        if evolution is None:
+            return {
+                "ok": False,
+                "error_code": "ROLLBACK_UNAVAILABLE",
+                "message": "Evolution engine does not support manual rollback",
+            }
+
+        rollback_fn = None
+        use_precise_manual_rollback = False
+        if callable(getattr(evolution, "manual_rollback", None)):
+            rollback_fn = evolution.manual_rollback
+            use_precise_manual_rollback = True
+        elif callable(getattr(evolution, "manual_rollback_latest", None)):
+            rollback_fn = evolution.manual_rollback_latest
+
+        if rollback_fn is None:
+            return {
+                "ok": False,
+                "error_code": "ROLLBACK_UNAVAILABLE",
+                "message": "Evolution engine does not support manual rollback",
+            }
+
+        try:
+            if use_precise_manual_rollback:
+                report = rollback_fn(
+                    family_key=family_key,
+                    current_candidate_id=current_candidate_id,
+                    rollback_to_candidate_id=rollback_to_candidate_id,
+                )
+            else:
+                report = rollback_fn()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[Phase3/EV] 手动回滚失败")
+            return {
+                "ok": False,
+                "error_code": str(getattr(exc, "code", "ROLLBACK_FAILED")),
+                "message": str(getattr(exc, "message", str(exc))),
+            }
+
+        if report is None:
+            return {
+                "ok": False,
+                "error_code": "NO_ROLLBACK_TARGET",
+                "message": "No rollback target is available",
+            }
+
+        try:
+            self._apply_evolution_runtime_state(report)
+        except Exception:  # noqa: BLE001
+            log.exception("[Phase3/EV] 手动回滚后的运行时同步失败")
+
+        decisions = list(getattr(report, "decisions", []) or [])
+        rollback_to = None
+        rollback_from = None
+        if decisions:
+            metadata = getattr(decisions[0], "metadata", {}) or {}
+            rollback_to = metadata.get("rollback_to")
+            rollback_from = getattr(decisions[0], "candidate_id", None)
+
+        return {
+            "ok": True,
+            "message": "Evolution rollback applied",
+            "rollback_from": rollback_from,
+            "rollback_to": rollback_to,
+            "family_key": family_key,
+            "report_id": getattr(report, "report_id", None),
+        }
 
     def _maybe_start_weekly_ml_params_optimization(
         self,

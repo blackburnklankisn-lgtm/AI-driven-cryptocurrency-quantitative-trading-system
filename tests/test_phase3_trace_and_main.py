@@ -2622,6 +2622,23 @@ class TestMainPhaseIntegration:
         trader._start_weekly_ml_params_optimization.assert_called_once_with(slot_id)
         assert trader._phase3_params_optimizer_state["status"] == "running"
 
+    def test_trigger_weekly_ml_params_optimization_starts_manual_slot(self):
+        from apps.trader.main import LiveTrader
+
+        trader = _make_minimal_trader()
+        trader._phase3_evolution = MagicMock()
+        trader._phase3_evolution.record_weekly_params_optimizer_start.return_value = {
+            "status": "running",
+        }
+        trader._start_weekly_ml_params_optimization = MagicMock(return_value=True)
+
+        result = LiveTrader.trigger_weekly_ml_params_optimization(trader)
+
+        assert result["ok"] is True
+        assert str(result["slot_id"]).startswith("manual:")
+        trader._phase3_evolution.record_weekly_params_optimizer_start.assert_called_once()
+        trader._start_weekly_ml_params_optimization.assert_called_once()
+
     def test_register_evolution_strategy_params_candidate_for_non_ml_strategy(self):
         from apps.trader.main import LiveTrader
 

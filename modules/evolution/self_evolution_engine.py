@@ -47,6 +47,15 @@ from modules.evolution.state_store import EvolutionStateStore
 log = get_logger(__name__)
 
 
+class ManualRollbackError(RuntimeError):
+    """可结构化识别的手动回滚异常。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 # ══════════════════════════════════════════════════════════════
 # 一、配置
 # ══════════════════════════════════════════════════════════════
@@ -366,6 +375,92 @@ class SelfEvolutionEngine:
             )
             self._state_store.append_decision(decision)
         return updated
+
+    def manual_rollback(
+        self,
+        *,
+        family_key: Optional[str] = None,
+        current_candidate_id: Optional[str] = None,
+        rollback_to_candidate_id: Optional[str] = None,
+        reason: str = "MANUAL_ROLLBACK",
+    ) -> Optional[Any]:
+        """按 family 或 candidate 精确执行一次手动回滚。"""
+        current = self._select_manual_current_candidate(
+            family_key=family_key,
+            current_candidate_id=current_candidate_id,
+        )
+
+        previous = self._resolve_manual_rollback_target(
+            current,
+            rollback_to_candidate_id=rollback_to_candidate_id,
+        )
+
+        effective_at = datetime.now(tz=timezone.utc)
+        self._registry.transition(
+            candidate_id=current.candidate_id,
+            new_status=CandidateStatus.PAUSED,
+            reason=reason,
+        )
+        self._registry.transition(
+            candidate_id=previous.candidate_id,
+            new_status=CandidateStatus.ACTIVE,
+            reason=f"ROLLBACK_FROM:{current.candidate_id}",
+        )
+
+        self._prev_active[current.candidate_id] = previous.candidate_id
+
+        decision = PromotionDecision(
+            candidate_id=current.candidate_id,
+            action=PromotionAction.ROLLBACK.value,
+            from_status=current.status,
+            to_status=CandidateStatus.PAUSED.value,
+            reason_codes=[reason, "MANUAL_OVERRIDE"],
+            effective_at=effective_at,
+            metadata={
+                "rollback_to": previous.candidate_id,
+                "family_key": self._candidate_family_key(current),
+            },
+        )
+        self._state_store.append_decision(decision)
+
+        record = self._retirement_policy.make_retirement_record(
+            snapshot=current,
+            decision=decision,
+            rollback_to=previous.candidate_id,
+        )
+        self._state_store.append_retirement(record)
+
+        report = self._report_builder.build(
+            period_start=effective_at,
+            decisions=[decision],
+            active_snapshot=self._registry.list_active(),
+            metadata={
+                "manual": True,
+                "reason": reason,
+                "family_key": self._candidate_family_key(current),
+                "rollback_from": current.candidate_id,
+                "rollback_to": previous.candidate_id,
+            },
+        )
+        self._state_store.save_report(report)
+        log.info(
+            "[Evolution] 手动回滚完成: current={} rollback_to={} reason={} family={}",
+            current.candidate_id,
+            previous.candidate_id,
+            reason,
+            self._candidate_family_key(current),
+        )
+        return report
+
+    def manual_rollback_latest(
+        self,
+        reason: str = "MANUAL_ROLLBACK",
+    ) -> Optional[Any]:
+        """回滚最近一个存在可恢复上一版本的 active 候选。"""
+        try:
+            return self.manual_rollback(reason=reason)
+        except ManualRollbackError:
+            return None
 
     # ─────────────────────────────────────────────
     # 对外接口：A/B 管理
@@ -716,6 +811,120 @@ class SelfEvolutionEngine:
             reverse=True,
         )
         return family_members
+
+    def _resolve_manual_rollback_target(
+        self,
+        snapshot: CandidateSnapshot,
+        *,
+        rollback_to_candidate_id: Optional[str] = None,
+    ) -> Optional[CandidateSnapshot]:
+        family_key = self._candidate_family_key(snapshot)
+
+        if rollback_to_candidate_id:
+            target = self._registry.get(rollback_to_candidate_id)
+            if target is None:
+                raise ManualRollbackError(
+                    "ROLLBACK_TARGET_NOT_FOUND",
+                    f"Rollback target candidate does not exist: {rollback_to_candidate_id}",
+                )
+            if target.candidate_id == snapshot.candidate_id:
+                raise ManualRollbackError(
+                    "INVALID_ROLLBACK_TARGET",
+                    "Rollback target candidate cannot be the same as current candidate",
+                )
+            if family_key and self._candidate_family_key(target) != family_key:
+                raise ManualRollbackError(
+                    "FAMILY_MISMATCH",
+                    (
+                        f"Rollback target family mismatch: current={family_key} "
+                        f"target={self._candidate_family_key(target)}"
+                    ),
+                )
+            if target.status == CandidateStatus.ACTIVE.value:
+                raise ManualRollbackError(
+                    "ROLLBACK_TARGET_ACTIVE",
+                    "Rollback target candidate is already active",
+                )
+            return target
+
+        previous_candidate_id = self._prev_active.get(snapshot.candidate_id)
+        if previous_candidate_id:
+            previous = self._registry.get(previous_candidate_id)
+            if previous is not None and previous.status != CandidateStatus.ACTIVE.value:
+                return previous
+
+        if not family_key:
+            raise ManualRollbackError(
+                "NO_ROLLBACK_TARGET",
+                "No rollback target is available for current candidate",
+            )
+
+        paused_family_members = [
+            candidate
+            for candidate in self._registry.list_by_status(CandidateStatus.PAUSED)
+            if self._candidate_family_key(candidate) == family_key
+        ]
+        paused_family_members.sort(
+            key=lambda candidate: candidate.promoted_at or candidate.created_at,
+            reverse=True,
+        )
+        if paused_family_members:
+            return paused_family_members[0]
+
+        raise ManualRollbackError(
+            "NO_ROLLBACK_TARGET",
+            f"No paused rollback target is available in family: {family_key}",
+        )
+
+    def _select_manual_current_candidate(
+        self,
+        *,
+        family_key: Optional[str],
+        current_candidate_id: Optional[str],
+    ) -> Optional[CandidateSnapshot]:
+        active_candidates = sorted(
+            self._registry.list_active(),
+            key=lambda candidate: candidate.promoted_at or candidate.created_at,
+            reverse=True,
+        )
+        if not active_candidates:
+            raise ManualRollbackError(
+                "NO_ACTIVE_CANDIDATE",
+                "No active candidate is available for rollback",
+            )
+
+        if current_candidate_id:
+            target = self._registry.get(current_candidate_id)
+            if target is None:
+                raise ManualRollbackError(
+                    "CANDIDATE_NOT_FOUND",
+                    f"Current candidate does not exist: {current_candidate_id}",
+                )
+            if target.status != CandidateStatus.ACTIVE.value:
+                raise ManualRollbackError(
+                    "CURRENT_NOT_ACTIVE",
+                    f"Current candidate is not active: {current_candidate_id}",
+                )
+            if family_key and self._candidate_family_key(target) != family_key:
+                raise ManualRollbackError(
+                    "FAMILY_MISMATCH",
+                    (
+                        f"Current candidate family mismatch: expected={family_key} "
+                        f"actual={self._candidate_family_key(target)}"
+                    ),
+                )
+            return target
+
+        if family_key:
+            for candidate in active_candidates:
+                if self._candidate_family_key(candidate) == family_key:
+                    return candidate
+            raise ManualRollbackError(
+                "FAMILY_NO_ACTIVE_CANDIDATE",
+                f"No active candidate found in family: {family_key}",
+            )
+
+        return active_candidates[0]
 
     @staticmethod
     def _candidate_family_key(snapshot: CandidateSnapshot) -> str:

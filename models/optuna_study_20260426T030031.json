@@ -1,0 +1,312 @@
+{
+  "n_trials": 30,
+  "best_value": 0.6212167886203203,
+  "best_params": {
+    "model_type": "rf",
+    "n_estimators": 54,
+    "max_depth": 4,
+    "min_samples_leaf": 40
+  },
+  "trials": [
+    {
+      "number": 0,
+      "value": 0.5639667603291767,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 238,
+        "max_depth": 6,
+        "min_samples_leaf": 7
+      }
+    },
+    {
+      "number": 1,
+      "value": 0.5714483903158939,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 200,
+        "max_depth": 6,
+        "min_samples_leaf": 18
+      }
+    },
+    {
+      "number": 2,
+      "value": 0.5828433114212226,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 148,
+        "max_depth": 3,
+        "min_samples_leaf": 8
+      }
+    },
+    {
+      "number": 3,
+      "value": 0.5822146349686486,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 290,
+        "max_depth": 8,
+        "min_samples_leaf": 34
+      }
+    },
+    {
+      "number": 4,
+      "value": 0.5916702215290717,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 92,
+        "max_depth": 7,
+        "min_samples_leaf": 24
+      }
+    },
+    {
+      "number": 5,
+      "value": 0.5879148047443326,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 189,
+        "max_depth": 3,
+        "min_samples_leaf": 16
+      }
+    },
+    {
+      "number": 6,
+      "value": 0.5582168075781586,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 58,
+        "max_depth": 8,
+        "min_samples_leaf": 11
+      }
+    },
+    {
+      "number": 7,
+      "value": 0.5812384984777125,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 210,
+        "max_depth": 4,
+        "min_samples_leaf": 30
+      }
+    },
+    {
+      "number": 8,
+      "value": 0.5804222461137222,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 293,
+        "max_depth": 6,
+        "min_samples_leaf": 35
+      }
+    },
+    {
+      "number": 9,
+      "value": 0.5924105402845229,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 77,
+        "max_depth": 4,
+        "min_samples_leaf": 26
+      }
+    },
+    {
+      "number": 10,
+      "value": 0.5820799203519792,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 122,
+        "max_depth": 10,
+        "min_samples_leaf": 26
+      }
+    },
+    {
+      "number": 11,
+      "value": 0.6102232048483276,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 59,
+        "max_depth": 5,
+        "min_samples_leaf": 24
+      }
+    },
+    {
+      "number": 12,
+      "value": 0.6212167886203203,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 54,
+        "max_depth": 4,
+        "min_samples_leaf": 40
+      }
+    },
+    {
+      "number": 13,
+      "value": 0.619664001087307,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 53,
+        "max_depth": 5,
+        "min_samples_leaf": 40
+      }
+    },
+    {
+      "number": 14,
+      "value": 0.5814765979241017,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 116,
+        "max_depth": 4,
+        "min_samples_leaf": 40
+      }
+    },
+    {
+      "number": 15,
+      "value": 0.5807238740841411,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 147,
+        "max_depth": 5,
+        "min_samples_leaf": 40
+      }
+    },
+    {
+      "number": 16,
+      "value": 0.5940661456534675,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 96,
+        "max_depth": 5,
+        "min_samples_leaf": 34
+      }
+    },
+    {
+      "number": 17,
+      "value": 0.6047324238971139,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 53,
+        "max_depth": 3,
+        "min_samples_leaf": 36
+      }
+    },
+    {
+      "number": 18,
+      "value": 0.5819483845433756,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 150,
+        "max_depth": 7,
+        "min_samples_leaf": 31
+      }
+    },
+    {
+      "number": 19,
+      "value": 0.5815341588522702,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 111,
+        "max_depth": 10,
+        "min_samples_leaf": 40
+      }
+    },
+    {
+      "number": 20,
+      "value": 0.5934027564610931,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 82,
+        "max_depth": 4,
+        "min_samples_leaf": 30
+      }
+    },
+    {
+      "number": 21,
+      "value": 0.6107862652079232,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 50,
+        "max_depth": 5,
+        "min_samples_leaf": 20
+      }
+    },
+    {
+      "number": 22,
+      "value": 0.5690757609193746,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 73,
+        "max_depth": 5,
+        "min_samples_leaf": 18
+      }
+    },
+    {
+      "number": 23,
+      "value": 0.6130903215070048,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 52,
+        "max_depth": 5,
+        "min_samples_leaf": 20
+      }
+    },
+    {
+      "number": 24,
+      "value": 0.5618397468272006,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 100,
+        "max_depth": 4,
+        "min_samples_leaf": 14
+      }
+    },
+    {
+      "number": 25,
+      "value": 0.5844979822436941,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 133,
+        "max_depth": 6,
+        "min_samples_leaf": 37
+      }
+    },
+    {
+      "number": 26,
+      "value": 0.6037831570371456,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 74,
+        "max_depth": 3,
+        "min_samples_leaf": 27
+      }
+    },
+    {
+      "number": 27,
+      "value": 0.5729381292705327,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 242,
+        "max_depth": 7,
+        "min_samples_leaf": 21
+      }
+    },
+    {
+      "number": 28,
+      "value": 0.5842371223376022,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 173,
+        "max_depth": 5,
+        "min_samples_leaf": 32
+      }
+    },
+    {
+      "number": 29,
+      "value": 0.5568047221782678,
+      "params": {
+        "model_type": "rf",
+        "n_estimators": 67,
+        "max_depth": 6,
+        "min_samples_leaf": 5
+      }
+    }
+  ]
+}

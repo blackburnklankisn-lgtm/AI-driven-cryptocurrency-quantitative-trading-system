@@ -77,6 +77,9 @@ export interface AlphaBrainSelectedResult {
 export interface ContinuousLearnerItem {
   id?: string;
   active_version?: string | null;
+  model_type?: string | null;
+  model_path?: string | null;
+  threshold_source?: string | null;
   thresholds?: Record<string, number>;
   versions?: string[];
   error?: string;
@@ -94,6 +97,7 @@ export interface AlphaBrainSnapshot {
   };
   is_regime_stable: boolean;
   orchestrator: {
+    decision_chain: string;
     gating_action: string;
     weights: Record<string, number>;
     block_reasons: string[];
@@ -102,6 +106,9 @@ export interface AlphaBrainSnapshot {
   continuous_learner: {
     count: number;
     active_version: string | null;
+    model_type?: string | null;
+    model_path?: string | null;
+    threshold_source?: string | null;
     thresholds: Record<string, number>;
     last_retrain_at: string | null;
     items: ContinuousLearnerItem[];
@@ -117,8 +124,19 @@ export interface EvolutionSnapshot {
   latest_promotions: Array<Record<string, unknown>>;
   latest_retirements: Array<Record<string, unknown>>;
   latest_rollbacks: Array<Record<string, unknown>>;
-  ab_experiments: Record<string, unknown>;
-  weekly_params_optimizer: Record<string, unknown>;
+  ab_experiments: {
+    summary: Record<string, unknown>;
+    active: Array<Record<string, unknown>>;
+    completed: Array<Record<string, unknown>>;
+  };
+  weekly_params_optimizer: {
+    cron?: string;
+    is_running?: boolean;
+    target_count?: number;
+    targets?: Array<Record<string, unknown>>;
+    runs: Array<Record<string, unknown>>;
+    state: Record<string, unknown>;
+  };
   last_report_meta: unknown;
   status?: string;
   message?: string;
@@ -152,7 +170,11 @@ export interface DataFusionSnapshot {
   sentiment_health: Record<string, unknown>;
   freshness_summary: Record<string, unknown>;
   stale_fields: string[];
-  latest_prices: Record<string, number>;
+  latest_prices: Record<string, {
+    price: number;
+    updated_at: string;
+    age_sec: number;
+  }>;
   status?: string;
 }
 
@@ -186,8 +208,14 @@ export interface RiskEvent {
 
 export interface EvolutionReport {
   report_id?: string;
-  created_at?: string;
-  candidate_id?: string;
-  result?: string;
-  summary?: Record<string, unknown>;
+  period_start?: string;
+  period_end?: string;
+  total_candidates?: number;
+  promoted?: string[];
+  demoted?: string[];
+  retired?: string[];
+  rollbacks?: string[];
+  decisions?: Array<Record<string, unknown>>;
+  active_snapshot?: Array<Record<string, unknown>>;
+  metadata?: Record<string, unknown>;
 }

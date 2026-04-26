@@ -1,0 +1,10 @@
+{
+  "source": "optuna",
+  "best_value": 0.6212167886203203,
+  "params": {
+    "model_type": "rf",
+    "n_estimators": 54,
+    "max_depth": 4,
+    "min_samples_leaf": 40
+  }
+}

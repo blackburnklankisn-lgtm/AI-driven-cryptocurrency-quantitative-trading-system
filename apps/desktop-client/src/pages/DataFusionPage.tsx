@@ -79,15 +79,40 @@ export function DataFusionPage({ snapshot }: DataFusionPageProps) {
         {Object.keys(data.latest_prices ?? {}).length > 0 ? (
           <table className="dcc-table">
             <thead>
-              <tr><th>标的</th><th>最新价</th></tr>
+              <tr>
+                <th>标的</th>
+                <th>最新价</th>
+                <th>最近更新</th>
+                <th>延迟(秒)</th>
+              </tr>
             </thead>
             <tbody>
-              {Object.entries(data.latest_prices).map(([symbol, price]) => (
-                <tr key={symbol}>
-                  <td>{symbol}</td>
-                  <td>{price.toFixed(4)}</td>
-                </tr>
-              ))}
+              {Object.entries(data.latest_prices).map(([symbol, priceData]) => {
+                const price = typeof priceData === 'object' && priceData !== null && 'price' in priceData 
+                  ? priceData.price 
+                  : parseFloat(String(priceData));
+                const updated_at = typeof priceData === 'object' && priceData !== null && 'updated_at' in priceData
+                  ? priceData.updated_at
+                  : '未知';
+                const age_sec = typeof priceData === 'object' && priceData !== null && 'age_sec' in priceData
+                  ? priceData.age_sec
+                  : 0;
+                
+                const updatedDate = updated_at && updated_at !== '未知' 
+                  ? new Date(updated_at).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                  : '未知';
+                  
+                const ageColor = age_sec < 10 ? '#4CAF50' : age_sec < 30 ? '#FF9800' : '#f44336';
+                
+                return (
+                  <tr key={symbol}>
+                    <td>{symbol}</td>
+                    <td>{price.toFixed(4)}</td>
+                    <td style={{ fontSize: '0.9em' }}>{updatedDate}</td>
+                    <td style={{ color: ageColor, fontWeight: 'bold' }}>{age_sec.toFixed(1)}s</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         ) : <p className="dcc-paragraph">暂无实时价格数据。</p>}

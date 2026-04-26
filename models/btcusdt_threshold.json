@@ -1,0 +1,49 @@
+{
+  "version": "cal_20260426T030156",
+  "buy_threshold_mean": 0.5212065797539849,
+  "buy_threshold_median": 0.4424131595079699,
+  "buy_threshold_conservative": 0.6021753106058269,
+  "sell_threshold_mean": 0.4787934202460151,
+  "sell_threshold_median": 0.5575868404920301,
+  "sell_threshold_conservative": 0.39782468939417315,
+  "avg_auc": 0.5292516252574458,
+  "avg_j_statistic": 0.229001603559104,
+  "recommended_buy_threshold": 0.4424131595079699,
+  "recommended_sell_threshold": 0.5575868404920301,
+  "aggregation_strategy": "median",
+  "created_at": "2026-04-26T03:01:56.514468+00:00",
+  "fold_thresholds": [
+    {
+      "fold_id": 0,
+      "optimal_buy_threshold": 0.44795182883678597,
+      "j_statistic": 0.398746923249049,
+      "auc": 0.6929961960170061,
+      "n_positives": 41,
+      "n_negatives": 109
+    },
+    {
+      "fold_id": 1,
+      "optimal_buy_threshold": 0.43687449017915386,
+      "j_statistic": 0.28693181818181823,
+      "auc": 0.5493607954545455,
+      "n_positives": 22,
+      "n_negatives": 128
+    },
+    {
+      "fold_id": 2,
+      "optimal_buy_threshold": 0.4,
+      "j_statistic": 0.2303276728055489,
+      "auc": 0.554891174360201,
+      "n_positives": 37,
+      "n_negatives": 113
+    },
+    {
+      "fold_id": 3,
+      "optimal_buy_threshold": 0.8,
+      "j_statistic": 0.0,
+      "auc": 0.3197583351980309,
+      "n_positives": 41,
+      "n_negatives": 109
+    }
+  ]
+}

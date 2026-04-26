@@ -283,6 +283,7 @@ class RiskManager:
         )
         self._state.circuit_broken = False
         self._state.circuit_reason = ""
+        self._state.circuit_broken_at = None
         self._state.consecutive_losses = 0
         log.warning("熔断已手动解除，授权人: {}", authorized_by)
 

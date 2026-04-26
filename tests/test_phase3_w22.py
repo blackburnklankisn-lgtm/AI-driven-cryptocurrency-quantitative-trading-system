@@ -43,7 +43,11 @@ from modules.evolution.promotion_gate import (
 from modules.evolution.report_builder import ReportBuilder
 from modules.evolution.retirement_policy import RetirementConfig, RetirementPolicy
 from modules.evolution.scheduler import EvolutionScheduler, SchedulerConfig
-from modules.evolution.self_evolution_engine import SelfEvolutionConfig, SelfEvolutionEngine
+from modules.evolution.self_evolution_engine import (
+    ManualRollbackError,
+    SelfEvolutionConfig,
+    SelfEvolutionEngine,
+)
 from modules.evolution.state_store import EvolutionStateStore
 
 
@@ -758,6 +762,161 @@ class TestSelfEvolutionEngine:
         assert updated_new.status == CandidateStatus.PAUSED.value
         assert updated_base.status == CandidateStatus.ACTIVE.value
         assert active_ids == {"cand_base"}
+
+    def test_manual_rollback_latest_reactivates_previous_paused_candidate(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base",
+            candidate_id="cand_base_manual",
+            metadata={"family_key": "rl/ppo/manual"},
+        )
+        challenger = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_new",
+            candidate_id="cand_new_manual",
+            metadata={"family_key": "rl/ppo/manual"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(challenger.candidate_id, CandidateStatus.PAPER)
+        engine.update_metrics(
+            challenger.candidate_id,
+            sharpe_30d=1.2,
+            max_drawdown_30d=0.03,
+            ab_lift=0.2,
+        )
+        engine.run_cycle(force=True)
+
+        report = engine.manual_rollback_latest()
+
+        assert report is not None
+        updated_base = engine.get_candidate(base.candidate_id)
+        updated_new = engine.get_candidate(challenger.candidate_id)
+        assert updated_base.status == CandidateStatus.ACTIVE.value
+        assert updated_new.status == CandidateStatus.PAUSED.value
+        assert challenger.candidate_id in report.rollbacks
+
+    def test_manual_rollback_with_explicit_family_and_target(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base_explicit",
+            candidate_id="cand_base_explicit",
+            metadata={"family_key": "rl/ppo/explicit"},
+        )
+        challenger = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_new_explicit",
+            candidate_id="cand_new_explicit",
+            metadata={"family_key": "rl/ppo/explicit"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(challenger.candidate_id, CandidateStatus.PAPER)
+        engine.update_metrics(
+            challenger.candidate_id,
+            sharpe_30d=1.2,
+            max_drawdown_30d=0.03,
+            ab_lift=0.2,
+        )
+        engine.run_cycle(force=True)
+
+        report = engine.manual_rollback(
+            family_key="rl/ppo/explicit",
+            current_candidate_id=challenger.candidate_id,
+            rollback_to_candidate_id=base.candidate_id,
+        )
+
+        assert report is not None
+        updated_base = engine.get_candidate(base.candidate_id)
+        updated_new = engine.get_candidate(challenger.candidate_id)
+        assert updated_base.status == CandidateStatus.ACTIVE.value
+        assert updated_new.status == CandidateStatus.PAUSED.value
+        assert challenger.candidate_id in report.rollbacks
+
+    def test_manual_rollback_target_active_returns_error_code(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base_active_target",
+            candidate_id="cand_base_active_target",
+            metadata={"family_key": "rl/ppo/strict"},
+        )
+        target = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_target_active_target",
+            candidate_id="cand_target_active_target",
+            metadata={"family_key": "rl/ppo/strict"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(target.candidate_id, CandidateStatus.ACTIVE)
+
+        with pytest.raises(ManualRollbackError) as exc_info:
+            engine.manual_rollback(
+                current_candidate_id=base.candidate_id,
+                rollback_to_candidate_id=target.candidate_id,
+            )
+
+        assert exc_info.value.code == "ROLLBACK_TARGET_ACTIVE"
+
+    def test_manual_rollback_family_mismatch_returns_error_code(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base_family",
+            candidate_id="cand_base_family",
+            metadata={"family_key": "rl/ppo/strict_a"},
+        )
+        challenger = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_new_family",
+            candidate_id="cand_new_family",
+            metadata={"family_key": "rl/ppo/strict_a"},
+        )
+
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+        engine.force_promote(challenger.candidate_id, CandidateStatus.PAPER)
+        engine.update_metrics(
+            challenger.candidate_id,
+            sharpe_30d=1.1,
+            max_drawdown_30d=0.03,
+            ab_lift=0.2,
+        )
+        engine.run_cycle(force=True)
+
+        with pytest.raises(ManualRollbackError) as exc_info:
+            engine.manual_rollback(
+                family_key="rl/ppo/strict_b",
+                current_candidate_id=challenger.candidate_id,
+            )
+
+        assert exc_info.value.code == "FAMILY_MISMATCH"
+
+    def test_manual_rollback_missing_candidate_returns_error_code(self):
+        engine = self.make_engine()
+        base = engine.register_candidate(
+            CandidateType.POLICY,
+            "rl/ppo",
+            "v_base_missing",
+            candidate_id="cand_base_missing",
+            metadata={"family_key": "rl/ppo/missing"},
+        )
+        engine.force_promote(base.candidate_id, CandidateStatus.ACTIVE)
+
+        with pytest.raises(ManualRollbackError) as exc_info:
+            engine.manual_rollback(current_candidate_id="cand_not_exists")
+
+        assert exc_info.value.code == "CANDIDATE_NOT_FOUND"
 
     def test_diagnostics_keys(self):
         engine = self.make_engine()
