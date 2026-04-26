@@ -242,12 +242,12 @@ class StrategyOrchestrator:
             if perf is not None and perf.avg_confidence < self.config.perf_discount_threshold:
                 w *= self.config.perf_discount_factor
                 block_reasons.append(
-                    f"{r.strategy_id} 表现折扣(avg_conf={perf.avg_confidence:.3f})"
+                    f"{r.strategy_id} 权重折扣[信号置信度偏低](avg_signal_conf={perf.avg_confidence:.3f})"
                 )
-                log.debug(
-                    "[Orchestrator] 表现折扣: strategy={} avg_conf={:.3f} discount={}",
-                    r.strategy_id, perf.avg_confidence, self.config.perf_discount_factor,
-                )
+                    log.debug(
+                        "[Orchestrator] 权重折扣(信号置信度偏低): strategy={} avg_signal_conf={:.3f} discount={}",
+                        r.strategy_id, perf.avg_confidence, self.config.perf_discount_factor,
+                    )
 
             # 4d: 高回撤缩减
             if inp.current_drawdown > self.config.max_drawdown_for_full_weight:

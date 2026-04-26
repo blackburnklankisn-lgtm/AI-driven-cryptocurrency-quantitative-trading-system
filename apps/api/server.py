@@ -546,6 +546,7 @@ def _build_alpha_brain_snapshot() -> Dict[str, Any]:
             "decision_chain": latest_decision_chain,
             "gating_action": _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None).value if _safe_getattr(_safe_getattr(orchestrator_decision, "gating", None), "action", None) else "unknown",
             "weights": _safe_getattr(orchestrator_decision, "weights", {}) or {},
+                "weight_basis": "regime_affinity",
             "block_reasons": _safe_getattr(orchestrator_decision, "block_reasons", []) or [],
             "selected_results": [
                 {

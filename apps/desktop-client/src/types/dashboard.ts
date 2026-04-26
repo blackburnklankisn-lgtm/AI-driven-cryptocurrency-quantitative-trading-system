@@ -100,6 +100,7 @@ export interface AlphaBrainSnapshot {
     decision_chain: string;
     gating_action: string;
     weights: Record<string, number>;
+      weight_basis?: string;
     block_reasons: string[];
     selected_results: AlphaBrainSelectedResult[];
   };

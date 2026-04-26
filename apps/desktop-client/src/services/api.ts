@@ -145,6 +145,7 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
         decision_chain: asString(orchestrator.decision_chain, 'unknown'),
         gating_action: asString(orchestrator.gating_action, 'unknown'),
         weights: asRecord(orchestrator.weights) as Record<string, number>,
+          weight_basis: asString(orchestrator.weight_basis, 'regime_affinity'),
         block_reasons: asArray<string>(orchestrator.block_reasons),
         selected_results: asArray(orchestrator.selected_results),
       },
