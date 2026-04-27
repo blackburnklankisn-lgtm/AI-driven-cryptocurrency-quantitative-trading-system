@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 a = Analysis(
     ['apps\\trader\\bundle_entry.py'],
     pathex=['.'],
     binaries=[],
     datas=[],
-    hiddenimports=['dotenv'],
+    hiddenimports=['dotenv', *collect_submodules('modules.alpha.orchestration')],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
