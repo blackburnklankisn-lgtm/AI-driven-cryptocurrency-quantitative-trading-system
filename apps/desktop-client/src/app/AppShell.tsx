@@ -11,6 +11,7 @@ import { EvolutionPage } from '../pages/EvolutionPage';
 import { RiskMatrixPage } from '../pages/RiskMatrixPage';
 import { DataFusionPage } from '../pages/DataFusionPage';
 import { ExecutionAuditPage } from '../pages/ExecutionAuditPage';
+import { formatBeijingTime } from '../utils/i18n';
 
 const navigation: Array<{ key: WorkspaceKey; label: string; icon: typeof Activity }> = [
   { key: 'overview', label: '总览', icon: Activity },
@@ -159,7 +160,7 @@ export function AppShell() {
             <section className="dcc-context-card">
               <div className="dcc-context-card__kicker">最新快照</div>
               <dl className="dcc-definition-list">
-                <div><dt>生成时间</dt><dd>{snapshot?.generated_at ?? '暂无'}</dd></div>
+                <div><dt>生成时间</dt><dd title={snapshot?.generated_at ?? ''}>{formatBeijingTime(snapshot?.generated_at)}</dd></div>
                 <div><dt>状态</dt><dd>{zh(overview?.status, '未知')}</dd></div>
                 <div><dt>权益</dt><dd>{overview?.equity?.toFixed(2) ?? '0.00'}</dd></div>
                 <div><dt>重连次数</dt><dd>{overview?.feed_health?.reconnect_count ?? 0}</dd></div>

@@ -2,20 +2,25 @@ import { useEffect, useState } from 'react';
 import { dashboardApi } from '../services/api';
 import type { DashboardSnapshot } from '../types/dashboard';
 
-export function useDashboardSnapshot() {
+const DEFAULT_REFRESH_INTERVAL_MS = 3000;
+
+export function useDashboardSnapshot(refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS) {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    async function load() {
-      setLoading(true);
-      setError(null);
+
+    async function load(showLoading = false) {
+      if (showLoading) {
+        setLoading(true);
+      }
       try {
         const data = await dashboardApi.getSnapshot();
         if (!cancelled) {
           setSnapshot(data);
+          setError(null);
         }
       } catch (err) {
         if (!cancelled) {
@@ -24,16 +29,22 @@ export function useDashboardSnapshot() {
           setError(message);
         }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && showLoading) {
           setLoading(false);
         }
       }
     }
-    load();
+
+    void load(true);
+    const intervalId = window.setInterval(() => {
+      void load(false);
+    }, refreshIntervalMs);
+
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
-  }, []);
+  }, [refreshIntervalMs]);
 
   return { snapshot, setSnapshot, loading, error };
 }
