@@ -27,6 +27,8 @@ dependencies = [
     "pydantic-settings>=2.2",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    # 外部 LLM / Gemini
+    "google-generativeai>=0.8",
     # 异步支持
     "aiohttp>=3.9",
     "uvloop>=0.19; sys_platform != 'win32'",

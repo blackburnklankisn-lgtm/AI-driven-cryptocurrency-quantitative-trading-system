@@ -8,7 +8,12 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[],
-    hiddenimports=['dotenv', *collect_submodules('modules.alpha.orchestration')],
+    hiddenimports=[
+        'dotenv',
+        *collect_submodules('modules.alpha.orchestration'),
+        *collect_submodules('google.generativeai'),
+        *collect_submodules('google.ai.generativelanguage'),
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

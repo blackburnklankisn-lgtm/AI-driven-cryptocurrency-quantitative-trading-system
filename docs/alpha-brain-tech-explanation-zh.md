@@ -239,7 +239,7 @@ rolling 窗口约 14~20 小时，若前几天 SOL 有过较大波动，即使今
 
 ### 7.3 AI 分析（Gemini 集成）
 
-仅在环境变量设置了 `GOOGLE_API_KEY` 时激活。  
+优先读取环境变量 `GEMINI_API_KEY`，并兼容旧的 `GOOGLE_API_KEY`。  
 每隔 N 个主循环周期，取最近 10 根 K 线的收盘价发送给 Gemini API，  
 返回市场情绪分析文字。未配置时固定显示 `Waiting for AI analysis...`。
 

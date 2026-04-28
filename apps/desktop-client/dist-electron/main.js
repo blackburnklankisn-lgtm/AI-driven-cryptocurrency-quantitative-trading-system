@@ -39,7 +39,9 @@ const child_process_1 = require("child_process");
 const http = __importStar(require("http"));
 let mainWindow = null;
 let pythonProcess = null;
+let backendLifecyclePromise = Promise.resolve();
 const isDev = process.env.NODE_ENV === 'development';
+const gotSingleInstanceLock = electron_1.app.requestSingleInstanceLock();
 // ── Python 后端进程管理 ──────────────────────────────────────
 function findPythonExecutable() {
     // 生产模式：使用打包好的 backend_trader.exe
@@ -104,12 +106,85 @@ function startPythonBackend() {
         pythonProcess = null;
     });
 }
-function stopPythonBackend() {
-    if (pythonProcess) {
-        console.log('[Electron] Stopping Python backend...');
-        pythonProcess.kill('SIGTERM');
-        pythonProcess = null;
+function stopPythonBackend(reason = 'shutdown') {
+    if (!pythonProcess) {
+        return Promise.resolve();
     }
+    const processToStop = pythonProcess;
+    pythonProcess = null;
+    console.log(`[Electron] Stopping Python backend (${reason}), PID: ${processToStop.pid ?? 'unknown'}...`);
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (!settled) {
+                settled = true;
+                resolve();
+            }
+        };
+        processToStop.once('exit', () => finish());
+        try {
+            processToStop.kill('SIGTERM');
+        }
+        catch (error) {
+            console.warn('[Electron] Failed to signal Python backend for shutdown:', error);
+            finish();
+            return;
+        }
+        setTimeout(() => {
+            if (processToStop.exitCode === null) {
+                try {
+                    processToStop.kill('SIGKILL');
+                }
+                catch (error) {
+                    console.warn('[Electron] Failed to force kill Python backend:', error);
+                }
+            }
+            finish();
+        }, 5000);
+    });
+}
+function stopStalePythonBackends(reason) {
+    if (isDev || process.platform !== 'win32') {
+        return Promise.resolve();
+    }
+    console.log(`[Electron] Terminating stale backend_trader.exe processes before ${reason}...`);
+    return new Promise((resolve) => {
+        const killer = (0, child_process_1.spawn)('taskkill', ['/IM', 'backend_trader.exe', '/F', '/T'], {
+            stdio: 'ignore',
+            windowsHide: true,
+        });
+        killer.on('error', (error) => {
+            console.warn('[Electron] Failed to run taskkill for backend cleanup:', error.message);
+            resolve();
+        });
+        killer.on('exit', (code) => {
+            if (code === 0) {
+                console.log('[Electron] Cleared stale backend_trader.exe processes.');
+            }
+            else {
+                console.log(`[Electron] No stale backend_trader.exe processes needed cleanup (exit=${code ?? 'unknown'}).`);
+            }
+            resolve();
+        });
+    });
+}
+async function refreshPythonBackend(reason) {
+    if (isDev) {
+        startPythonBackend();
+        return;
+    }
+    await stopPythonBackend(reason);
+    await stopStalePythonBackends(reason);
+    startPythonBackend();
+    await waitForBackend(30, 1000);
+}
+function queueBackendRefresh(reason) {
+    backendLifecyclePromise = backendLifecyclePromise
+        .catch((error) => {
+        console.error('[Electron] Previous backend lifecycle operation failed:', error);
+    })
+        .then(() => refreshPythonBackend(reason));
+    return backendLifecyclePromise;
 }
 // ── 等待后端就绪（健康检查轮询） ─────────────────────────────
 function waitForBackend(maxRetries = 30, intervalMs = 1000) {
@@ -172,40 +247,54 @@ const createWindow = () => {
         mainWindow = null;
     });
 };
-// ── 应用生命周期 ─────────────────────────────────────────────
-electron_1.app.whenReady().then(async () => {
-    // 1. 启动 Python 后端（生产模式）
-    startPythonBackend();
-    // 2. 等待后端就绪后再创建窗口（生产模式等待，开发模式直接创建）
+async function createWindowWithFreshBackend(reason) {
     if (!isDev) {
         try {
-            await waitForBackend(30, 1000);
+            await queueBackendRefresh(reason);
         }
-        catch (err) {
-            console.error('[Electron] Backend startup timeout:', err);
-            // 即使后端未就绪也打开窗口，前端会显示 Connecting... 状态
+        catch (error) {
+            console.error(`[Electron] Backend refresh failed during ${reason}:`, error);
         }
     }
     createWindow();
-    electron_1.app.on('activate', () => {
-        if (electron_1.BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
+}
+// ── 应用生命周期 ─────────────────────────────────────────────
+if (!gotSingleInstanceLock) {
+    electron_1.app.quit();
+}
+else {
+    electron_1.app.on('second-instance', () => {
+        const primaryWindow = electron_1.BrowserWindow.getAllWindows()[0] ?? null;
+        if (primaryWindow) {
+            if (primaryWindow.isMinimized()) {
+                primaryWindow.restore();
+            }
+            primaryWindow.focus();
+        }
+        void createWindowWithFreshBackend('second-instance launch');
+    });
+    electron_1.app.whenReady().then(async () => {
+        await createWindowWithFreshBackend('initial launch');
+        electron_1.app.on('activate', () => {
+            if (electron_1.BrowserWindow.getAllWindows().length === 0) {
+                void createWindowWithFreshBackend('app activate');
+            }
+        });
+    });
+    electron_1.app.on('window-all-closed', () => {
+        void stopPythonBackend('window-all-closed');
+        if (process.platform !== 'darwin') {
+            electron_1.app.quit();
         }
     });
-});
-electron_1.app.on('window-all-closed', () => {
-    stopPythonBackend();
-    if (process.platform !== 'darwin') {
-        electron_1.app.quit();
-    }
-});
-electron_1.app.on('before-quit', () => {
-    stopPythonBackend();
-});
-// ── IPC: 前端可查询后端进程状态 ──────────────────────────────
-electron_1.ipcMain.handle('get-backend-status', () => {
-    return {
-        running: pythonProcess !== null,
-        pid: pythonProcess?.pid ?? null,
-    };
-});
+    electron_1.app.on('before-quit', () => {
+        void stopPythonBackend('before-quit');
+    });
+    // ── IPC: 前端可查询后端进程状态 ──────────────────────────────
+    electron_1.ipcMain.handle('get-backend-status', () => {
+        return {
+            running: pythonProcess !== null,
+            pid: pythonProcess?.pid ?? null,
+        };
+    });
+}

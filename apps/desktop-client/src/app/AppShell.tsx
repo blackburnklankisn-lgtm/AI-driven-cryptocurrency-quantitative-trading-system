@@ -141,7 +141,7 @@ export function AppShell() {
 
             <section className="dcc-context-card">
               <div className="dcc-context-card__kicker">AI 洞察面板</div>
-              <p className="dcc-paragraph">{snapshot?.alpha_brain.ai_analysis ?? '正在等待 AI 分析...'}</p>
+              <p className="dcc-paragraph">{snapshot?.alpha_brain.ai_analysis ?? 'AI 解读状态同步中...'}</p>
             </section>
 
             {(snapshot?.overview.alerts?.length ?? 0) > 0 && (

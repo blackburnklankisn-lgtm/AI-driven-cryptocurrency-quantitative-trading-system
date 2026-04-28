@@ -161,7 +161,7 @@ export function AlphaBrainPage({ snapshot }: AlphaBrainPageProps) {
             <h3 className="dcc-subtitle">AI 盘面解读</h3>
             <p className="dcc-paragraph">{snapshot.ai_analysis}</p>
             <Footnote>
-              AI 解读需配置 GOOGLE_API_KEY 环境变量后才激活。未配置时显示 "Waiting for AI analysis..." 属正常状态。
+              AI 解读优先使用 GEMINI_API_KEY，兼容旧的 GOOGLE_API_KEY。未配置时会明确提示缺少 key；已配置但程序刚重启时，会先显示“等待行情数据稳定后自动生成本次启动后的 AI 解读”。
             </Footnote>
 
             <h3 className="dcc-subtitle" style={{ marginTop: '18px' }}>版本历史</h3>

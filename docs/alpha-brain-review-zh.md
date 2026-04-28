@@ -17,7 +17,7 @@
 2. `门控动作 = 未知` 并不是 GatingEngine 的合法动作之一，而是 `Alpha Brain` 快照在拿不到最新编排决策时使用的前端/接口回退值。
 3. `状态稳定 = 否` 的合法来源有两种：要么最近 5 次 regime 不一致，要么缓存记录还不足 5 条。少于 5 条时，系统也会直接返回 `False`。
 4. 页面上“决策链：编排器”并不是后端真实返回的动态字段，而是当前页面写死的表现方式。当前版本并没有把“当前究竟是哪条决策链”做成后端枚举暴露出来。
-5. `AI 分析` 目前确实可以接外部 LLM，但只有在环境变量配置了 `GOOGLE_API_KEY` 时才会触发；未配置时会一直停留在 `Waiting for AI analysis...`。
+5. `AI 分析` 目前确实可以接外部 LLM，优先读取环境变量 `GEMINI_API_KEY`，并兼容旧的 `GOOGLE_API_KEY`；未配置时会一直停留在 `Waiting for AI analysis...`。
 6. `持续学习器` 当前是已实现且已接入的。它会先加载本地已有模型作为 `init_loaded`，然后在满足定时、性能退化、概念漂移三类触发条件时重训，并在条件满足时热替换线上模型和阈值。
 
 ## 2. `Alpha Brain` 页面各区域的数据从哪里来
@@ -481,9 +481,9 @@ Regime 计算主要使用下面这类特征：
 
 接入方式：
 
-1. 读取环境变量 `GOOGLE_API_KEY`
-2. 如果存在，则导入 `google.generativeai`
-3. 使用模型：`gemini-1.5-flash`
+1. 优先读取环境变量 `GEMINI_API_KEY`，并兼容旧的 `GOOGLE_API_KEY`
+2. 如果存在，则优先尝试 `google.genai`，并回退到 `google.generativeai`
+3. 默认使用模型：`gemini-3-flash-preview`（也可通过 `GEMINI_MODEL` 覆盖）
 4. 每小时整点附近触发一次 `_run_ai_analysis()`
 
 Prompt 的内容也比较简单：
@@ -494,7 +494,7 @@ Prompt 的内容也比较简单：
 
 ### 7.3 如果没有配置 API Key，会发生什么
 
-如果没有配置 `GOOGLE_API_KEY`：
+如果没有配置 `GEMINI_API_KEY`（且也没有旧的 `GOOGLE_API_KEY`）：
 
 1. `_run_ai_analysis()` 直接 return
 2. 不会调用任何外部 LLM
@@ -508,16 +508,17 @@ Prompt 的内容也比较简单：
 
 ### 7.4 API Key 是什么
 
-代码里只明确了：
+代码里当前明确了：
 
-- 使用的环境变量名称是 `GOOGLE_API_KEY`
+- 优先使用 `GEMINI_API_KEY`
+- 兼容旧的 `GOOGLE_API_KEY`
 
 但实际 secret 值不在仓库代码中，也不应该在核查文档里展开。
 
 结论应理解为：
 
 1. 当前支持接 Gemini
-2. 需要用户在环境中配置 `GOOGLE_API_KEY`
+2. 需要用户在环境中配置 `GEMINI_API_KEY`（旧环境仍可继续使用 `GOOGLE_API_KEY`）
 3. 代码审查无法也不应该给出真实密钥值
 
 ## 8. 最近重训、版本历史、训练原理应该如何理解
@@ -753,7 +754,7 @@ Prompt 的内容也比较简单：
 2. `门控动作 = 未知` 不是合法 gating 分类，而是“当前拿不到最新编排决策”的回退值。
 3. `状态稳定 = 否` 不只表示状态切换频繁，也可能只是最近不足 5 次 regime 记录。
 4. 页面上的“决策链：编排器”目前是静态展示，不是后端真实动态字段。
-5. `AI analysis` 目前确实接了 Gemini，但前提是配置了 `GOOGLE_API_KEY`；否则只会显示 `Waiting for AI analysis...`。
+5. `AI analysis` 目前确实接了 Gemini，但前提是配置了 `GEMINI_API_KEY`（或兼容旧的 `GOOGLE_API_KEY`）；否则只会显示 `Waiting for AI analysis...`。
 6. `持续学习器` 当前已经实现并接入，`init_loaded -> 新版本` 的版本历史，说明系统确实已经完成过至少一次新的 learner 训练/版本产出。
 7. `buy=0.6000 / sell=0.4000` 不是随便写死给页面看的数字，而是 ML 信号离散化的核心阈值；它既可能来自默认值，也可能来自阈值工件或重训后的自适应校准结果。
 

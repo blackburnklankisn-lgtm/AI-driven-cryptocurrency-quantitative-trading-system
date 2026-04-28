@@ -119,6 +119,11 @@ from loguru import logger
 _ws_sink = WebsocketLogSink()
 logger.add(_ws_sink, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
 
+_GEMINI_API_KEY_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+_GEMINI_MISSING_KEY_PLACEHOLDER = "未配置 GEMINI_API_KEY 或 GOOGLE_API_KEY，AI 盘面解读不可用。"
+_GEMINI_PENDING_ANALYSIS_PLACEHOLDER = "已配置 Gemini，正在等待行情数据稳定后自动生成本次启动后的 AI 解读。"
+_DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
 class LiveTrader:
     """
     实盘/模拟盘主控类。
@@ -260,8 +265,11 @@ class LiveTrader:
         self._preload_done: bool = False
 
         # Gemini 配置
-        self._gemini_api_key = os.getenv("GOOGLE_API_KEY")
-        self._last_ai_analysis = "Waiting for AI analysis..."
+        self._gemini_api_key = self._resolve_gemini_api_key()
+        self._gemini_model_name = os.getenv("GEMINI_MODEL", _DEFAULT_GEMINI_MODEL)
+        self._pending_ai_analysis_refresh = bool(self._gemini_api_key)
+        self._next_ai_analysis_at = self._compute_next_ai_analysis_at(datetime.now(tz=timezone.utc))
+        self._last_ai_analysis = self._build_ai_analysis_placeholder()
 
         # 轮询间隔（根据 timeframe 动态调整，1h K 线每 60s 轮询一次）
         self._poll_interval_s: float = 60.0
@@ -1646,9 +1654,8 @@ class LiveTrader:
                 _price = float(_ev.close)
                 self._step_phase3_shadow(_ev.symbol, _price, seq)
 
-        # Step 5: 周期性 AI 深度分析 (如每小时一次)
-        if now.minute == 0 and now.second < 10:
-             self._run_ai_analysis()
+        # Step 5: 周期性 AI 深度分析（稳定每小时一次，不依赖命中整点秒窗口）
+        self._maybe_run_ai_analysis(now)
 
         # Step 6: 轮询成交回报
         fills = self.order_manager.poll_fills()
@@ -4783,24 +4790,147 @@ class LiveTrader:
             if len(store) > 600:
                 self._kline_store[event.symbol] = store[-600:]
 
+    @staticmethod
+    def _load_google_genai_module() -> Optional[Any]:
+        try:
+            from google import genai
+        except ImportError:
+            return None
+        return genai
+
+    @staticmethod
+    def _load_google_generativeai_module() -> Optional[Any]:
+        try:
+            import google.generativeai as legacy_genai
+        except ImportError:
+            return None
+        return legacy_genai
+
+    def _resolve_gemini_api_key(self) -> Optional[str]:
+        for env_name in _GEMINI_API_KEY_ENV_VARS:
+            api_key = os.getenv(env_name)
+            if api_key:
+                return api_key
+        return getattr(self, "_gemini_api_key", None)
+
+    def _build_ai_analysis_placeholder(self) -> str:
+        if not self._resolve_gemini_api_key():
+            return _GEMINI_MISSING_KEY_PLACEHOLDER
+        return _GEMINI_PENDING_ANALYSIS_PLACEHOLDER
+
+    def _is_ai_analysis_context_ready(self, symbol: str = "BTC/USDT") -> bool:
+        klines = self._kline_store.get(symbol, [])
+        if len(klines) < 3:
+            return False
+
+        if getattr(self, "_preload_done", False):
+            return True
+
+        subscription_manager = getattr(self, "_phase3_subscription_manager", None)
+        diagnostics = getattr(subscription_manager, "diagnostics", None)
+        if callable(diagnostics):
+            try:
+                health_snapshot = diagnostics() or {}
+                return str(health_snapshot.get("health", "unknown")).lower() == "healthy"
+            except Exception as exc:
+                log.debug("读取 Gemini AI 触发前的 feed 健康状态失败: {}", exc)
+
+        return False
+
+    @staticmethod
+    def _compute_next_ai_analysis_at(now: datetime) -> datetime:
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        if now == current_hour:
+            return current_hour
+        return current_hour + timedelta(hours=1)
+
+    def _maybe_run_ai_analysis(self, now: datetime) -> None:
+        next_due = getattr(self, "_next_ai_analysis_at", None)
+        if next_due is None:
+            self._next_ai_analysis_at = self._compute_next_ai_analysis_at(now)
+            next_due = self._next_ai_analysis_at
+
+        if getattr(self, "_pending_ai_analysis_refresh", False):
+            if not self._is_ai_analysis_context_ready():
+                self._last_ai_analysis = self._build_ai_analysis_placeholder()
+                return
+
+            self._run_ai_analysis()
+            self._pending_ai_analysis_refresh = False
+
+            while self._next_ai_analysis_at <= now:
+                self._next_ai_analysis_at += timedelta(hours=1)
+
+            if now < self._next_ai_analysis_at:
+                return
+
+        if now < next_due:
+            return
+
+        if not self._is_ai_analysis_context_ready():
+            self._last_ai_analysis = self._build_ai_analysis_placeholder()
+            return
+
+        self._run_ai_analysis()
+        while self._next_ai_analysis_at <= now:
+            self._next_ai_analysis_at += timedelta(hours=1)
+
+    def _extract_gemini_response_text(self, response: Any) -> str:
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        candidates = getattr(response, "candidates", None) or []
+        parts: List[str] = []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    parts.append(part_text.strip())
+
+        if parts:
+            return "\n".join(parts)
+
+        raise ValueError("Gemini 返回内容为空")
+
+    def _generate_gemini_analysis(self, prompt: str, api_key: str) -> str:
+        modern_genai = self._load_google_genai_module()
+        if modern_genai is not None:
+            client = modern_genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=self._gemini_model_name,
+                contents=prompt,
+            )
+            return self._extract_gemini_response_text(response)
+
+        legacy_genai = self._load_google_generativeai_module()
+        if legacy_genai is None:
+            raise ImportError("Gemini SDK 未安装")
+
+        legacy_genai.configure(api_key=api_key)
+        model = legacy_genai.GenerativeModel(self._gemini_model_name)
+        response = model.generate_content(prompt)
+        return self._extract_gemini_response_text(response)
+
     def _run_ai_analysis(self) -> None:
         """驱动 Gemini AI 对当前盘面进行解读（如果已配置 Key）。"""
-        if not self._gemini_api_key:
+        api_key = self._resolve_gemini_api_key()
+        if not api_key:
+            self._pending_ai_analysis_refresh = False
+            self._last_ai_analysis = self._build_ai_analysis_placeholder()
             return
-            
+
+        self._gemini_api_key = api_key
+
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self._gemini_api_key)
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            
             # 构建 Prompt: 选取最近 10 根价格
             symbol = "BTC/USDT"
             klines = self._kline_store.get(symbol, [])[-10:]
             prices = [k["close"] for k in klines]
-            
+
             prompt = f"你是一个专业的加密货币交易员。当前 {symbol} 最近的价格序列是: {prices}。请用一段简短的话分析当前市场情绪并给出风险提示。"
-            response = model.generate_content(prompt)
-            self._last_ai_analysis = response.text
+            self._last_ai_analysis = self._generate_gemini_analysis(prompt, api_key)
             log.info("Gemini AI 分析完成: {}", self._last_ai_analysis[:50] + "...")
         except Exception as e:
             log.error("Gemini AI 分析失败: {}", e)
