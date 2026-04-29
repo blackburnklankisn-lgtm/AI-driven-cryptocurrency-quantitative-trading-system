@@ -253,6 +253,7 @@ class LiveTrader:
         self._latest_prices_updated_at: Dict[str, float] = {}  # 每个价格的更新时间戳（Unix秒）
         self._current_equity: float = 0.0
         self._running: bool = False
+        self._fills: List[Dict[str, Any]] = []  # 近期成交列表（供 Execution 页展示，最多保留 50 条）
         
         # K 线存储库 (最近 100 根，供前端绘图使用)
         # 格式: { symbol: [ {time, open, high, low, close, volume}, ... ] }
@@ -1554,7 +1555,9 @@ class LiveTrader:
         for event in kline_events:
             close_f = float(event.close)
             prev_price = self._latest_prices.get(event.symbol, 0)
-            self._latest_prices[event.symbol] = close_f
+            # ⚡ Fix: mock 数据不覆盖止损价格缓存，防止虚假价格触发止损
+            if getattr(event, "source", "") != "mock_feed":
+                self._latest_prices[event.symbol] = close_f
             self._cache_kline_event(event)
 
             # ── 收益率计算（Allocator 数据源）────────────────────
@@ -4504,6 +4507,22 @@ class LiveTrader:
             cash=f"{cash_after:.2f}",
         )
 
+        # ⚡ Fix: 同步到内存 _fills 列表，供 Execution 页面实时展示
+        fill_record: Dict[str, Any] = {
+            "symbol": rec.symbol,
+            "side": rec.side,
+            "amount": f"{fill_qty:.6f}",
+            "price": f"{fill_price:.4f}",
+            "notional": f"{notional:.2f}",
+            "fee": f"{fee:.4f}",
+            "pnl": f"{pnl:.4f}" if rec.side == "sell" else None,
+            "strategy": rec.strategy_id,
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        self._fills.append(fill_record)
+        if len(self._fills) > 50:
+            self._fills = self._fills[-50:]
+
         # ── PerformanceAttributor 记录成交 ─────────────────────
         try:
             self.attributor.record_trade(
@@ -5117,6 +5136,16 @@ class LiveTrader:
             current_price = self._latest_prices.get(sym)
             if not current_price or current_price <= 0:
                 log.debug("[StopLoss] {} 无法获取当前价格，跳过", sym)
+                continue
+
+            # ⚡ Fix: 价格新鲜度校验 —— 只允许 5 分钟内来自 live feed 的价格触发止损
+            _PRICE_FRESHNESS_S = 300
+            price_age_s = time.time() - self._latest_prices_updated_at.get(sym, 0)
+            if price_age_s > _PRICE_FRESHNESS_S:
+                log.warning(
+                    "[StopLoss] {} 价格已过期 {:.0f}s > {}s，跳过止损检查（防止使用 mock/过期价格触发）",
+                    sym, price_age_s, _PRICE_FRESHNESS_S,
+                )
                 continue
 
             should_stop = False
