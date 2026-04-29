@@ -594,8 +594,16 @@ class LiveTrader:
         ws_cfg: WsClientConfig,
     ) -> ExchangeWsClient:
         """按配置构建 Phase 3 realtime ws client。"""
+        provider_str = str(getattr(rt_cfg, "provider", "") or "").strip().lower()
+        if not provider_str or provider_str == "mock":
+            log.warning(
+                "[Phase3] realtime ws provider 未配置或设为 'mock'，Phase 3 已禁用。"
+                " 合成订单簿/成交数据不反映真实市场，不允许在交易中使用。"
+                " 如需启用，请在 system.yaml 中配置真实 ws 数据源。"
+            )
+            raise ValueError("Phase3 ws_client: mock/空 provider 已禁用，请配置真实数据源")
         return create_exchange_ws_client(
-            str(getattr(rt_cfg, "provider", "mock") or "mock"),
+            provider_str,
             ws_cfg,
             mock_price_drift=0.0008,
             mock_seed=42,
@@ -761,7 +769,11 @@ class LiveTrader:
         if normalized == "cryptoquant":
             return CryptoQuantProvider(api_key=os.getenv("CRYPTOQUANT_API_KEY", ""))
         if normalized == "mock":
-            return MockOnChainProvider(seed=42)
+            log.critical(
+                "[OnChain] onchain_provider 配置为 'mock'，将产生虚假链上数据，已拒绝初始化。"
+                " 请在 system.yaml 中配置真实数据源: public | glassnode | cryptoquant"
+            )
+            raise ValueError("onchain_provider='mock' 已被禁用，不允许使用虚假链上数据")
         raise ValueError(f"未知 onchain provider: {provider_name}")
 
     def _create_sentiment_provider(self, provider_name: str):
@@ -773,7 +785,11 @@ class LiveTrader:
         if normalized == "cryptocompare":
             return CryptoCompareProvider(api_key=os.getenv("CRYPTOCOMPARE_API_KEY", ""))
         if normalized == "mock":
-            return MockSentimentProvider(seed=42)
+            log.critical(
+                "[Sentiment] sentiment_provider 配置为 'mock'，将产生虚假情绪数据，已拒绝初始化。"
+                " 请在 system.yaml 中配置真实数据源: htx | alternative_me | cryptocompare"
+            )
+            raise ValueError("sentiment_provider='mock' 已被禁用，不允许使用虚假情绪数据")
         raise ValueError(f"未知 sentiment provider: {provider_name}")
 
     def _collect_external_source_frame(
@@ -1691,8 +1707,8 @@ class LiveTrader:
         """
         通过 CCXT fetch_ohlcv 获取最新已收线 K 线。
 
-        Live 模式：API 异常时跳过本次循环（不使用假数据）。
-        Paper 模式：API 异常时使用 Mock 数据保持 UI 可用。
+        Live / Paper 模式：API 异常时均跳过本次循环，保留上一次真实价格缓存。
+        ⛔ 任何模式下均不使用 Mock 数据：假价格会污染策略信号、ML 训练和风控决策。
         """
         events = []
         tf = self.sys_config.data.default_timeframe
@@ -1742,30 +1758,14 @@ class LiveTrader:
                     log.error("获取行情失败(Live模式跳过): symbol={} error={}", symbol, err_str)
                     continue
                 else:
-                    # Paper 模式下使用 Mock 数据保持 UI 可用
-                    log.warning("获取行情(走Mock): symbol={} error={}", symbol, err_str)
-                    import random
-                    mock_prices = {"BTC": 67000, "ETH": 3500, "SOL": 150}
-                    base = next((v for k, v in mock_prices.items() if k in symbol), 1000)
-                    mock_price = base * random.uniform(0.99, 1.01)
-                    # 使用上一小时的整点时间戳（与真实 K 线对齐），
-                    # 避免 datetime.now() 产生的非整点时间戳导致
-                    # developing bar 追加时出现时间倒序。
-                    now_utc = datetime.now(tz=timezone.utc)
-                    mock_ts = now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
-                    events.append(KlineEvent(
-                        event_type=EventType.KLINE_UPDATED,
-                        timestamp=mock_ts,
-                        source="mock_feed",
-                        symbol=symbol,
-                        timeframe=tf,
-                        open=Decimal(str(round(mock_price * 0.999, 2))),
-                        high=Decimal(str(round(mock_price * 1.002, 2))),
-                        low=Decimal(str(round(mock_price * 0.997, 2))),
-                        close=Decimal(str(round(mock_price, 2))),
-                        volume=Decimal("10.5"),
-                        is_closed=True,
-                    ))
+                    # ⛔ Paper 模式同样不使用 Mock 数据
+                    # 假价格会喂入策略/ML/Allocator/风控，造成错误决策
+                    # 跳过本 symbol，保留最后一次真实行情缓存
+                    log.warning(
+                        "[行情] {} 获取失败，本次跳过（不使用 mock 数据）: {}",
+                        symbol, err_str,
+                    )
+                    continue
 
         return events
 
@@ -5293,9 +5293,9 @@ def main() -> None:
     # 下单量配置（基于 $5000 初始资金，单笔控制在 ~$200-300 左右）
     # 注意：买单实际数量由 PositionSizer 波动率目标法动态调整
     order_qty_map = {
-        "BTC/USDT": 0.003,   # ~$200 @ BTC=$67000
-        "ETH/USDT": 0.06,    # ~$210 @ ETH=$3500
-        "SOL/USDT": 1.5,     # ~$225 @ SOL=$150
+        "BTC/USDT": 0.003,   # 基础仓位（实际由 PositionSizer 波动率目标法动态覆盖）
+        "ETH/USDT": 0.06,    # 基础仓位（实际由 PositionSizer 波动率目标法动态覆盖）
+        "SOL/USDT": 1.5,     # 基础仓位（实际由 PositionSizer 波动率目标法动态覆盖）
     }
     # Momentum 策略使用较小基础仓位（动态仓位会覆盖）
     momentum_qty_map = {
