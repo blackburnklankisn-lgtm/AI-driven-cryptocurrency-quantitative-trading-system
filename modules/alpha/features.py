@@ -314,6 +314,9 @@ class FeatureEngine:
         result[f"atr_{atr_window}"] = cls.atr(result, atr_window)
         result[f"atr_pct_{atr_window}"] = cls.atr_pct(result, atr_window)
 
+        # ADX（趋势强度，regime 检测必需）
+        result[f"adx_{atr_window}"] = cls.adx(result, atr_window)
+
         # Bollinger Bands
         bb = cls.bollinger_bands(close, bb_window)
         for col in bb.columns:

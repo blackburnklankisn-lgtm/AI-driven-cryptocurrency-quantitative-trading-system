@@ -83,7 +83,7 @@ class DataKitchenConfig:
     # regime_features: 保留哪些前缀列（未指定时取所有列的子集）
     regime_feature_prefixes: list[str] = field(default_factory=lambda: [
         "close_return", "rsi_", "macd_", "atr_", "adx",
-        "ret_roll_mean", "ret_roll_std", "bb_pctb",
+        "ret_roll_mean", "ret_roll_std", "bb_pctb", "bb_width",
         "price_vs_sma", "volume_ratio", "oc_", "st_",
     ])
 
