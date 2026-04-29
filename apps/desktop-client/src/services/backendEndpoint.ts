@@ -19,7 +19,7 @@ export function wsBaseFromHttp(httpBase: string): string {
   return httpBase.replace(/^http/i, 'ws');
 }
 
-export async function fetchWithFallback(path: string, init?: RequestInit): Promise<Response> {
+export async function fetchWithEndpointRetry(path: string, init?: RequestInit): Promise<Response> {
   let lastNetworkError: unknown = null;
   let lastHttpError: Error | null = null;
 
@@ -45,10 +45,10 @@ export async function fetchWithFallback(path: string, init?: RequestInit): Promi
   throw new Error(`Request failed for ${path}: ${String(lastNetworkError)}`);
 }
 
-export function getPreferredWsBase(): string {
+export function getPreferredWsEndpointBase(): string {
   return wsBaseFromHttp(HTTP_BASE_CANDIDATES[preferredBaseIndex]);
 }
 
-export function rotatePreferredBase(): void {
+export function rotatePreferredEndpointBase(): void {
   preferredBaseIndex = (preferredBaseIndex + 1) % HTTP_BASE_CANDIDATES.length;
 }

@@ -35,10 +35,10 @@ data:
   storage_dir: "./storage"
   # Phase 2 外部源：默认开启真实 public onchain + HTX sentiment
   onchain_enabled: true
-  onchain_provider: public     # public | glassnode | cryptoquant | mock
+  onchain_provider: public     # public | glassnode | cryptoquant
   onchain_ttl_sec: 43200       # public onchain 以日频/低频为主，12h 内复用缓存
   sentiment_enabled: true
-  sentiment_provider: htx      # htx | alternative_me | cryptocompare | mock
+  sentiment_provider: htx      # htx | alternative_me | cryptocompare
   sentiment_ttl_sec: 3600      # HTX public derivatives 情绪数据按小时刷新
   external_feature_max_fill_periods: 72
 
@@ -96,7 +96,6 @@ logging:
 # ---------------------------
 # Phase 3 高级策略 + 自进化配置
 # realtime feed 在 paper 模式下默认开启，且默认走 HTX public market feed。
-# 如需离线/无外网验证，可将 provider 切回 mock。
 # 可用脚本验证: python scripts/verify_phase3_realtime_feed.py --provider htx --exchange htx --symbol BTC/USDT --timeout 20
 # ---------------------------
 phase3:
@@ -107,7 +106,7 @@ phase3:
   self_evolution_enabled: false
 
   realtime_feed:
-    provider: htx    # htx | mock
+    provider: htx    # htx
     ws_url:
     reconnect_backoff_sec: 2
     heartbeat_timeout_sec: 15

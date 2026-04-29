@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { createChart, CandlestickSeries, type IChartApi, type ISeriesApi, type CandlestickData } from 'lightweight-charts';
-import { fetchWithFallback } from '../../services/backendEndpoint';
+import { fetchWithEndpointRetry } from '../../services/backendEndpoint';
 
 interface KlineChartProps {
   symbol?: string;
@@ -45,7 +45,7 @@ export function KlineChart({ symbol = 'BTC/USDT', height = 320 }: KlineChartProp
 
     async function fetchKlines() {
       try {
-        const res = await fetchWithFallback(`/api/v1/klines?symbol=${encodeURIComponent(symbol)}`);
+        const res = await fetchWithEndpointRetry(`/api/v1/klines?symbol=${encodeURIComponent(symbol)}`);
         if (!res.ok) {
           console.warn('[KlineChart] klines response not ok', res.status);
           return;

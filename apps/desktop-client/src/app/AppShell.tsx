@@ -33,6 +33,8 @@ export function AppShell() {
 
   const activeLabel = useMemo(() => navigation.find((item) => item.key === workspace)?.label ?? workspace, [workspace]);
   const overview = snapshot?.overview;
+  const feedHealth = overview?.feed_health?.health;
+  const hasFreshRealData = feedHealth === 'healthy';
 
   const actionLabelMap: Record<string, string> = {
     reset_circuit: '重置熔断',
@@ -125,6 +127,12 @@ export function AppShell() {
           <section className="dcc-content">
             {loading && !snapshot ? <div className="dcc-empty">正在加载仪表盘快照...</div> : null}
             {error ? <div className="dcc-error">快照加载失败：{error}</div> : null}
+            {!error && snapshot && !hasFreshRealData ? (
+              <div className="dcc-error">
+                未获取到新鲜真实数据（当前数据源状态：{zh(feedHealth, '未知')}）。
+                系统不会使用 mock 数据，请检查网络连通性与交易所接口状态。
+              </div>
+            ) : null}
             {renderWorkspace()}
           </section>
 

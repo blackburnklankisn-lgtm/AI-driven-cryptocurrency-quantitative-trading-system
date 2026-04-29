@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getPreferredWsBase, rotatePreferredBase } from '../services/backendEndpoint';
+import { getPreferredWsEndpointBase, rotatePreferredEndpointBase } from '../services/backendEndpoint';
 
 export function useAuditLogStream() {
   const [logs, setLogs] = useState<string[]>([]);
@@ -20,7 +20,7 @@ export function useAuditLogStream() {
 
     const connect = () => {
       console.info('[desktop-client][audit-log-stream] connecting');
-      const url = `${getPreferredWsBase()}/api/v1/ws/logs`;
+      const url = `${getPreferredWsEndpointBase()}/api/v1/ws/logs`;
       socket = new WebSocket(url);
       socket.onopen = () => {
         console.info('[desktop-client][audit-log-stream] connected', url);
@@ -46,7 +46,7 @@ export function useAuditLogStream() {
           pingTimer = null;
         }
         if (!closedByClient) {
-          rotatePreferredBase();
+          rotatePreferredEndpointBase();
           retryTimer = window.setTimeout(connect, 3000);
         }
       };

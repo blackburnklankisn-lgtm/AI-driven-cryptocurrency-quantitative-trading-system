@@ -10,7 +10,7 @@ import type {
   RiskEvent,
   RiskMatrixSnapshot,
 } from '../types/dashboard';
-import { fetchWithFallback } from './backendEndpoint';
+import { fetchWithEndpointRetry } from './backendEndpoint';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -234,7 +234,7 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
 
 async function fetchJson<T>(path: string): Promise<T> {
   console.debug('[desktop-client][api] request', path);
-  const response = await fetchWithFallback(path);
+  const response = await fetchWithEndpointRetry(path);
   if (!response.ok) {
     const text = await response.text();
     console.error('[desktop-client][api] request failed', path, response.status, text);
@@ -261,7 +261,7 @@ export async function postControlAction(
   const payload: ControlActionPayload =
     typeof actionOrPayload === 'string' ? { action: actionOrPayload } : actionOrPayload;
   console.info('[desktop-client][api] control action', payload);
-  const response = await fetchWithFallback('/api/v1/control', {
+  const response = await fetchWithEndpointRetry('/api/v1/control', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
