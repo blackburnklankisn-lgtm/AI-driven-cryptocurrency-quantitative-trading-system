@@ -16,7 +16,7 @@ from dataclasses import asdict, is_dataclass
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -107,6 +107,7 @@ risk_manager_ws = ConnectionManager()
 evolution_manager_ws = ConnectionManager()
 data_health_manager_ws = ConnectionManager()
 execution_manager_ws = ConnectionManager()
+diagnostics_manager_ws = ConnectionManager()
 
 
 # ── WebSocket 日志 Sink（带背压控制） ────────────────────────
@@ -182,8 +183,9 @@ async def _drain_and_broadcast(q):
         combined = "".join(msgs)
         try:
             await log_manager.broadcast(combined)
-        except Exception:
-            pass
+            _record_channel_broadcast("logs")
+        except Exception as exc:
+            _record_channel_broadcast("logs", str(exc))
 
 
 
@@ -197,23 +199,22 @@ async def _status_push_worker():
     """
     while True:
         await asyncio.sleep(3)
-        if status_manager.connection_count() == 0:
+        active_channels = {
+            key: manager.connection_count()
+            for key, manager in _channel_manager_map().items()
+        }
+        if sum(active_channels.values()) == 0:
+            _record_worker_tick("status_push", extra={"active_channels": active_channels})
             continue
-        try:
-            status_data = _build_status_response()
-            await status_manager.broadcast(json.dumps(status_data))
-            if dashboard_manager.connection_count() > 0:
-                await dashboard_manager.broadcast(json.dumps(_build_dashboard_snapshot()))
-            if risk_manager_ws.connection_count() > 0:
-                await risk_manager_ws.broadcast(json.dumps(_build_risk_matrix_snapshot()))
-            if evolution_manager_ws.connection_count() > 0:
-                await evolution_manager_ws.broadcast(json.dumps(_build_evolution_snapshot()))
-            if data_health_manager_ws.connection_count() > 0:
-                await data_health_manager_ws.broadcast(json.dumps(_build_data_fusion_snapshot()))
-            if execution_manager_ws.connection_count() > 0:
-                await execution_manager_ws.broadcast(json.dumps(_build_execution_snapshot()))
-        except Exception:
-            pass
+
+        await _broadcast_snapshot(status_manager, "status", _build_status_response)
+        await _broadcast_snapshot(dashboard_manager, "dashboard", _build_dashboard_snapshot)
+        await _broadcast_snapshot(risk_manager_ws, "risk", _build_risk_matrix_snapshot)
+        await _broadcast_snapshot(evolution_manager_ws, "evolution", _build_evolution_snapshot)
+        await _broadcast_snapshot(data_health_manager_ws, "data-health", _build_data_fusion_snapshot)
+        await _broadcast_snapshot(execution_manager_ws, "execution", _build_execution_snapshot)
+        await _broadcast_snapshot(diagnostics_manager_ws, "diagnostics", _build_diagnostics_snapshot)
+        _record_worker_tick("status_push", extra={"active_channels": active_channels})
 
 
 async def _ticker_refresh_worker():
@@ -230,11 +231,13 @@ async def _ticker_refresh_worker():
         await asyncio.sleep(5)
         trader = _global_trader_instance
         if not trader:
+            _record_worker_tick("ticker_refresh", extra={"cycle": cycle, "updated_symbols": [], "error_count": 0})
             continue
         loop = asyncio.get_running_loop()
         symbols = getattr(trader, '_symbols', None) or _symbols
         cycle += 1
         updated = []
+        error_count = 0
         current_time = time.time()
         for symbol in symbols:
             try:
@@ -249,6 +252,7 @@ async def _ticker_refresh_worker():
                     if old != float(last):
                         updated.append(f"{symbol}: {old:.4f}→{float(last):.4f}")
             except Exception as exc:  # noqa: BLE001
+                error_count += 1
                 log.debug("[Ticker] fetch_ticker 失败: {} {}", symbol, str(exc)[:80])
         if updated:
             log.debug("[Ticker] cycle#{} 价格更新: {}", cycle, " | ".join(updated))
@@ -258,6 +262,15 @@ async def _ticker_refresh_worker():
                 cycle,
                 {s: f"{v:.4f}" for s, v in trader._latest_prices.items()},
             )
+        _record_worker_tick(
+            "ticker_refresh",
+            extra={
+                "cycle": cycle,
+                "tracked_symbols": list(symbols),
+                "updated_symbols": updated,
+                "error_count": error_count,
+            },
+        )
 
 
 # ── 状态构建辅助函数 ─────────────────────────────────────────
@@ -284,6 +297,7 @@ def _build_status_response() -> Dict[str, Any]:
         "risk_state": risk_summary,
         "poll_interval_s": trader._poll_interval_s,
         "ws_log_connections": log_manager.connection_count(),
+        "ws_diagnostics_connections": diagnostics_manager_ws.connection_count(),
         "ai_analysis": getattr(trader, "_last_ai_analysis", "N/A"),
         "latest_prices": latest_prices,
     }
@@ -298,6 +312,387 @@ def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
 
 def _iso_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+_SERVER_STARTED_AT = datetime.now(tz=timezone.utc)
+_CHANNEL_REGISTRY: dict[str, dict[str, Any]] = {
+    "logs": {
+        "label": "audit-logs",
+        "path": "/api/v1/ws/logs",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "status": {
+        "label": "system-status",
+        "path": "/api/v1/ws/status",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "dashboard": {
+        "label": "dashboard",
+        "path": "/api/v2/ws/dashboard",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "risk": {
+        "label": "risk-matrix",
+        "path": "/api/v2/ws/risk",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "evolution": {
+        "label": "evolution",
+        "path": "/api/v2/ws/evolution",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "data-health": {
+        "label": "data-health",
+        "path": "/api/v2/ws/data-health",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "execution": {
+        "label": "execution",
+        "path": "/api/v2/ws/execution",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+    "diagnostics": {
+        "label": "diagnostics",
+        "path": "/api/v2/ws/diagnostics",
+        "last_broadcast_at": None,
+        "broadcast_count": 0,
+        "last_error": None,
+    },
+}
+_WORKER_REGISTRY: dict[str, dict[str, Any]] = {
+    "status_push": {
+        "interval_sec": 3,
+        "last_tick_at": None,
+        "last_error": None,
+        "success_count": 0,
+    },
+    "ticker_refresh": {
+        "interval_sec": 5,
+        "last_tick_at": None,
+        "last_error": None,
+        "success_count": 0,
+        "cycle": 0,
+        "updated_symbols": [],
+        "error_count": 0,
+    },
+}
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return str(value)
+
+
+def _structured_payload(value: Any) -> Any:
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, BaseModel):
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return _json_safe(model_dump())
+        dict_fn = getattr(value, "dict", None)
+        if callable(dict_fn):
+            return _json_safe(dict_fn())
+    if isinstance(value, dict):
+        return _json_safe(value)
+    if isinstance(value, (list, tuple, set)):
+        return _json_safe(list(value))
+    return _json_safe(value)
+
+
+def _config_payload(component: Any) -> Dict[str, Any]:
+    config = _safe_getattr(component, "config", None)
+    if config is None:
+        return {}
+    if is_dataclass(config):
+        return _json_safe(asdict(config))
+    if isinstance(config, BaseModel):
+        model_dump = getattr(config, "model_dump", None)
+        if callable(model_dump):
+            return _json_safe(model_dump())
+        dict_fn = getattr(config, "dict", None)
+        if callable(dict_fn):
+            return _json_safe(dict_fn())
+    raw = getattr(config, "__dict__", None)
+    return _json_safe(raw if isinstance(raw, dict) else str(config))
+
+
+def _component_descriptor(component: Any) -> Dict[str, Any]:
+    return {
+        "available": component is not None,
+        "class_name": component.__class__.__name__ if component is not None else None,
+        "config": _config_payload(component) if component is not None else {},
+    }
+
+
+def _invoke_component_method(component: Any, method_name: str, default: Any) -> Any:
+    if component is None:
+        return default
+    method = _safe_getattr(component, method_name, None)
+    if not callable(method):
+        return default
+    try:
+        return _structured_payload(method())
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "component": component.__class__.__name__,
+            "method": method_name,
+            "last_error": str(exc),
+        }
+
+
+def _summarize_table_like(table: Any) -> Dict[str, Any]:
+    if table is None:
+        return {"rows": 0, "columns": [], "last_index": None}
+
+    try:
+        columns = [str(column) for column in list(_safe_getattr(table, "columns", []))]
+    except Exception:
+        columns = []
+
+    rows = 0
+    last_index = None
+    is_empty = bool(_safe_getattr(table, "empty", True))
+    if not is_empty:
+        try:
+            rows = int(len(table))
+        except Exception:
+            rows = 0
+        index = _safe_getattr(table, "index", None)
+        try:
+            if index is not None and len(index) > 0:
+                last_index = str(index[-1])
+        except Exception:
+            last_index = None
+
+    return {
+        "rows": rows,
+        "columns": columns,
+        "last_index": last_index,
+    }
+
+
+def _table_records(table: Any, limit: int = 5) -> List[Dict[str, Any]]:
+    if table is None or bool(_safe_getattr(table, "empty", True)):
+        return []
+    try:
+        head = _safe_getattr(table, "head", None)
+        limited = head(limit) if callable(head) else table
+        to_dict = _safe_getattr(limited, "to_dict", None)
+        if callable(to_dict):
+            return _structured_payload(to_dict(orient="records"))
+    except Exception:
+        return []
+    return []
+
+
+def _summarize_feature_views(feature_views: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for key, table in (feature_views or {}).items():
+        summary[key] = _summarize_table_like(table)
+    return summary
+
+
+def _summarize_runtime_state_map(runtime_state_map: Dict[str, Any], *, limit: int = 20) -> Dict[str, Any]:
+    items = list((runtime_state_map or {}).items())
+    keys_summary: Dict[str, Any] = {}
+    for candidate_id, state in items[:limit]:
+        if isinstance(state, dict):
+            keys_summary[candidate_id] = {
+                "keys": sorted(str(key) for key in state.keys()),
+            }
+        else:
+            keys_summary[candidate_id] = {
+                "type": type(state).__name__,
+            }
+    return {
+        "count": len(items),
+        "sample": keys_summary,
+    }
+
+
+def _channel_manager_map() -> dict[str, ConnectionManager]:
+    return {
+        "logs": log_manager,
+        "status": status_manager,
+        "dashboard": dashboard_manager,
+        "risk": risk_manager_ws,
+        "evolution": evolution_manager_ws,
+        "data-health": data_health_manager_ws,
+        "execution": execution_manager_ws,
+        "diagnostics": diagnostics_manager_ws,
+    }
+
+
+def _record_channel_broadcast(channel_key: str, error: Optional[str] = None) -> None:
+    state = _CHANNEL_REGISTRY.get(channel_key)
+    if state is None:
+        return
+    state["last_broadcast_at"] = _iso_now()
+    if error is None:
+        state["broadcast_count"] = int(state.get("broadcast_count", 0)) + 1
+        state["last_error"] = None
+    else:
+        state["last_error"] = error[:500]
+
+
+def _record_worker_tick(
+    worker_key: str,
+    *,
+    error: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    state = _WORKER_REGISTRY.get(worker_key)
+    if state is None:
+        return
+    state["last_tick_at"] = _iso_now()
+    if error is None:
+        state["success_count"] = int(state.get("success_count", 0)) + 1
+        state["last_error"] = None
+    else:
+        state["last_error"] = error[:500]
+    if extra:
+        state.update(extra)
+
+
+async def _broadcast_snapshot(
+    manager: ConnectionManager,
+    channel_key: str,
+    payload_builder: Callable[[], Dict[str, Any]],
+) -> None:
+    if manager.connection_count() == 0:
+        return
+    try:
+        await manager.broadcast(json.dumps(payload_builder(), default=str))
+        _record_channel_broadcast(channel_key)
+    except Exception as exc:  # noqa: BLE001
+        _record_channel_broadcast(channel_key, str(exc))
+
+
+def _workspace_health_summary(name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    generated_at = payload.get("generated_at", _iso_now())
+    if name == "overview":
+        feed_health = _safe_getattr(payload.get("feed_health", {}), "get", lambda *_a, **_k: "unknown")("health", "unknown")
+        return {
+            "status": feed_health if payload.get("status") == "running" else payload.get("status", "unknown"),
+            "generated_at": generated_at,
+            "alert_count": len(payload.get("alerts", []) or []),
+            "detail": f"feed={feed_health} alerts={len(payload.get('alerts', []) or [])}",
+        }
+    if name == "alpha_brain":
+        dominant_regime = payload.get("dominant_regime", "unknown")
+        is_stable = bool(payload.get("is_regime_stable", False))
+        return {
+            "status": "healthy" if dominant_regime != "unknown" and is_stable else ("partial" if dominant_regime != "unknown" else "warning"),
+            "generated_at": generated_at,
+            "alert_count": len(payload.get("orchestrator", {}).get("block_reasons", []) or []),
+            "detail": f"regime={dominant_regime} stable={is_stable}",
+        }
+    if name == "evolution":
+        return {
+            "status": payload.get("status", "healthy") or "healthy",
+            "generated_at": generated_at,
+            "alert_count": len(payload.get("latest_rollbacks", []) or []),
+            "detail": f"active={len(payload.get('active_candidates', []) or [])} rollbacks={len(payload.get('latest_rollbacks', []) or [])}",
+        }
+    if name == "risk_matrix":
+        circuit_broken = bool(payload.get("circuit_broken", False))
+        return {
+            "status": "critical" if circuit_broken else "healthy",
+            "generated_at": generated_at,
+            "alert_count": 1 if payload.get("circuit_reason") else 0,
+            "detail": f"circuit={circuit_broken} cooldown={payload.get('circuit_cooldown_remaining_sec', 0)}s",
+        }
+    if name == "data_fusion":
+        freshness_status = payload.get("freshness_summary", {}).get("status", payload.get("status", "unknown"))
+        return {
+            "status": freshness_status,
+            "generated_at": generated_at,
+            "alert_count": len(payload.get("stale_fields", []) or []),
+            "detail": f"stale_fields={len(payload.get('stale_fields', []) or [])}",
+        }
+    if name == "execution":
+        return {
+            "status": payload.get("status", "healthy") or "healthy",
+            "generated_at": generated_at,
+            "alert_count": 0,
+            "detail": f"open_orders={len(payload.get('open_orders', []) or [])} fills={len(payload.get('recent_fills', []) or [])}",
+        }
+    return {
+        "status": payload.get("status", "unknown"),
+        "generated_at": generated_at,
+        "alert_count": 0,
+        "detail": "",
+    }
+
+
+def _collect_recent_errors(
+    overview: Dict[str, Any],
+    data_fusion: Dict[str, Any],
+    latest_order_rejection: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    recent_errors: List[Dict[str, Any]] = []
+    for channel_key, state in _CHANNEL_REGISTRY.items():
+        if state.get("last_error"):
+            recent_errors.append({
+                "source": f"transport:{channel_key}",
+                "severity": "warning",
+                "message": state.get("last_error"),
+                "occurred_at": state.get("last_broadcast_at") or _iso_now(),
+            })
+    for worker_key, state in _WORKER_REGISTRY.items():
+        if state.get("last_error"):
+            recent_errors.append({
+                "source": f"worker:{worker_key}",
+                "severity": "warning",
+                "message": state.get("last_error"),
+                "occurred_at": state.get("last_tick_at") or _iso_now(),
+            })
+    if isinstance(latest_order_rejection, dict) and latest_order_rejection:
+        recent_errors.append({
+            "source": "execution:order_rejection",
+            "severity": "warning",
+            "message": latest_order_rejection.get("reason", "unknown"),
+            "occurred_at": latest_order_rejection.get("timestamp", _iso_now()),
+            "details": latest_order_rejection,
+        })
+    for field_name in ("onchain_health", "sentiment_health"):
+        payload = data_fusion.get(field_name, {}) or {}
+        degrade_reason = payload.get("degrade_reason") or payload.get("reason")
+        if degrade_reason:
+            recent_errors.append({
+                "source": f"data:{field_name}",
+                "severity": "warning",
+                "message": degrade_reason,
+                "occurred_at": data_fusion.get("generated_at", _iso_now()),
+            })
+    for alert in overview.get("alerts", []) or []:
+        if isinstance(alert, dict) and alert.get("severity") in {"warning", "critical"}:
+            recent_errors.append({
+                "source": f"alert:{alert.get('source', 'unknown')}",
+                "severity": alert.get("severity", "warning"),
+                "message": alert.get("message", "unknown"),
+                "occurred_at": alert.get("occurred_at", _iso_now()),
+                "details": alert.get("details", {}),
+            })
+    return recent_errors[-20:]
 
 
 def _summarize_positions(trader: Any) -> Dict[str, Any]:
@@ -1014,6 +1409,307 @@ def _build_execution_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
+def _build_diagnostics_snapshot() -> Dict[str, Any]:
+    generated_at = _iso_now()
+    trader = _global_trader_instance
+
+    status_response = _build_status_response()
+    overview = _build_overview_snapshot()
+    alpha_brain = _build_alpha_brain_snapshot()
+    evolution = _build_evolution_snapshot()
+    risk_matrix = _build_risk_matrix_snapshot()
+    data_fusion = _build_data_fusion_snapshot()
+    execution = _build_execution_snapshot()
+
+    alpha_runtime = _safe_getattr(trader, "_alpha_runtime", None)
+    strategy_registry = _safe_getattr(trader, "_strategy_registry", None)
+    orchestrator = _safe_getattr(trader, "_phase1_orchestrator", None)
+    budget_checker = _safe_getattr(trader, "_budget_checker", None)
+    kill_switch = _safe_getattr(trader, "_kill_switch", None)
+    adaptive_risk = _safe_getattr(trader, "_adaptive_risk", None)
+    phase2_state_store = _safe_getattr(trader, "_phase2_state_store", None)
+    source_aligner = _safe_getattr(trader, "_phase2_source_aligner", None)
+    evolution_engine = _get_evolution_engine(trader)
+    subscription_manager = (
+        _safe_getattr(trader, "_phase3_subscription_manager", None)
+        or _safe_getattr(trader, "_subscription_manager", None)
+    )
+    ws_client = _safe_getattr(trader, "_phase3_ws_client", None)
+    depth_registry = _safe_getattr(trader, "_phase3_depth_registry", None)
+    trade_registry = _safe_getattr(trader, "_phase3_trade_registry", None)
+    onchain_collector = _safe_getattr(trader, "_onchain_collector", None)
+    onchain_feature_builder = _safe_getattr(trader, "_onchain_feature_builder", None)
+    sentiment_collector = _safe_getattr(trader, "_sentiment_collector", None)
+    sentiment_feature_builder = _safe_getattr(trader, "_sentiment_feature_builder", None)
+    phase3_mm = _safe_getattr(trader, "_phase3_mm", None)
+    phase3_ppo = _safe_getattr(trader, "_phase3_ppo", None)
+    micro_builder = _safe_getattr(trader, "_phase3_micro_builder", None)
+    action_adapter = _safe_getattr(trader, "_phase3_action_adapter", None)
+    obs_builder = _safe_getattr(trader, "_phase3_obs_builder", None)
+    attributor = _safe_getattr(trader, "attributor", None)
+
+    regime_detector_diags = {}
+    for symbol, detector in ((_safe_getattr(trader, "_phase1_regime_detectors", {}) or {}) if trader else {}).items():
+        diag_fn = _safe_getattr(detector, "health_snapshot", None)
+        regime_detector_diags[symbol] = _json_safe(diag_fn() if callable(diag_fn) else {})
+
+    data_kitchen_diags = {}
+    for symbol, kitchen in ((_safe_getattr(trader, "_phase1_data_kitchens", {}) or {}) if trader else {}).items():
+        diag_fn = _safe_getattr(kitchen, "diagnostics", None)
+        data_kitchen_diags[symbol] = _json_safe(diag_fn() if callable(diag_fn) else {})
+
+    continuous_learner_diags = {}
+    for key, learner in ((_safe_getattr(trader, "_continuous_learners", {}) or {}) if trader else {}).items():
+        versions_fn = _safe_getattr(learner, "get_model_version_info", None)
+        thresholds_fn = _safe_getattr(learner, "get_optimal_thresholds", None)
+        thresholds = thresholds_fn() if callable(thresholds_fn) else ()
+        continuous_learner_diags[key] = _json_safe({
+            "versions": versions_fn() if callable(versions_fn) else [],
+            "thresholds": {
+                "buy": thresholds[0] if len(thresholds) > 0 else None,
+                "sell": thresholds[1] if len(thresholds) > 1 else None,
+            },
+            "buffer_size": len(_safe_getattr(learner, "_ohlcv_buffer", []) or []),
+            "bars_since_retrain": _safe_getattr(learner, "_bars_since_retrain", None),
+        })
+
+    feature_view_summaries = {}
+    for symbol, feature_views in ((_safe_getattr(trader, "_phase1_feature_views", {}) or {}) if trader else {}).items():
+        feature_view_summaries[symbol] = _summarize_feature_views(feature_views if isinstance(feature_views, dict) else {})
+
+    symbol_regimes = {}
+    for symbol, regime in ((_safe_getattr(trader, "_symbol_regimes", {}) or {}) if trader else {}).items():
+        symbol_regimes[symbol] = _structured_payload(regime)
+
+    symbol_risk_plans = {}
+    for symbol, plan in ((_safe_getattr(trader, "_symbol_risk_plans", {}) or {}) if trader else {}).items():
+        plan_payload = _structured_payload(plan)
+        symbol_risk_plans[symbol] = plan_payload if isinstance(plan_payload, dict) else {"value": plan_payload}
+
+    latest_prices_updated_at = _safe_getattr(trader, "_latest_prices_updated_at", {}) if trader else {}
+    price_ages_sec = {
+        symbol: round(time.time() - timestamp, 2)
+        for symbol, timestamp in latest_prices_updated_at.items()
+    }
+
+    performance_summary = _invoke_component_method(attributor, "get_summary_metrics", {})
+    strategy_attribution = []
+    asset_attribution = []
+    if attributor is not None:
+        try:
+            strategy_attribution = _table_records(attributor.get_strategy_attribution(), limit=10)
+        except Exception:
+            strategy_attribution = []
+        try:
+            asset_attribution = _table_records(attributor.get_asset_attribution(), limit=10)
+        except Exception:
+            asset_attribution = []
+
+    phase3_strategy_candidates = _safe_getattr(trader, "_phase3_strategy_candidates", {}) if trader else {}
+    phase3_strategy_candidate_bindings = _safe_getattr(trader, "_phase3_strategy_candidate_bindings", {}) if trader else {}
+    phase3_strategy_metric_bindings = _safe_getattr(trader, "_phase3_strategy_metric_bindings", {}) if trader else {}
+    phase3_candidate_experiments = _safe_getattr(trader, "_phase3_candidate_experiments", {}) if trader else {}
+    phase3_candidate_runtime_state = _safe_getattr(trader, "_phase3_candidate_runtime_state", {}) if trader else {}
+    phase3_mm_realized_trade_records = _safe_getattr(trader, "_phase3_mm_realized_trade_records", {}) if trader else {}
+    phase3_mm_last_realized_pnl = _safe_getattr(trader, "_phase3_mm_last_realized_pnl", {}) if trader else {}
+    phase3_mm_last_halt_reason = _safe_getattr(trader, "_phase3_mm_last_halt_reason", {}) if trader else {}
+
+    evolution_registry = _safe_getattr(evolution_engine, "_registry", None)
+    evolution_state_store = _safe_getattr(evolution_engine, "_state_store", None)
+    evolution_scheduler = _safe_getattr(evolution_engine, "_scheduler", None)
+    evolution_ab_manager = _safe_getattr(evolution_engine, "_ab_manager", None)
+
+    transport_channels = {}
+    for key, manager in _channel_manager_map().items():
+        meta = _CHANNEL_REGISTRY.get(key, {})
+        transport_channels[key] = {
+            "label": meta.get("label", key),
+            "path": meta.get("path", ""),
+            "active_connections": manager.connection_count(),
+            "last_broadcast_at": meta.get("last_broadcast_at"),
+            "broadcast_count": meta.get("broadcast_count", 0),
+            "last_error": meta.get("last_error"),
+        }
+
+    alerts = _json_safe(overview.get("alerts", []) or [])
+    latest_order_rejection = overview.get("latest_order_rejection")
+    recent_errors = _collect_recent_errors(overview, data_fusion, latest_order_rejection)
+
+    overall_status = "healthy"
+    if overview.get("status") == "inactive" or status_response.get("status") == "inactive":
+        overall_status = "inactive"
+    elif any(alert.get("severity") == "critical" for alert in (overview.get("alerts", []) or []) if isinstance(alert, dict)):
+        overall_status = "critical"
+    elif recent_errors:
+        overall_status = "warning"
+
+    snapshot = {
+        "generated_at": generated_at,
+        "status": overall_status,
+        "system": {
+            "api_version": app.version,
+            "server_started_at": _SERVER_STARTED_AT.isoformat(),
+            "uptime_sec": round((datetime.now(tz=timezone.utc) - _SERVER_STARTED_AT).total_seconds(), 2),
+            "status_response": status_response,
+            "trader_runtime": {
+                "running": bool(_safe_getattr(trader, "_running", False)) if trader else False,
+                "mode": _safe_getattr(trader, "mode", "unknown") if trader else "unknown",
+                "symbols": list(_safe_getattr(_safe_getattr(_safe_getattr(trader, "sys_config", None), "data", None), "default_symbols", []) or []),
+                "poll_interval_sec": _safe_getattr(trader, "_poll_interval_s", None) if trader else None,
+                "markets_loaded": bool(_safe_getattr(trader, "_markets_loaded", False)) if trader else False,
+                "preload_done": bool(_safe_getattr(trader, "_preload_done", False)) if trader else False,
+                "phase2_external_enabled": bool(_safe_getattr(trader, "_phase2_external_enabled", False)) if trader else False,
+                "phase3_enabled": bool(_safe_getattr(trader, "_phase3_enabled", False)) if trader else False,
+                "phase3_realtime_enabled": bool(_safe_getattr(trader, "_phase3_realtime_enabled", False)) if trader else False,
+            },
+            "workers": _json_safe(_WORKER_REGISTRY),
+            "queue_depths": {
+                "log_queue": _safe_getattr(_safe_getattr(WebsocketLogSink, "_sync_queue", None), "qsize", lambda: 0)(),
+            },
+        },
+        "transport": {
+            "channels": transport_channels,
+            "status_push_interval_sec": _WORKER_REGISTRY.get("status_push", {}).get("interval_sec", 3),
+            "ticker_refresh_interval_sec": _WORKER_REGISTRY.get("ticker_refresh", {}).get("interval_sec", 5),
+        },
+        "workspace_health": {
+            "overview": _workspace_health_summary("overview", overview),
+            "alpha_brain": _workspace_health_summary("alpha_brain", alpha_brain),
+            "evolution": _workspace_health_summary("evolution", evolution),
+            "risk_matrix": _workspace_health_summary("risk_matrix", risk_matrix),
+            "data_fusion": _workspace_health_summary("data_fusion", data_fusion),
+            "execution": _workspace_health_summary("execution", execution),
+        },
+        "alpha_brain_diag": {
+            "snapshot": alpha_brain,
+            "runtime": {
+                "available": alpha_runtime is not None,
+                "loop_seq": _safe_getattr(alpha_runtime, "loop_seq", None),
+                "debug_enabled": bool(_safe_getattr(alpha_runtime, "debug_enabled", False)) if alpha_runtime is not None else False,
+                "context_builder": _component_descriptor(_safe_getattr(alpha_runtime, "context_builder", None)),
+                "signal_pipeline": _component_descriptor(_safe_getattr(alpha_runtime, "signal_pipeline", None)),
+                "trace_recorder": {
+                    **_component_descriptor(_safe_getattr(alpha_runtime, "trace_recorder", None)),
+                    "enabled": bool(_safe_getattr(_safe_getattr(alpha_runtime, "trace_recorder", None), "enabled", False)),
+                },
+                "registered_strategy_count": len(strategy_registry) if strategy_registry is not None else 0,
+            },
+            "strategy_registry": _json_safe(_safe_getattr(strategy_registry, "health_snapshot", lambda: {})()),
+            "orchestrator": _json_safe(_safe_getattr(orchestrator, "health_snapshot", lambda: {})()),
+            "regime_detectors": regime_detector_diags,
+            "data_kitchens": data_kitchen_diags,
+            "feature_views": feature_view_summaries,
+            "symbol_regimes": symbol_regimes,
+            "last_trace_ids": _json_safe(_safe_getattr(trader, "_last_trace_ids", {}) if trader else {}),
+            "continuous_learners": continuous_learner_diags,
+            "gemini": {
+                "configured": bool(_safe_getattr(trader, "_gemini_api_key", None)) if trader else False,
+                "model_name": _safe_getattr(trader, "_gemini_model_name", None) if trader else None,
+                "pending_refresh": bool(_safe_getattr(trader, "_pending_ai_analysis_refresh", False)) if trader else False,
+                "analysis_available": bool(_safe_getattr(trader, "_last_ai_analysis", "")) if trader else False,
+            },
+        },
+        "risk_diag": {
+            "snapshot": risk_matrix,
+            "budget_checker": _json_safe(_safe_getattr(budget_checker, "snapshot", lambda: {})()),
+            "kill_switch": _json_safe(_safe_getattr(kill_switch, "health_snapshot", lambda: {})()),
+            "adaptive_risk": _json_safe(_safe_getattr(adaptive_risk, "health_snapshot", lambda: {})()),
+            "state_store": _json_safe(_safe_getattr(phase2_state_store, "diagnostics", lambda: {})()),
+            "symbol_risk_plans": symbol_risk_plans,
+            "recent_order_rejections": _json_safe(_safe_getattr(trader, "_recent_order_rejections", []) if trader else []),
+        },
+        "data_sources": {
+            "snapshot": data_fusion,
+            "subscription_manager": _json_safe(_safe_getattr(subscription_manager, "diagnostics", lambda: {})()),
+            "ws_client": _json_safe(_safe_getattr(ws_client, "diagnostics", lambda: {})()),
+            "depth_registry": _json_safe(_safe_getattr(depth_registry, "diagnostics", lambda: {})()),
+            "trade_registry": _json_safe(_safe_getattr(trade_registry, "diagnostics", lambda: {})()),
+            "onchain_collector": _json_safe(_safe_getattr(onchain_collector, "diagnostics", lambda: {})()),
+            "sentiment_collector": _json_safe(_safe_getattr(sentiment_collector, "diagnostics", lambda: {})()),
+            "phase2_pipeline": {
+                "external_sources_enabled": bool(_safe_getattr(trader, "_phase2_external_enabled", False)) if trader else False,
+                "source_aligner": {
+                    **_component_descriptor(source_aligner),
+                    "config": _json_safe(_safe_getattr(_safe_getattr(source_aligner, "config", None), "__dict__", {})) if source_aligner is not None else {},
+                },
+                "onchain_feature_builder": _component_descriptor(onchain_feature_builder),
+                "sentiment_feature_builder": _component_descriptor(sentiment_feature_builder),
+            },
+            "price_ages_sec": price_ages_sec,
+        },
+        "execution_diag": {
+            "snapshot": execution,
+            "audit_log_stream": {
+                "active_connections": log_manager.connection_count(),
+                "queue_depth": _safe_getattr(_safe_getattr(WebsocketLogSink, "_sync_queue", None), "qsize", lambda: 0)(),
+            },
+            "orders_count": len(_safe_getattr(trader, "_orders", []) or []) if trader else 0,
+            "fills_count": len(_safe_getattr(trader, "_fills", []) or []) if trader else 0,
+            "performance_attribution": {
+                "summary": performance_summary,
+                "strategy_attribution": strategy_attribution,
+                "asset_attribution": asset_attribution,
+            },
+            "recent_order_rejections": _json_safe(_safe_getattr(trader, "_recent_order_rejections", []) if trader else []),
+        },
+        "evolution_diag": {
+            "snapshot": evolution,
+            "engine": _json_safe(_safe_getattr(evolution_engine, "diagnostics", lambda: {})()),
+            "registry": _invoke_component_method(evolution_registry, "diagnostics", {}),
+            "state_store": _invoke_component_method(evolution_state_store, "diagnostics", {}),
+            "scheduler": _invoke_component_method(evolution_scheduler, "diagnostics", {}),
+            "ab_manager": _invoke_component_method(evolution_ab_manager, "diagnostics", {}),
+        },
+        "phase3_diag": {
+            "enabled": bool(_safe_getattr(trader, "_phase3_enabled", False)) if trader else False,
+            "realtime_enabled": bool(_safe_getattr(trader, "_phase3_realtime_enabled", False)) if trader else False,
+            "subscription_manager": _json_safe(_safe_getattr(subscription_manager, "diagnostics", lambda: {})()),
+            "ws_client": _json_safe(_safe_getattr(ws_client, "diagnostics", lambda: {})()),
+            "market_making": _json_safe(_safe_getattr(phase3_mm, "diagnostics", lambda: {})()),
+            "rl_agent": _json_safe(_safe_getattr(phase3_ppo, "diagnostics", lambda: {})()),
+            "depth_registry": _json_safe(_safe_getattr(depth_registry, "diagnostics", lambda: {})()),
+            "trade_registry": _json_safe(_safe_getattr(trade_registry, "diagnostics", lambda: {})()),
+            "runtime_wiring": {
+                "policy_mode": _safe_getattr(trader, "_phase3_rl_policy_mode", "unknown") if trader else "unknown",
+                "ws_client": _component_descriptor(ws_client),
+                "subscription_manager": _component_descriptor(subscription_manager),
+                "micro_feature_builder": _component_descriptor(micro_builder),
+                "action_adapter": _component_descriptor(action_adapter),
+                "observation_builder": _component_descriptor(obs_builder),
+            },
+            "params_optimizer": {
+                "is_running": bool(_safe_getattr(trader, "_phase3_params_optimizer_running", False)) if trader else False,
+                "thread_alive": bool(_safe_getattr(_safe_getattr(trader, "_phase3_params_optimizer_thread", None), "is_alive", lambda: False)()) if trader else False,
+                "state": _structured_payload(_safe_getattr(trader, "_phase3_params_optimizer_state", {}) if trader else {}),
+            },
+            "candidate_bindings": {
+                "strategy_candidates": _structured_payload(phase3_strategy_candidates),
+                "candidate_bindings": _structured_payload(phase3_strategy_candidate_bindings),
+                "metric_bindings": _structured_payload(phase3_strategy_metric_bindings),
+                "candidate_experiments": _structured_payload(phase3_candidate_experiments),
+                "runtime_state": _summarize_runtime_state_map(phase3_candidate_runtime_state),
+            },
+            "market_making_feedback": {
+                "realized_trade_record_counts": {
+                    strategy_id: len(records) if isinstance(records, list) else 0
+                    for strategy_id, records in (phase3_mm_realized_trade_records or {}).items()
+                },
+                "last_realized_pnl": _structured_payload(phase3_mm_last_realized_pnl),
+                "last_halt_reason": _structured_payload(phase3_mm_last_halt_reason),
+            },
+        },
+        "alerts": alerts,
+        "recent_errors": _json_safe(recent_errors),
+    }
+    log.debug(
+        "[APIv2] Diagnostics snapshot built: status={} channels={} errors={}",
+        snapshot["status"],
+        len(snapshot["transport"]["channels"]),
+        len(snapshot["recent_errors"]),
+    )
+    return snapshot
+
+
 def _build_dashboard_snapshot() -> Dict[str, Any]:
     snapshot = {
         "generated_at": _iso_now(),
@@ -1203,6 +1899,11 @@ async def get_dashboard_execution() -> Dict[str, Any]:
 @app.get("/api/v2/dashboard/snapshot")
 async def get_dashboard_snapshot() -> Dict[str, Any]:
     return _build_dashboard_snapshot()
+
+
+@app.get("/api/v2/diagnostics")
+async def get_diagnostics_snapshot() -> Dict[str, Any]:
+    return _build_diagnostics_snapshot()
 
 
 @app.get("/api/v2/evolution/reports")
@@ -1416,3 +2117,18 @@ async def websocket_execution_endpoint(websocket: WebSocket):
         execution_manager_ws.disconnect(websocket)
     except Exception:
         execution_manager_ws.disconnect(websocket)
+
+
+@app.websocket("/api/v2/ws/diagnostics")
+async def websocket_diagnostics_endpoint(websocket: WebSocket):
+    await diagnostics_manager_ws.connect(websocket)
+    try:
+        await websocket.send_text(json.dumps(_build_diagnostics_snapshot(), default=str))
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        diagnostics_manager_ws.disconnect(websocket)
+    except Exception:
+        diagnostics_manager_ws.disconnect(websocket)

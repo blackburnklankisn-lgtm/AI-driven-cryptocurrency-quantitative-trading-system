@@ -11,6 +11,7 @@ import { EvolutionPage } from '../pages/EvolutionPage';
 import { RiskMatrixPage } from '../pages/RiskMatrixPage';
 import { DataFusionPage } from '../pages/DataFusionPage';
 import { ExecutionAuditPage } from '../pages/ExecutionAuditPage';
+import { DiagnosticsPage } from '../pages/DiagnosticsPage';
 import { formatBeijingTime } from '../utils/i18n';
 
 const navigation: Array<{ key: WorkspaceKey; label: string; icon: typeof Activity }> = [
@@ -20,6 +21,7 @@ const navigation: Array<{ key: WorkspaceKey; label: string; icon: typeof Activit
   { key: 'risk-matrix', label: '风险矩阵', icon: Shield },
   { key: 'data-fusion', label: '数据融合', icon: DatabaseZap },
   { key: 'execution-audit', label: '执行与审计', icon: TerminalSquare },
+  { key: 'diagnostics', label: '统一诊断', icon: Shield },
 ];
 
 export function AppShell() {
@@ -50,6 +52,9 @@ export function AppShell() {
   }
 
   function renderWorkspace() {
+    if (workspace === 'diagnostics') {
+      return <DiagnosticsPage />;
+    }
     if (!snapshot) {
       return <div className="dcc-empty">正在等待仪表盘快照...</div>;
     }

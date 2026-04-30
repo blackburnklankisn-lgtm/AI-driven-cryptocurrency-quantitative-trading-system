@@ -2,6 +2,7 @@ import type {
   AlphaBrainSnapshot,
   DashboardSnapshot,
   DataFusionSnapshot,
+  DiagnosticsSnapshot,
   EvolutionReport,
   EvolutionSnapshot,
   ExecutionSnapshot,
@@ -232,6 +233,25 @@ export function normalizeDashboardSnapshot(raw: DashboardSnapshot): DashboardSna
   };
 }
 
+export function normalizeDiagnosticsSnapshot(raw: DiagnosticsSnapshot): DiagnosticsSnapshot {
+  const source = asRecord(raw);
+  return {
+    generated_at: asString(source.generated_at),
+    status: asString(source.status, 'unknown'),
+    system: asRecord(source.system),
+    transport: asRecord(source.transport),
+    workspace_health: asRecord(source.workspace_health),
+    alpha_brain_diag: asRecord(source.alpha_brain_diag),
+    risk_diag: asRecord(source.risk_diag),
+    data_sources: asRecord(source.data_sources),
+    execution_diag: asRecord(source.execution_diag),
+    evolution_diag: asRecord(source.evolution_diag),
+    phase3_diag: asRecord(source.phase3_diag),
+    alerts: asArray<Record<string, unknown>>(source.alerts),
+    recent_errors: asArray<Record<string, unknown>>(source.recent_errors),
+  };
+}
+
 async function fetchJson<T>(path: string): Promise<T> {
   console.debug('[desktop-client][api] request', path);
   const response = await fetchWithEndpointRetry(path);
@@ -253,6 +273,7 @@ export const dashboardApi = {
   getRiskMatrix: () => fetchJson<RiskMatrixSnapshot>('/api/v2/dashboard/risk-matrix'),
   getDataFusion: () => fetchJson<DataFusionSnapshot>('/api/v2/dashboard/data-fusion'),
   getExecution: () => fetchJson<ExecutionSnapshot>('/api/v2/dashboard/execution'),
+  getDiagnostics: async () => normalizeDiagnosticsSnapshot(await fetchJson<DiagnosticsSnapshot>('/api/v2/diagnostics')),
 };
 
 export async function postControlAction(

@@ -9,6 +9,18 @@ let backendLifecyclePromise: Promise<void> = Promise.resolve();
 
 const isDev = process.env.NODE_ENV === 'development';
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+const BACKEND_HEALTH_PATH = '/api/v1/health';
+
+function getBackendHealthUrls(): string[] {
+  if (process.platform === 'win32') {
+    return [`http://localhost:8000${BACKEND_HEALTH_PATH}`];
+  }
+
+  return [
+    `http://localhost:8000${BACKEND_HEALTH_PATH}`,
+    `http://127.0.0.1:8000${BACKEND_HEALTH_PATH}`,
+  ];
+}
 
 // ── Python 后端进程管理 ──────────────────────────────────────
 
@@ -183,34 +195,74 @@ function queueBackendRefresh(reason: string): Promise<void> {
 function waitForBackend(maxRetries = 30, intervalMs = 1000): Promise<void> {
   return new Promise((resolve, reject) => {
     let attempts = 0;
-    const healthUrls = ['http://localhost:8000/api/v1/health', 'http://127.0.0.1:8000/api/v1/health'];
+    const healthUrls = getBackendHealthUrls();
+    const startedAt = Date.now();
+    const requestTimeoutMs = process.platform === 'win32' ? 1000 : 500;
+    let lastFailureDetail = 'no response received';
+
     const check = () => {
       attempts++;
       const healthUrl = healthUrls[(attempts - 1) % healthUrls.length];
-      console.log(`[Electron] Health check #${attempts}/${maxRetries} → GET ${healthUrl}`);
+
+      if (attempts === 1) {
+        console.log(
+          `[Electron] Waiting for backend readiness via ${healthUrls.join(', ')} ` +
+          `(max ${maxRetries} checks, ${intervalMs}ms interval)...`,
+        );
+      } else if (attempts % 10 === 0) {
+        const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+        console.log(`[Electron] Backend still starting (${attempts}/${maxRetries}, ${elapsedSeconds}s elapsed)...`);
+      }
+
+      let attemptFinished = false;
+      const finishAttempt = (next: () => void, detail?: string) => {
+        if (attemptFinished) {
+          return;
+        }
+
+        attemptFinished = true;
+        if (detail) {
+          lastFailureDetail = detail;
+        }
+        next();
+      };
+
       const req = http.get(healthUrl, (res) => {
-        console.log(`[Electron] Health check response: HTTP ${res.statusCode}`);
+        res.resume();
         if (res.statusCode === 200) {
-          console.log('[Electron] ✅ Backend is ready.');
-          resolve();
+          const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+          finishAttempt(() => {
+            console.log(`[Electron] ✅ Backend is ready after ${attempts} checks (${elapsedSeconds}s).`);
+            resolve();
+          });
         } else {
-          retry();
+          finishAttempt(retry, `${healthUrl} returned HTTP ${res.statusCode ?? 'unknown'}`);
         }
       });
+
       req.on('error', (err: Error) => {
-        console.warn(`[Electron] Health check #${attempts} error: ${err.message}`);
-        retry();
+        finishAttempt(retry, `${healthUrl} error: ${err.message}`);
       });
-      req.setTimeout(500, () => { req.destroy(); retry(); });
+
+      req.setTimeout(requestTimeoutMs, () => {
+        finishAttempt(retry, `${healthUrl} timed out after ${requestTimeoutMs}ms`);
+        req.destroy();
+      });
     };
+
     const retry = () => {
       if (attempts >= maxRetries) {
-        console.error(`[Electron] ❌ Backend did not start after ${maxRetries} attempts.`);
-        reject(new Error('Backend did not start in time'));
+        const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+        console.error(
+          `[Electron] ❌ Backend did not start after ${attempts} checks ` +
+          `(${elapsedSeconds}s). Last failure: ${lastFailureDetail}`,
+        );
+        reject(new Error(`Backend did not start in time: ${lastFailureDetail}`));
       } else {
         setTimeout(check, intervalMs);
       }
     };
+
     check();
   });
 }

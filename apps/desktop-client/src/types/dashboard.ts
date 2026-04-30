@@ -4,7 +4,8 @@ export type WorkspaceKey =
   | 'evolution'
   | 'risk-matrix'
   | 'data-fusion'
-  | 'execution-audit';
+  | 'execution-audit'
+  | 'diagnostics';
 
 export interface FeedHealthSummary {
   health: string;
@@ -187,6 +188,22 @@ export interface ExecutionSnapshot {
   positions: PositionsSummary;
   control_actions: Array<Record<string, unknown>>;
   status?: string;
+}
+
+export interface DiagnosticsSnapshot {
+  generated_at: string;
+  status: string;
+  system: Record<string, unknown>;
+  transport: Record<string, unknown>;
+  workspace_health: Record<string, unknown>;
+  alpha_brain_diag: Record<string, unknown>;
+  risk_diag: Record<string, unknown>;
+  data_sources: Record<string, unknown>;
+  execution_diag: Record<string, unknown>;
+  evolution_diag: Record<string, unknown>;
+  phase3_diag: Record<string, unknown>;
+  alerts: Array<Record<string, unknown>>;
+  recent_errors: Array<Record<string, unknown>>;
 }
 
 export interface DashboardSnapshot {
