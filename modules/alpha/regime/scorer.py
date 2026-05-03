@@ -120,6 +120,8 @@ class HybridRegimeScorer:
         # Step 5: 归一化到概率空间
         total_directional = bull_adj + bear_adj + high_vol_score
         if total_directional < 1e-8:
+            if self._looks_sideways(features):
+                return self._sideways_state()
             return self._unknown_state()
 
         bull_prob = bull_adj / total_directional
@@ -151,6 +153,8 @@ class HybridRegimeScorer:
         # Step 9: 确定 dominant regime
         dominant = self._dominant(bull_prob, bear_prob, sideways_prob, high_vol_prob)
         if confidence < cfg.confidence_floor:
+            if self._looks_sideways(features):
+                return self._sideways_state()
             dominant = "unknown"
 
         regime = RegimeState(
@@ -327,4 +331,28 @@ class HybridRegimeScorer:
             high_vol_prob=0.25,
             confidence=0.0,
             dominant_regime="unknown",
+        )
+
+    def _looks_sideways(self, f: RegimeFeatures) -> bool:
+        cfg = self.config
+        return (
+            abs(f.price_vs_sma20) <= cfg.sma20_bias_threshold
+            and abs(f.price_vs_sma50) <= cfg.sma50_bias_threshold
+            and f.adx <= cfg.adx_strong
+            and f.atr_pct <= cfg.atr_pct_mid
+            and f.bb_width <= cfg.bb_width_high * 0.5
+            and f.ret_roll_std_20 <= cfg.ret_std_high * 0.5
+            and cfg.ret_mean_down <= f.ret_roll_mean_20 <= cfg.ret_mean_up
+            and cfg.rsi_oversold <= f.rsi_14 <= cfg.rsi_overbought
+        )
+
+    @staticmethod
+    def _sideways_state() -> RegimeState:
+        return RegimeState(
+            bull_prob=0.1,
+            bear_prob=0.1,
+            sideways_prob=0.7,
+            high_vol_prob=0.1,
+            confidence=0.6,
+            dominant_regime="sideways",
         )

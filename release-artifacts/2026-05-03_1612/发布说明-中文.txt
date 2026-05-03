@@ -1,0 +1,24 @@
+AI Quant Trader 发布说明
+
+版本: 0.0.0
+构建时间: 2026-05-03 16:12
+发布目录: release-artifacts\\2026-05-03_1612
+
+文件说明:
+1. AI Quant Trader Setup 0.0.0.exe: Windows 安装程序
+2. backend_trader.exe: 后端独立可执行程序
+3. SHA256SUMS.txt: 校验值清单
+
+安装步骤:
+1. 运行 AI Quant Trader Setup 0.0.0.exe
+2. 按安装向导选择目录并完成安装
+3. 首次启动前确认本机可访问 HTX 与公共数据源
+
+验证结果摘要:
+1. 后端 backend_trader.exe 可启动并进入实时行情/订单簿处理流程
+2. 打包后的桌面端 AI Quant Trader.exe 可正常拉起进程
+3. NSIS 安装包可静默安装到测试目录，安装包文件生成完整，校验值已写入 SHA256SUMS.txt
+
+注意事项:
+1. 当前 onchain 使用 public 数据源，无需 API KEY
+2. 若后续切换到 glassnode 或 cryptoquant，再补充对应环境变量密钥

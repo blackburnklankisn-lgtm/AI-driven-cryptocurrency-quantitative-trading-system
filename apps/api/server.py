@@ -14,6 +14,7 @@ apps/api/server.py — FastAPI 后端桥接服务
 import asyncio
 from dataclasses import asdict, is_dataclass
 import json
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -394,9 +395,25 @@ _WORKER_REGISTRY: dict[str, dict[str, Any]] = {
 
 def _json_safe(value: Any) -> Any:
     try:
-        return json.loads(json.dumps(value, default=str))
+        return json.loads(json.dumps(_sanitize_non_finite(value), default=str, allow_nan=False))
     except Exception:
         return str(value)
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """Convert NaN/Infinity to JSON-safe null recursively."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_non_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_non_finite(v) for v in value]
+    return value
+
+
+def _json_dumps_safe(value: Any) -> str:
+    """Serialize payload with strict JSON compatibility."""
+    return json.dumps(_sanitize_non_finite(value), default=str, allow_nan=False)
 
 
 def _structured_payload(value: Any) -> Any:
@@ -580,7 +597,7 @@ async def _broadcast_snapshot(
     if manager.connection_count() == 0:
         return
     try:
-        await manager.broadcast(json.dumps(payload_builder(), default=str))
+        await manager.broadcast(_json_dumps_safe(payload_builder()))
         _record_channel_broadcast(channel_key)
     except Exception as exc:  # noqa: BLE001
         _record_channel_broadcast(channel_key, str(exc))
@@ -2029,7 +2046,7 @@ async def websocket_status_endpoint(websocket: WebSocket):
     # 连接后立即推送一次当前状态
     try:
         status_data = _build_status_response()
-        await websocket.send_text(json.dumps(status_data))
+        await websocket.send_text(_json_dumps_safe(status_data))
     except Exception:
         pass
 
@@ -2048,7 +2065,7 @@ async def websocket_status_endpoint(websocket: WebSocket):
 async def websocket_dashboard_endpoint(websocket: WebSocket):
     await dashboard_manager.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_dashboard_snapshot()))
+        await websocket.send_text(_json_dumps_safe(_build_dashboard_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":
@@ -2063,7 +2080,7 @@ async def websocket_dashboard_endpoint(websocket: WebSocket):
 async def websocket_risk_endpoint(websocket: WebSocket):
     await risk_manager_ws.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_risk_matrix_snapshot()))
+        await websocket.send_text(_json_dumps_safe(_build_risk_matrix_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":
@@ -2078,7 +2095,7 @@ async def websocket_risk_endpoint(websocket: WebSocket):
 async def websocket_evolution_endpoint(websocket: WebSocket):
     await evolution_manager_ws.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_evolution_snapshot()))
+        await websocket.send_text(_json_dumps_safe(_build_evolution_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":
@@ -2093,7 +2110,7 @@ async def websocket_evolution_endpoint(websocket: WebSocket):
 async def websocket_data_health_endpoint(websocket: WebSocket):
     await data_health_manager_ws.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_data_fusion_snapshot()))
+        await websocket.send_text(_json_dumps_safe(_build_data_fusion_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":
@@ -2108,7 +2125,7 @@ async def websocket_data_health_endpoint(websocket: WebSocket):
 async def websocket_execution_endpoint(websocket: WebSocket):
     await execution_manager_ws.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_execution_snapshot()))
+        await websocket.send_text(_json_dumps_safe(_build_execution_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":
@@ -2123,7 +2140,7 @@ async def websocket_execution_endpoint(websocket: WebSocket):
 async def websocket_diagnostics_endpoint(websocket: WebSocket):
     await diagnostics_manager_ws.connect(websocket)
     try:
-        await websocket.send_text(json.dumps(_build_diagnostics_snapshot(), default=str))
+        await websocket.send_text(_json_dumps_safe(_build_diagnostics_snapshot()))
         while True:
             data = await websocket.receive_text()
             if data == "ping":

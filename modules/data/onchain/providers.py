@@ -168,31 +168,34 @@ class PublicOnChainProvider(OnChainProvider):
         requested_symbol = _extract_base_symbol(symbol)
         proxy_symbol = "BTC"
 
-        try:
-            btc_coin = self._get_coin_payload("bitcoin")
-            stablecoin_caps = [
-                self._extract_market_cap(self._get_coin_payload(coin_id))
-                for coin_id in self._stablecoin_ids
-            ]
+        btc_coin = self._safe_get_coin_payload("bitcoin")
+        stablecoin_caps = []
+        for coin_id in self._stablecoin_ids:
+            cap_payload = self._safe_get_coin_payload(coin_id)
+            stablecoin_caps.append(self._extract_market_cap(cap_payload) if cap_payload else None)
 
-            unique_addresses = self._get_chart_series("n-unique-addresses")
-            tx_volume_usd = self._get_chart_series("estimated-transaction-volume-usd")
-            tx_count = self._get_chart_series("n-transactions")
-            hash_rate = self._get_chart_series("hash-rate")
-        except requests.RequestException as exc:
-            raise OnChainFetchError(f"公开 onchain API 请求失败: {exc}") from exc
-        except ValueError as exc:
-            raise OnChainFetchError(f"公开 onchain API 响应解析失败: {exc}") from exc
+        unique_addresses = self._safe_get_chart_series("n-unique-addresses")
+        tx_volume_usd = self._safe_get_chart_series("estimated-transaction-volume-usd")
+        tx_count = self._safe_get_chart_series("n-transactions")
+        hash_rate = self._safe_get_chart_series("hash-rate")
 
-        btc_market_cap = self._extract_market_cap(btc_coin)
-        btc_total_volume = self._extract_total_volume(btc_coin)
-        if btc_market_cap is None or btc_total_volume is None:
-            raise OnChainFetchError("CoinGecko BTC market_data 缺少 market_cap/total_volume")
+        # 允许部分数据源失败，只要至少一部分字段可计算就继续返回，避免 collector 全量降级。
+        if (
+            btc_coin is None
+            and unique_addresses is None
+            and tx_volume_usd is None
+            and tx_count is None
+            and hash_rate is None
+        ):
+            raise OnChainFetchError("公开 onchain API 全部不可用")
 
-        latest_active, prev_active = self._last_two(unique_addresses)
-        latest_tx_volume, _ = self._last_two(tx_volume_usd)
-        latest_tx_count, _ = self._last_two(tx_count)
-        latest_hash_rate, prev_hash_rate = self._last_two(hash_rate)
+        btc_market_cap = self._extract_market_cap(btc_coin) if btc_coin else None
+        btc_total_volume = self._extract_total_volume(btc_coin) if btc_coin else None
+
+        latest_active, prev_active = self._last_two(unique_addresses or [])
+        latest_tx_volume, _ = self._last_two(tx_volume_usd or [])
+        latest_tx_count, _ = self._last_two(tx_count or [])
+        latest_hash_rate, prev_hash_rate = self._last_two(hash_rate or [])
 
         active_addresses_change = _pct_change(prev_active, latest_active)
 
@@ -211,14 +214,16 @@ class PublicOnChainProvider(OnChainProvider):
 
         stablecoin_supply_ratio = None
         stablecoin_cap_sum = sum(cap for cap in stablecoin_caps if cap is not None)
-        if btc_market_cap > 0:
+        if btc_market_cap is not None and btc_market_cap > 0:
             stablecoin_supply_ratio = stablecoin_cap_sum / btc_market_cap
 
         miner_reserve_change = _pct_change(prev_hash_rate, latest_hash_rate)
 
         nvt_proxy = None
-        if latest_tx_volume and latest_tx_volume > 0:
+        if latest_tx_volume and latest_tx_volume > 0 and btc_market_cap is not None:
             nvt_proxy = btc_market_cap / latest_tx_volume
+        elif btc_market_cap is not None and btc_total_volume and btc_total_volume > 0:
+            nvt_proxy = btc_market_cap / btc_total_volume
 
         fields = {
             "active_addresses_change": active_addresses_change,
@@ -240,12 +245,30 @@ class PublicOnChainProvider(OnChainProvider):
             "tx_volume_usd": latest_tx_volume,
             "tx_count": latest_tx_count,
         }
+
+        if all(value is None for value in fields.values()):
+            raise OnChainFetchError("公开 onchain API 返回空字段")
+
         return OnChainRecord(
             fetched_at=datetime.now(tz=timezone.utc),
             fields=fields,
             source_name=self.provider_name,
             metadata=metadata,
         )
+
+    def _safe_get_coin_payload(self, coin_id: str) -> Optional[dict[str, Any]]:
+        try:
+            return self._get_coin_payload(coin_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[OnChain] CoinGecko 拉取失败: coin_id={} error={}", coin_id, exc)
+            return None
+
+    def _safe_get_chart_series(self, metric: str) -> Optional[list[dict[str, Any]]]:
+        try:
+            return self._get_chart_series(metric)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[OnChain] Blockchain.com 拉取失败: metric={} error={}", metric, exc)
+            return None
 
     def _get_coin_payload(self, coin_id: str) -> dict[str, Any]:
         response = requests.get(

@@ -981,6 +981,8 @@ class TestMainPhaseIntegration:
         assert "st_fear_greed" in views["alpha_features"].columns
         assert "oc_active_addr_chg" in views["regime_features"].columns
         assert "st_sentiment_ema" in views["diagnostic_features"].columns
+        assert trader._phase1_regime_detectors["BTC/USDT"].is_stable is True
+        assert trader._symbol_regimes["BTC/USDT"].dominant_regime != "unknown"
 
     def test_build_risk_snapshot_merges_runtime_guards(self):
         from apps.trader.main import LiveTrader
@@ -2895,6 +2897,8 @@ def _make_minimal_trader():
     obj._onchain_feature_builder = None
     obj._sentiment_collector = None
     obj._sentiment_feature_builder = None
+    obj._phase2_external_warmup_thread = None
+    obj._phase2_external_warmup_started = False
     obj._symbol_regimes = {}
     obj._last_trace_ids = {}
     obj._symbol_risk_plans = {}
@@ -2966,3 +2970,48 @@ def _load_p3_cfg():
     p3_cfg = load_config().phase3
     rt_cfg = p3_cfg.realtime_feed.model_copy(update={"provider": "mock"})
     return p3_cfg.model_copy(update={"realtime_feed": rt_cfg})
+
+
+class TestPhase2ExternalWarmup:
+    def test_start_phase2_external_warmup_runs_once_async(self, monkeypatch):
+        from apps.trader.main import LiveTrader
+
+        trader = _make_minimal_trader()
+        trader._phase2_external_enabled = True
+        trader.sys_config.data.default_symbols = ["BTC/USDT", "ETH/USDT"]
+
+        started = []
+
+        class DummyThread:
+            def __init__(self, target, args, name, daemon):
+                self.target = target
+                self.args = args
+                self.name = name
+                self.daemon = daemon
+
+            def start(self):
+                started.append((self.target, self.args, self.name, self.daemon))
+
+        monkeypatch.setattr("apps.trader.main.threading.Thread", DummyThread)
+
+        LiveTrader._start_phase2_external_warmup(trader)
+        LiveTrader._start_phase2_external_warmup(trader)
+
+        assert trader._phase2_external_warmup_started is True
+        assert len(started) == 1
+        assert started[0][0] == trader._warmup_phase2_external_sources
+        assert started[0][1] == (["BTC/USDT", "ETH/USDT"],)
+        assert started[0][2] == "phase2-external-warmup"
+        assert started[0][3] is True
+
+    def test_warmup_phase2_external_sources_collects_enabled_sources(self):
+        from apps.trader.main import LiveTrader
+
+        trader = _make_minimal_trader()
+        trader._onchain_collector = MagicMock()
+        trader._sentiment_collector = MagicMock()
+
+        LiveTrader._warmup_phase2_external_sources(trader, ["BTC/USDT"])
+
+        trader._onchain_collector.collect_all.assert_called_once_with(["BTC/USDT"], force=True)
+        trader._sentiment_collector.collect_all.assert_called_once_with(["BTC/USDT"], force=True)

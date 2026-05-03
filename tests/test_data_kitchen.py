@@ -317,8 +317,15 @@ class TestDataKitchen:
         views_infer = dk.transform(infer_df, validate_contract=True)
 
         # 列名应该相同
-        assert list(views_train["alpha_features"].columns) == \
-               list(views_infer["alpha_features"].columns)
+        assert list(views_train["alpha_features"].columns) == list(
+            views_infer["alpha_features"].columns
+        )
+        assert list(views_train["regime_features"].columns) == list(
+            views_infer["regime_features"].columns
+        )
+        assert list(views_train["diagnostic_features"].columns) == list(
+            views_infer["diagnostic_features"].columns
+        )
 
     def test_contract_validate_detects_missing_feature(self):
         """手动验证缺少特征时应返回 False。"""
@@ -332,15 +339,25 @@ class TestDataKitchen:
         assert ok is False
         assert len(missing) == 2
 
-    def test_regime_features_subset_of_alpha(self):
-        """regime_features 的列应是 alpha_features 列的子集。"""
+    def test_regime_features_preserve_detector_core_columns(self):
+        """regime_features 应保留 detector 依赖的核心列，不受 ML selector 裁剪影响。"""
         dk = DataKitchen()
         views, _ = dk.fit(make_ohlcv(400))
 
-        alpha_set = set(views["alpha_features"].columns)
         regime_cols = set(views["regime_features"].columns)
+        required = {
+            "ret_roll_mean_20",
+            "ret_roll_std_20",
+            "price_vs_sma_20",
+            "price_vs_sma_50",
+            "adx_14",
+            "rsi_14",
+            "atr_pct_14",
+            "bb_width",
+            "volume_ratio",
+        }
 
-        assert regime_cols.issubset(alpha_set)
+        assert required.issubset(regime_cols)
 
     def test_contract_save_load_roundtrip(self, tmp_path: Path):
         """FeatureContract 保存后重新加载，签名和列名一致。"""

@@ -345,6 +345,8 @@ class LiveTrader:
         self._phase3_mm_realized_trade_records: Dict[str, List[Dict[str, Any]]] = {}
         self._phase3_mm_last_realized_pnl: Dict[str, float] = {}
         self._phase3_mm_last_halt_reason: Dict[str, str] = {}
+        self._phase2_external_warmup_thread: Optional[threading.Thread] = None
+        self._phase2_external_warmup_started: bool = False
 
         p3_cfg = getattr(self.sys_config, "phase3", None)
         if p3_cfg is not None and getattr(p3_cfg, "enabled", False):
@@ -614,6 +616,19 @@ class LiveTrader:
         if hasattr(self, "_kill_switch"):
             self._kill_switch.record_data_health("phase3_realtime", is_healthy)
 
+    def _refresh_phase3_realtime_health(self) -> None:
+        """按主循环节奏刷新 Phase 3 realtime 聚合健康，避免 healthy 状态因时间戳过期被误判 stale。"""
+        subscription_manager = getattr(self, "_phase3_subscription_manager", None)
+        if subscription_manager is None or not hasattr(self, "_kill_switch"):
+            return
+
+        try:
+            health = subscription_manager.get_health()
+            is_healthy = getattr(getattr(health, "health", None), "value", "") == "healthy"
+            self._kill_switch.record_data_health("phase3_realtime", is_healthy)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[Phase3] 刷新 realtime 聚合健康失败: {}", exc)
+
     def _pump_phase3_realtime_feed(self, symbol: str) -> None:
         """驱动一次 mock realtime feed，产出真实 DepthCache / TradeCache 数据。"""
         client = getattr(self, "_phase3_ws_client", None)
@@ -680,6 +695,43 @@ class LiveTrader:
             detector = MarketRegimeDetector()
             self._phase1_regime_detectors[symbol] = detector
         return detector
+
+    def _prime_regime_detector_from_history(
+        self,
+        symbol: str,
+        feature_views: Optional[Dict[str, pd.DataFrame]],
+        ohlcv_df: Optional[pd.DataFrame] = None,
+    ) -> None:
+        detector = self._get_or_create_regime_detector(symbol)
+        cache_size = int(
+            detector.health_snapshot().get("cache", {}).get("cache_size", 0)
+        )
+        if cache_size >= 5:
+            return
+
+        regime_features = feature_views.get("regime_features") if feature_views else None
+        if regime_features is not None and not regime_features.empty and len(regime_features) >= 5:
+            tail = regime_features.tail(5)
+            for offset in range(len(tail)):
+                detector.update_from_frame(
+                    tail.iloc[: offset + 1],
+                    bar_seq=offset,
+                )
+        elif ohlcv_df is not None and len(ohlcv_df) >= detector.config.min_bars_required + 4:
+            history = ohlcv_df[["open", "high", "low", "close", "volume"]]
+            start = len(history) - 4
+            for bar_seq, end in enumerate(range(start, len(history) + 1)):
+                detector.update(
+                    history.iloc[:end],
+                    bar_seq=bar_seq,
+                )
+        else:
+            return
+
+        self._symbol_regimes[symbol] = detector.current_regime
+        self._current_regime = detector.current_regime
+        self._latest_regime_state = detector.current_regime
+        self._latest_regime_stable = detector.is_stable
 
     def _init_phase2_external_sources(self) -> None:
         data_cfg = self.sys_config.data
@@ -753,12 +805,46 @@ class LiveTrader:
                 self._sentiment_feature_builder,
             )
         )
+
         log.info(
             "[Phase2] external sources ready: onchain={} sentiment={} enabled={}",
             self._onchain_collector is not None,
             self._sentiment_collector is not None,
             self._phase2_external_enabled,
         )
+
+    def _start_phase2_external_warmup(self) -> None:
+        if self._phase2_external_warmup_started or not self._phase2_external_enabled:
+            return
+
+        symbols = list(getattr(self.sys_config.data, "default_symbols", []) or [])
+        if not symbols:
+            return
+
+        self._phase2_external_warmup_started = True
+        self._phase2_external_warmup_thread = threading.Thread(
+            target=self._warmup_phase2_external_sources,
+            args=(symbols,),
+            name="phase2-external-warmup",
+            daemon=True,
+        )
+        self._phase2_external_warmup_thread.start()
+        log.info("[Phase2] external warmup 已异步启动: symbols={}", symbols)
+
+    def _warmup_phase2_external_sources(self, symbols: List[str]) -> None:
+        if self._onchain_collector is not None:
+            try:
+                self._onchain_collector.collect_all(symbols, force=True)
+                log.info("[Phase2] onchain 启动预采集完成: symbols={}", symbols)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[Phase2] onchain 启动预采集失败（将于主循环重试）: {}", exc)
+
+        if self._sentiment_collector is not None:
+            try:
+                self._sentiment_collector.collect_all(symbols, force=True)
+                log.info("[Phase2] sentiment 启动预采集完成: symbols={}", symbols)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[Phase2] sentiment 启动预采集失败（将于主循环重试）: {}", exc)
 
     def _create_onchain_provider(self, provider_name: str):
         normalized = (provider_name or "public").strip().lower()
@@ -915,6 +1001,7 @@ class LiveTrader:
             else:
                 views = kitchen.transform(enriched_df, validate_contract=False)
             self._phase1_feature_views[symbol] = views
+            self._prime_regime_detector_from_history(symbol, views, ohlcv_df=ohlcv_df)
             return views
         except Exception as exc:  # noqa: BLE001
             log.debug("[Phase1] DataKitchen 处理失败: symbol={} error={}", symbol, exc)
@@ -1442,9 +1529,8 @@ class LiveTrader:
         trader_thread.start()
         
         # 主线程阻塞运行 API
-        log.info("启动本地通信层 API: http://127.0.0.1:8000 (Dual Stack Support)")
-        # 使用 host="::" 以支持 IPv4 和 IPv6 客户端
-        uvicorn.run(fast_app, host="::", port=8000, log_level="info")
+        log.info("启动本地通信层 API: http://127.0.0.1:8000")
+        uvicorn.run(fast_app, host="127.0.0.1", port=8000, log_level="info")
 
     def _run_loop(self) -> None:
         """原有的交易主引擎循环"""
@@ -1470,6 +1556,8 @@ class LiveTrader:
                 "首次启动: 以当前权益 {:.2f} 初始化风控基线",
                 self._current_equity,
             )
+
+        self._start_phase2_external_warmup()
 
         # ── 预加载历史 K 线，喂给策略暖机 ─────────────────────
         self._preload_history()
@@ -1523,6 +1611,7 @@ class LiveTrader:
         now = datetime.now(tz=timezone.utc)
         self.metrics.record_heartbeat()
         log.debug("主循环心跳: seq={} ts={}", seq, now.isoformat())
+        self._refresh_phase3_realtime_health()
 
         # 每 10 次循环输出一次 INFO 级状态摘要（约每 10 分钟），监控各模块健康状态
         if seq % 10 == 1:

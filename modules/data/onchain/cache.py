@@ -38,7 +38,9 @@ from modules.data.onchain.providers import ONCHAIN_FIELDS, OnChainRecord
 log = get_logger(__name__)
 
 _DEFAULT_CACHE_PATH = (
-    Path(__file__).resolve().parents[3] / "storage" / "onchain_cache.json"
+    Path(os.getenv("USER_DATA_DIR", "")).joinpath("storage", "onchain_cache.json")
+    if os.getenv("USER_DATA_DIR")
+    else (Path(__file__).resolve().parents[3] / "storage" / "onchain_cache.json")
 )
 
 
@@ -51,6 +53,14 @@ def _parse_dt(val: Any) -> Optional[datetime]:
         return None
     dt = datetime.fromisoformat(str(val))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _normalize_symbol(symbol: str) -> str:
+    token = (symbol or "BTC").split(":", 1)[0]
+    token = token.split("/", 1)[0]
+    token = token.split("-", 1)[0]
+    token = token.strip().upper()
+    return token or "BTC"
 
 
 class OnChainCache:
@@ -113,6 +123,7 @@ class OnChainCache:
 
         每个字段独立存储，附带 collected_at 时间戳。
         """
+        symbol = _normalize_symbol(symbol)
         with self._lock:
             data = self._read_all()
             sym_data = data.get(symbol, {})
@@ -145,6 +156,7 @@ class OnChainCache:
             dict（字段名 -> {"value": float, "collected_at": datetime}），
             如果 symbol 不存在则返回 None
         """
+        symbol = _normalize_symbol(symbol)
         with self._lock:
             data = self._read_all()
         raw = data.get(symbol)
@@ -197,6 +209,7 @@ class OnChainCache:
         Returns:
             SourceFreshness 评估结果
         """
+        symbol = _normalize_symbol(symbol)
         evaluator = FreshnessEvaluator(
             source_name=f"onchain_{symbol.lower()}",
             config=config,
@@ -280,6 +293,7 @@ class OnChainCache:
 
     def clear(self, symbol: str) -> bool:
         """删除指定 symbol 的缓存数据。"""
+        symbol = _normalize_symbol(symbol)
         with self._lock:
             data = self._read_all()
             if symbol not in data:

@@ -17,7 +17,7 @@ import pytest
 from modules.alpha.contracts.regime_types import RegimeState
 from modules.alpha.regime.cache import RegimeCache
 from modules.alpha.regime.detector import DetectorConfig, MarketRegimeDetector
-from modules.alpha.regime.feature_source import RegimeFeatureSource
+from modules.alpha.regime.feature_source import RegimeFeatureSource, RegimeFeatures
 from modules.alpha.regime.scorer import HybridRegimeScorer, ScorerConfig
 
 
@@ -170,9 +170,52 @@ class TestHybridRegimeScorer:
         regime = self._get_regime(make_bear_ohlcv(100))
         assert regime.bear_prob >= regime.bull_prob, f"强熊市 bear_prob 未高于 bull_prob: {regime}"
 
+    def test_live_like_neutral_features_return_sideways(self):
+        """真实运行时常见的低波动/弱趋势特征应判为 sideways，而不是 unknown。"""
+        scorer = HybridRegimeScorer()
+        regime = scorer.score(
+            RegimeFeatures(
+                valid=True,
+                n_bars=451,
+                ret_roll_mean_20=0.00005,
+                ret_roll_std_20=0.0038,
+                price_vs_sma20=0.0044,
+                price_vs_sma50=-0.0011,
+                adx=21.4,
+                rsi_14=52.1,
+                atr_pct=0.0050,
+                bb_width=0.0139,
+                volume_ratio=1.0,
+            )
+        )
+
+        assert regime.dominant_regime == "sideways"
+        assert regime.confidence >= 0.45
+
+    def test_moderate_adx_neutral_features_still_return_sideways(self):
+        """中等 ADX 但缺乏方向和波动放大的场景，仍应判为 sideways。"""
+        scorer = HybridRegimeScorer()
+        regime = scorer.score(
+            RegimeFeatures(
+                valid=True,
+                n_bars=451,
+                ret_roll_mean_20=0.0,
+                ret_roll_std_20=0.0050,
+                price_vs_sma20=0.0042,
+                price_vs_sma50=-0.0036,
+                adx=29.0,
+                rsi_14=50.7,
+                atr_pct=0.0063,
+                bb_width=0.0200,
+                volume_ratio=1.0,
+            )
+        )
+
+        assert regime.dominant_regime == "sideways"
+        assert regime.confidence >= 0.45
+
     def test_invalid_features_returns_unknown(self):
         """特征无效时应该返回 unknown dominant_regime。"""
-        from modules.alpha.regime.feature_source import RegimeFeatures
         scorer = HybridRegimeScorer()
         regime = scorer.score(RegimeFeatures(valid=False))
         assert regime.dominant_regime == "unknown"

@@ -8,6 +8,38 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Invoke-CmdQuiet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [Parameter(Mandatory = $true)]
+        [string]$FailureMessage
+    )
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/d", "/c", $Command `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+    } finally {
+        if (Test-Path $stdoutPath) {
+            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($process.ExitCode -ne 0) {
+        throw $FailureMessage
+    }
+}
+
 Write-Host "╔════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║                前端应用构建 (Vite + Electron Builder)                      ║" -ForegroundColor Cyan
 Write-Host "╚════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
@@ -51,36 +83,28 @@ try {
 
     # 安装 npm 依赖
     Write-Host "▶ 安装 npm 依赖 (首次可能需要 2-3 分钟)..." -ForegroundColor Yellow
-    npm install --legacy-peer-deps 2>&1 | Out-Null
+    Invoke-CmdQuiet -Command "npm install --legacy-peer-deps" -FailureMessage "npm install 失败"
     Write-Host "✓ npm 依赖已安装" -ForegroundColor Green
 
     # TypeScript 编译 (Web)
     Write-Host "▶ 编译 React 前端 (TypeScript)..." -ForegroundColor Yellow
-    npx tsc -b 2>&1 | Out-Null
+    Invoke-CmdQuiet -Command "npx tsc -b" -FailureMessage "TypeScript 编译失败"
     Write-Host "✓ TypeScript 编译完成" -ForegroundColor Green
 
     # Vite 构建
     Write-Host "▶ 运行 Vite 构建..." -ForegroundColor Yellow
-    npm run build 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "✗ Vite 构建失败" -ForegroundColor Red
-        exit 1
-    }
+    Invoke-CmdQuiet -Command "npx vite build" -FailureMessage "Vite 构建失败"
     Write-Host "✓ Vite 构建完成" -ForegroundColor Green
 
     # 编译 Electron 主进程
     Write-Host "▶ 编译 Electron 主进程..." -ForegroundColor Yellow
-    npx tsc -p tsconfig.electron.json 2>&1 | Out-Null
+    Invoke-CmdQuiet -Command "npx tsc -p tsconfig.electron.json" -FailureMessage "Electron 主进程编译失败"
     Write-Host "✓ Electron 主进程编译完成" -ForegroundColor Green
 
     # Electron Builder
     Write-Host "▶ 运行 electron-builder (生成安装程序)..." -ForegroundColor Yellow
     Write-Host "  这可能需要 2-5 分钟..." -ForegroundColor Gray
-    npm run build 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "✗ electron-builder 失败" -ForegroundColor Red
-        exit 1
-    }
+    Invoke-CmdQuiet -Command "npx electron-builder" -FailureMessage "electron-builder 失败"
 
     # 验证输出
     Write-Host ""

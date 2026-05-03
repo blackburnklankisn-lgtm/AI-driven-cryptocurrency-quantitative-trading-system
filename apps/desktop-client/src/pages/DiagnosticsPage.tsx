@@ -21,11 +21,36 @@ function asNumber(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function wsIssueSummary(info: Record<string, unknown>): string {
+  const lastError = asString(info.last_error, '');
+  if (lastError) {
+    const kind = asString(info.last_error_kind, 'error');
+    return `${kind}: ${lastError}`;
+  }
+
+  const closeCode = typeof info.last_close_code === 'number' ? info.last_close_code : null;
+  const closeReason = asString(info.last_close_reason, '');
+  const detail = asString(info.status_detail, '');
+  if (closeCode != null || closeReason || detail) {
+    const parts = [
+      closeCode != null ? `code=${closeCode}` : '',
+      closeReason,
+      !closeCode && !closeReason ? detail : '',
+    ].filter(Boolean);
+    return parts.join(' · ') || '无';
+  }
+
+  return '无';
+}
+
 function StatusBadge({ value }: { value: unknown }) {
   const status = String(value ?? 'unknown').toLowerCase();
   const label = zh(value, '未知');
   if (status.includes('healthy') || status.includes('fresh') || status.includes('open') || status.includes('running')) {
     return <span className="dcc-badge dcc-badge--fresh">{label}</span>;
+  }
+  if (status.includes('inactive') || status.includes('idle') || status.includes('connecting') || status.includes('retrying')) {
+    return <span className="dcc-badge dcc-badge--partial">{label}</span>;
   }
   if (status.includes('critical') || status.includes('error') || status.includes('fail') || status.includes('stale') || status.includes('closed')) {
     return <span className="dcc-badge dcc-badge--stale">{label}</span>;
@@ -48,7 +73,8 @@ export function DiagnosticsPage() {
   const recentErrors = asArray<Record<string, unknown>>(snapshot?.recent_errors);
   const uptimeSec = asNumber(system.uptime_sec);
   const activeBackendChannels = backendChannels.filter(([, value]) => asNumber(asRecord(value).active_connections) > 0).length;
-  const openFrontendChannels = frontendWsChannels.filter(([, value]) => value.status === 'open').length;
+  const subscribedFrontendChannels = frontendWsChannels.filter(([, value]) => value.subscription_count > 0).length;
+  const openFrontendChannels = frontendWsChannels.filter(([, value]) => value.subscription_count > 0 && value.status === 'open').length;
   const staleWorkspaces = workspaceHealth.filter(([, value]) => {
     const status = asString(asRecord(value).status, 'unknown').toLowerCase();
     return status.includes('warning') || status.includes('critical') || status.includes('stale') || status.includes('degraded');
@@ -73,7 +99,7 @@ export function DiagnosticsPage() {
         />
         <MetricCard
           label="传输通道"
-          value={`${openFrontendChannels}/${Math.max(frontendWsChannels.length, 1)}`}
+          value={`${openFrontendChannels}/${Math.max(subscribedFrontendChannels, 1)}`}
           accent={openFrontendChannels > 0 ? 'bull' : 'risk'}
           subtitle={`后端活动通道 ${activeBackendChannels} 个`}
           icon={<DatabaseZap size={18} />}
@@ -104,16 +130,18 @@ export function DiagnosticsPage() {
             {frontendWsChannels.length ? (
               <table className="dcc-table">
                 <thead>
-                  <tr><th>路径</th><th>状态</th><th>消息数</th><th>重连数</th><th>最近消息</th></tr>
+                  <tr><th>路径</th><th>状态</th><th>订阅数</th><th>消息数</th><th>重连数</th><th>最近消息</th><th>最近异常/关闭</th></tr>
                 </thead>
                 <tbody>
                   {frontendWsChannels.map(([path, info]) => (
                     <tr key={path}>
                       <td>{path}</td>
                       <td><StatusBadge value={info.status} /></td>
+                      <td>{info.subscription_count}</td>
                       <td>{info.message_count}</td>
                       <td>{info.reconnect_count}</td>
                       <td>{info.last_message_at ?? '暂无'}</td>
+                      <td>{wsIssueSummary(info as unknown as Record<string, unknown>)}</td>
                     </tr>
                   ))}
                 </tbody>

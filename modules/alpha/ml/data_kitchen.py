@@ -41,6 +41,18 @@ from modules.alpha.ml.feature_selectors import (
 
 log = get_logger(__name__)
 
+_REGIME_CORE_COLUMNS = [
+    "ret_roll_mean_20",
+    "ret_roll_std_20",
+    "price_vs_sma_20",
+    "price_vs_sma_50",
+    "adx_14",
+    "rsi_14",
+    "atr_pct_14",
+    "bb_width",
+    "volume_ratio",
+]
+
 
 # ══════════════════════════════════════════════════════════════
 # 输出容器
@@ -212,7 +224,9 @@ class DataKitchen:
         )
 
         # Step 3: 构建三个视图
-        views = self._build_views(X_processed)
+        # alpha_features 走筛选后的矩阵；regime/diagnostic 保留原始可解释特征，
+        # 避免规则引擎依赖列被 variance/decorrelation 提前剔除。
+        views = self._build_views(X_processed, raw_feature_matrix=X_raw)
 
         # Step 4: 生成 FeatureContract
         version = self._versioned_name()
@@ -285,7 +299,7 @@ class DataKitchen:
                 )
 
         # Step 4: 构建视图
-        views = self._build_views(X_processed)
+        views = self._build_views(X_processed, raw_feature_matrix=X_raw)
 
         log.debug(
             "[DataKitchen] transform完成: alpha_rows={} alpha_cols={}",
@@ -317,38 +331,53 @@ class DataKitchen:
     # 视图构建
     # ────────────────────────────────────────────────────────────
 
-    def _build_views(self, X: pd.DataFrame) -> dict[str, pd.DataFrame]:
-        """从处理后的特征矩阵中，按前缀规则分出三个视图。"""
+    def _build_views(
+        self,
+        X: pd.DataFrame,
+        raw_feature_matrix: pd.DataFrame | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """从特征矩阵中，按前缀规则分出三个视图。"""
         cfg = self.config
         all_cols = list(X.columns)
+        raw_matrix = raw_feature_matrix if raw_feature_matrix is not None else X
+        raw_cols = list(raw_matrix.columns)
 
         # alpha_features: 全部处理后的特征
         alpha_cols = all_cols
 
-        # regime_features: 匹配前缀规则的列
+        # regime_features: 使用原始特征矩阵，保留 detector 所需列的可解释性
         regime_cols = [
-            c for c in all_cols
+            c for c in raw_cols
             if any(c.startswith(pfx) for pfx in cfg.regime_feature_prefixes)
         ]
         if not regime_cols:
             # 降级：至少保留 5 列
-            regime_cols = all_cols[:min(5, len(all_cols))]
+            regime_cols = raw_cols[:min(5, len(raw_cols))]
             log.warning(
                 "[DataKitchen] regime_features前缀匹配为空，降级为前{}列", len(regime_cols),
             )
 
-        # diagnostic_features: 匹配诊断前缀
+        missing_regime_core = [
+            col for col in _REGIME_CORE_COLUMNS if col not in regime_cols
+        ]
+        if missing_regime_core:
+            log.warning(
+                "[DataKitchen] regime_features 缺少 detector 核心列: {}",
+                missing_regime_core,
+            )
+
+        # diagnostic_features: 使用原始特征矩阵，尽量保留诊断上下文
         diag_cols = [
-            c for c in all_cols
+            c for c in raw_cols
             if any(c.startswith(pfx) for pfx in cfg.diagnostic_feature_prefixes)
         ]
         if not diag_cols:
-            diag_cols = all_cols[:min(5, len(all_cols))]
+            diag_cols = raw_cols[:min(5, len(raw_cols))]
 
         return {
             "alpha_features": X[alpha_cols],
-            "regime_features": X[regime_cols],
-            "diagnostic_features": X[diag_cols],
+            "regime_features": raw_matrix[regime_cols],
+            "diagnostic_features": raw_matrix[diag_cols],
         }
 
     # ────────────────────────────────────────────────────────────

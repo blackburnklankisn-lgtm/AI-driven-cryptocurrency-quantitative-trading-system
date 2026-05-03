@@ -13,6 +13,11 @@ export interface WsChannelDiagnostics {
   last_close_at: string | null;
   last_error_at: string | null;
   last_error: string | null;
+  last_error_kind: string | null;
+  last_close_code: number | null;
+  last_close_reason: string | null;
+  last_close_was_clean: boolean | null;
+  status_detail: string | null;
 }
 
 const wsDiagnostics = new Map<string, WsChannelDiagnostics>();
@@ -43,6 +48,11 @@ function updateWsDiagnostics(
     last_close_at: null,
     last_error_at: null,
     last_error: null,
+    last_error_kind: null,
+    last_close_code: null,
+    last_close_reason: null,
+    last_close_was_clean: null,
+    status_detail: null,
   };
   wsDiagnostics.set(path, updater(current));
   emitWsDiagnostics();
@@ -75,6 +85,17 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
   let retryTimer: number | null = null;
   let closedByClient = false;
 
+  const updateErrorState = (kind: string, message: string, detail?: string) => {
+    updateWsDiagnostics(options.path, (current) => ({
+      ...current,
+      status: 'error',
+      last_error_at: nowIso(),
+      last_error: message,
+      last_error_kind: kind,
+      status_detail: detail ?? message,
+    }));
+  };
+
   updateWsDiagnostics(options.path, (current) => ({
     ...current,
     subscription_count: current.subscription_count + 1,
@@ -88,6 +109,7 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
       status: 'connecting',
       last_url: url,
       last_connect_at: nowIso(),
+      status_detail: `connecting ${url}`,
     }));
     socket = new WebSocket(url);
     socket.onopen = () => {
@@ -98,7 +120,7 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
         open_count: current.open_count + 1,
         last_url: url,
         last_connect_at: nowIso(),
-        last_error: null,
+        status_detail: null,
       }));
       options.onOpen?.();
     };
@@ -107,42 +129,57 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
       if (raw === 'pong') {
         return;
       }
-      updateWsDiagnostics(options.path, (current) => ({
-        ...current,
-        message_count: current.message_count + 1,
-        last_message_at: nowIso(),
-      }));
+
+      let parsed: T;
       try {
-        const parsed = options.parseMessage ? options.parseMessage(raw) : (JSON.parse(raw) as T);
-        console.debug('[desktop-client][ws] message', url, parsed);
-        options.onMessage(parsed);
+        parsed = options.parseMessage ? options.parseMessage(raw) : (JSON.parse(raw) as T);
       } catch (error) {
         console.error('[desktop-client][ws] parse error', url, raw, error);
+        updateErrorState(
+          'parse',
+          error instanceof Error ? error.message : 'message parse error',
+          `parse failed for ${url}`,
+        );
+        return;
+      }
+
+      try {
+        console.debug('[desktop-client][ws] message', url, parsed);
+        options.onMessage(parsed);
         updateWsDiagnostics(options.path, (current) => ({
           ...current,
-          status: 'error',
-          last_error_at: nowIso(),
-          last_error: error instanceof Error ? error.message : 'message parse error',
+          status: 'open',
+          message_count: current.message_count + 1,
+          last_message_at: nowIso(),
+          status_detail: null,
         }));
+      } catch (error) {
+        console.error('[desktop-client][ws] handler error', url, parsed, error);
+        updateErrorState(
+          'handler',
+          error instanceof Error ? error.message : 'message handler error',
+          `handler failed for ${url}`,
+        );
       }
     };
     socket.onerror = (error) => {
       console.error('[desktop-client][ws] error', url, error);
-      updateWsDiagnostics(options.path, (current) => ({
-        ...current,
-        status: 'error',
-        last_error_at: nowIso(),
-        last_error: 'websocket error',
-      }));
+      updateErrorState('socket', 'websocket error', `socket error for ${url}`);
       options.onError?.(error);
     };
-    socket.onclose = () => {
-      console.warn('[desktop-client][ws] closed', url);
+    socket.onclose = (event) => {
+      console.warn('[desktop-client][ws] closed', url, event.code, event.reason, event.wasClean);
       updateWsDiagnostics(options.path, (current) => ({
         ...current,
-        status: closedByClient ? 'closed' : 'retrying',
+        status: closedByClient ? 'inactive' : 'retrying',
         reconnect_count: closedByClient ? current.reconnect_count : current.reconnect_count + 1,
         last_close_at: nowIso(),
+        last_close_code: event.code,
+        last_close_reason: event.reason || null,
+        last_close_was_clean: event.wasClean,
+        status_detail: closedByClient
+          ? 'client unsubscribed'
+          : `socket closed code=${event.code}${event.reason ? ` reason=${event.reason}` : ''}`,
       }));
       options.onClose?.();
       if (!closedByClient) {
@@ -169,9 +206,10 @@ export function createWsChannel<T>(options: WsChannelOptions<T>): () => void {
     socket?.close();
     updateWsDiagnostics(options.path, (current) => ({
       ...current,
-      status: 'closed',
+      status: 'inactive',
       subscription_count: Math.max(0, current.subscription_count - 1),
       last_close_at: nowIso(),
+      status_detail: 'client unsubscribed',
     }));
   };
 }
