@@ -292,7 +292,7 @@ class PublicOnChainProvider(OnChainProvider):
     def _get_chart_series(self, metric: str) -> list[dict[str, Any]]:
         response = requests.get(
             f"{self._BLOCKCHAIN_BASE}/{metric}",
-            params={"timespan": "5days", "format": "json"},
+            params={"timespan": "10days", "format": "json"},
             timeout=self._timeout_sec,
         )
         response.raise_for_status()
